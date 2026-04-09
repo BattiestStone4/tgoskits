@@ -1,0 +1,8 @@
+[package]
+name = "arceos-axalloc-usage-statistics-updated-before-actual"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+axstd = { workspace = true, features = ["alloc"], optional = true }
+axalloc = { workspace = true }
