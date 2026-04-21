@@ -1,0 +1,68 @@
+args = [
+    "-nographic",
+    "-cpu",
+    "cortex-a53",
+    "-device",
+    "virtio-blk-pci,drive=disk0",
+    "-drive",
+    "id=disk0,if=none,format=raw,file=${workspace}/target/aarch64-unknown-none-softfloat/rootfs-aarch64.img",
+    "-device",
+    "virtio-net-pci,netdev=net0",
+    "-netdev",
+    "user,id=net0",
+]
+uefi = false
+to_bin = true
+shell_prefix = "root@starry:"
+shell_init_cmd = '''
+sh -c '
+pass=0
+fail=0
+
+run_test() {
+    _name="$1"; _cmd="$2"; _expect="$3"
+    _out=$($_cmd 2>&1)
+    if [ -n "$_expect" ]; then
+        if echo "$_out" | grep -q "$_expect"; then
+            echo "PASS: $_name"; pass=$((pass + 1))
+        else
+            echo "FAIL: $_name [expected '"'"'$_expect'"'"' got '"'"'$_out'"'"']"; fail=$((fail + 1))
+        fi
+    else
+        if [ -n "$_out" ]; then
+            echo "PASS: $_name"; pass=$((pass + 1))
+        else
+            echo "FAIL: $_name [empty output]"; fail=$((fail + 1))
+        fi
+    fi
+}
+
+echo "=== busybox-process: process management ==="
+
+run_test "kill"         "busybox kill -l"                         "HUP"
+run_test "killall"      "busybox killall -l"                      "HUP"
+run_test "killall5"     "busybox killall5 -h 2>&1"                "Usage"
+run_test "pidof"        "busybox pidof -s sh"                     ""
+run_test "pgrep"        "busybox pgrep -h 2>&1"                   "Usage"
+run_test "pkill"        "busybox pkill -l"                        "HUP"
+run_test "nice"         "busybox nice -n 10 echo nice_ok"         "nice_ok"
+run_test "renice"       "busybox renice +0 -p $$ 2>&1"            ""
+run_test "setsid"       "busybox setsid echo setsid_ok"           "setsid_ok"
+run_test "sleep"        "busybox sleep 0 && echo sleep_ok"        "sleep_ok"
+run_test "usleep"       "busybox usleep 1 && echo usleep_ok"      "usleep_ok"
+run_test "timeout"      "busybox timeout 2 echo timeout_ok"       "timeout_ok"
+run_test "time"         "busybox time echo time_ok 2>&1"          "time_ok"
+run_test "top"          "busybox top -b -n1 2>&1"                 ""
+run_test "ionice"       "busybox ionice -h 2>&1"                  "Usage"
+run_test "reset"        "busybox reset; echo reset_done"          "reset_done"
+run_test "unshare"      "busybox unshare -h 2>&1"                 "Usage"
+run_test "nsenter"      "busybox nsenter -h 2>&1"                 "Usage"
+run_test "setpriv"      "busybox setpriv -h 2>&1"                 "Usage"
+
+echo ""
+echo "DONE: $pass pass, $fail fail"
+'
+'''
+success_regex = ["(?m)DONE: \\d+ pass, \\d+ fail"]
+fail_regex = ['(?i)\bpanic(?:ked)?\b']
+timeout = 120

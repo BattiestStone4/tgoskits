@@ -1,0 +1,136 @@
+args = [
+    "-nographic",
+    "-device",
+    "virtio-blk-pci,drive=disk0",
+    "-drive",
+    "id=disk0,if=none,format=raw,file=${workspace}/target/x86_64-unknown-none/rootfs-x86_64.img",
+    "-device",
+    "virtio-net-pci,netdev=net0",
+    "-netdev",
+    "user,id=net0",
+]
+uefi = false
+to_bin = false
+shell_prefix = "root@starry:"
+shell_init_cmd = '''
+sh -c '
+pass=0
+fail=0
+
+check_help() {
+    _name="$1"; _cmd="$2"; _expect="$3"
+    _out=$($_cmd 2>&1)
+    if echo "$_out" | grep -q "$_expect"; then
+        echo "PASS: $_name"; pass=$((pass + 1))
+    else
+        echo "FAIL: $_name [expected '"'"'$_expect'"'"' got '"'"'$_out'"'"']"; fail=$((fail + 1))
+    fi
+}
+
+echo "=== busybox-help: shallow -h + Usage tests ==="
+
+check_help "acpid"          "busybox acpid -h 2>&1"                  "Usage"
+check_help "add_shell"      "busybox add-shell -h 2>&1"              "Usage"
+check_help "chattr"         "busybox chattr -h 2>&1"                 "Usage"
+check_help "chpasswd"       "busybox chpasswd -h 2>&1"               "Usage"
+check_help "chvt"           "busybox chvt -h 2>&1"                   "Usage"
+check_help "cryptpw"        "busybox cryptpw -h 2>&1"                "Usage"
+check_help "deallocvt"      "busybox deallocvt -h 2>&1"              "Usage"
+check_help "depmod"         "busybox depmod -h 2>&1"                 "Usage"
+check_help "dmesg"          "busybox dmesg -h 2>&1"                  "Usage"
+check_help "dumpkmap"       "busybox dumpkmap -h 2>&1"               "Usage"
+check_help "eject"          "busybox eject -h 2>&1"                  "Usage"
+check_help "ether_wake"     "busybox ether-wake 2>&1"                "Usage"
+check_help "fbsplash"       "busybox fbsplash -h 2>&1"               "Usage"
+check_help "fdflush"        "busybox fdflush -h 2>&1"                "Usage"
+check_help "fdisk"          "busybox fdisk -h 2>&1"                  "Usage"
+check_help "findfs"         "busybox findfs -h 2>&1"                 "Usage"
+check_help "fstrim"         "busybox fstrim -h 2>&1"                 "Usage"
+check_help "fuser"          "busybox fuser -h 2>&1"                  "Usage"
+check_help "getty"          "busybox getty -h 2>&1"                  "Usage"
+check_help "halt"           "busybox halt -h 2>&1"                   "Usage"
+check_help "ifenslave"      "busybox ifenslave 2>&1"                 "Usage"
+check_help "ifup"           "busybox ifup -h 2>&1"                   "Usage"
+check_help "init"           "busybox init 2>&1"                      "PID 1"
+check_help "inotifyd"       "busybox inotifyd -h 2>&1"               "Usage"
+check_help "insmod"         "busybox insmod -h 2>&1"                 "Usage"
+check_help "ipcrm"          "busybox ipcrm -h 2>&1"                  "Usage"
+check_help "kbd_mode"       "busybox kbd_mode -h 2>&1"               "Usage"
+check_help "killall5"       "busybox killall5 -h 2>&1"               "Usage"
+check_help "klogd"          "busybox klogd -h 2>&1"                  "Usage"
+check_help "last"           "busybox last -h 2>&1"                   "Usage"
+check_help "less"           "busybox less -h 2>&1"                   "Usage"
+check_help "loadfont"       "busybox loadfont -h 2>&1"               "Usage"
+check_help "loadkmap"       "busybox loadkmap -h 2>&1"               "Usage"
+check_help "logger"         "busybox logger -h 2>&1"                 "Usage"
+check_help "login"          "busybox login -h 2>&1"                  "Usage"
+check_help "lsmod"          "busybox lsmod 2>&1"                     ""
+check_help "lsof"           "busybox lsof 2>&1"                      ""
+check_help "lsusb"          "busybox lsusb 2>&1"                     ""
+check_help "makemime"       "busybox makemime -h 2>&1"               "Usage"
+check_help "mdev"           "busybox mdev -h 2>&1"                   "Usage"
+check_help "microcom"       "busybox microcom -h 2>&1"               "Usage"
+check_help "mkdosfs"        "busybox mkdosfs -h 2>&1"                "Usage"
+check_help "mkfs_vfat"      "busybox mkfs.vfat -h 2>&1"              "Usage"
+check_help "mknod"          "busybox mknod -h 2>&1"                  "Usage"
+check_help "mkswap"         "busybox mkswap -h 2>&1"                 "Usage"
+check_help "modinfo"        "busybox modinfo -h 2>&1"                "Usage"
+check_help "modprobe"       "busybox modprobe -h 2>&1"               "Usage"
+check_help "nameif"         "busybox nameif -h 2>&1"                 "Usage"
+check_help "nanddump"       "busybox nanddump -h 2>&1"               "Usage"
+check_help "nandwrite"      "busybox nandwrite -h 2>&1"              "Usage"
+check_help "nbd_client"     "busybox nbd-client -h 2>&1"             "Usage"
+check_help "nmeter"         "busybox nmeter -h 2>&1"                 "Usage"
+check_help "ntpd"           "busybox ntpd -h 2>&1"                   "Usage"
+check_help "openvt"         "busybox openvt -h 2>&1"                 "Usage"
+check_help "partprobe"      "busybox partprobe -h 2>&1"              "Usage"
+check_help "passwd"         "busybox passwd -h 2>&1"                 "Usage"
+check_help "pipe_progress"  "busybox pipe_progress -h 2>&1"          "Usage"
+check_help "pivot_root"     "busybox pivot_root -h 2>&1"             "Usage"
+check_help "poweroff"       "busybox poweroff -h 2>&1"               "Usage"
+check_help "pscan"          "busybox pscan -h 2>&1"                   "Usage"
+check_help "raidautorun"    "busybox raidautorun -h 2>&1"            "Usage"
+check_help "rdate"          "busybox rdate -h 2>&1"                  "Usage"
+check_help "rdev"           "busybox rdev -h 2>&1"                   "Usage"
+check_help "reboot"         "busybox reboot -h 2>&1"                 "Usage"
+check_help "reformime"      "busybox reformime -h 2>&1"              "Usage"
+check_help "remove_shell"   "busybox remove-shell -h 2>&1"           "Usage"
+check_help "resize"         "busybox resize -h 2>&1"                 "Usage"
+check_help "rmmod"          "busybox rmmod -h 2>&1"                  "Usage"
+check_help "sendmail"       "busybox sendmail -h 2>&1"               "Usage"
+check_help "setconsole"     "busybox setconsole -h 2>&1"             "Usage"
+check_help "setfont"        "busybox setfont -h 2>&1"                "Usage"
+check_help "setkeycodes"    "busybox setkeycodes -h 2>&1"            "Usage"
+check_help "setlogcons"     "busybox setlogcons -h 2>&1"             "Usage"
+check_help "setserial"      "busybox setserial -h 2>&1"              "Usage"
+check_help "showkey"        "busybox showkey -h 2>&1"                "Usage"
+check_help "slattach"       "busybox slattach -h 2>&1"               "Usage"
+check_help "su"             "busybox su -h 2>&1"                     "Usage"
+check_help "swapoff"        "busybox swapoff -h 2>&1"                "Usage"
+check_help "swapon"         "busybox swapon -h 2>&1"                 "Usage"
+check_help "switch_root"    "busybox switch_root -h 2>&1"            "Usage"
+check_help "syslogd"        "busybox syslogd -h 2>&1"                "Usage"
+check_help "tunctl"         "busybox tunctl -h 2>&1"                 "Usage"
+check_help "udhcpc"         "busybox udhcpc -h 2>&1"                 "Usage"
+check_help "udhcpc6"        "busybox udhcpc6 -h 2>&1"                "Usage"
+check_help "umount"         "busybox umount -h 2>&1"                 "Usage"
+check_help "unlzma"         "busybox unlzma -h 2>&1"                 "Usage"
+check_help "unlzop"         "busybox unlzop -h 2>&1"                 "Usage"
+check_help "unxz"           "busybox unxz -h 2>&1"                   "Usage"
+check_help "unzip"          "busybox unzip -h 2>&1"                  "Usage"
+check_help "vconfig"        "busybox vconfig -h 2>&1"                "Usage"
+check_help "vi"             "busybox vi -h 2>&1"                     "Usage"
+check_help "vlock"          "busybox vlock -h 2>&1"                  "Usage"
+check_help "watch"          "busybox watch -h 2>&1"                  "Usage"
+check_help "watchdog"       "busybox watchdog -h 2>&1"               "Usage"
+check_help "whois"          "busybox whois -h 2>&1"                  "Usage"
+check_help "xzcat"          "busybox xzcat -h 2>&1"                  "Usage"
+check_help "zcip"           "busybox zcip -h 2>&1"                   "Usage"
+
+echo ""
+echo "DONE: $pass pass, $fail fail"
+'
+'''
+success_regex = ["(?m)DONE: \\d+ pass, \\d+ fail"]
+fail_regex = ['(?i)\bpanic(?:ked)?\b']
+timeout = 120

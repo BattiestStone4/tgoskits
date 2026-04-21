@@ -1,0 +1,72 @@
+args = [
+  "-machine",
+  "virt",
+  "-cpu",
+  "la464",
+  "-nographic",
+  "-m",
+  "128M",
+  "-device",
+  "virtio-blk-pci,drive=disk0",
+  "-drive",
+  "id=disk0,if=none,format=raw,file=${workspace}/target/loongarch64-unknown-none-softfloat/rootfs-loongarch64.img",
+  "-device",
+  "virtio-net-pci,netdev=net0",
+  "-netdev",
+  "user,id=net0",
+]
+uefi = false
+to_bin = true
+shell_prefix = "root@starry:"
+shell_init_cmd = '''
+sh -c '
+pass=0
+fail=0
+
+run_test() {
+    _name="$1"; _cmd="$2"; _expect="$3"
+    _out=$($_cmd 2>&1)
+    if [ -n "$_expect" ]; then
+        if echo "$_out" | grep -q "$_expect"; then
+            echo "PASS: $_name"; pass=$((pass + 1))
+        else
+            echo "FAIL: $_name [expected '"'"'$_expect'"'"' got '"'"'$_out'"'"']"; fail=$((fail + 1))
+        fi
+    else
+        if [ -n "$_out" ]; then
+            echo "PASS: $_name"; pass=$((pass + 1))
+        else
+            echo "FAIL: $_name [empty output]"; fail=$((fail + 1))
+        fi
+    fi
+}
+
+echo "=== busybox-network: network commands ==="
+
+# Safe tests: mostly -h / help / listing, no actual network I/O
+run_test "ifconfig_h"    "busybox ifconfig -h 2>&1"               "Usage"
+run_test "ip_link"       "busybox ip link 2>&1"                   ""
+run_test "ip_addr"       "busybox ip addr 2>&1"                   ""
+run_test "ip_route"      "busybox ip route show 2>&1"             ""
+run_test "ip_neigh"      "busybox ip neigh show 2>&1"             ""
+run_test "ip_rule"       "busybox ip rule show 2>&1"              ""
+run_test "ip_tunnel"     "busybox ip tunnel show 2>&1"            ""
+run_test "iplink"        "busybox iplink 2>&1"                    ""
+run_test "route_n"       "busybox route -n 2>&1"                  ""
+run_test "netstat_a"     "busybox netstat -a 2>&1"                ""
+run_test "nc_h"          "busybox nc -h 2>&1"                     "Usage"
+run_test "wget_h"        "busybox wget -h 2>&1"                   "Usage"
+run_test "arp_h"         "busybox arp 2>&1"                       ""
+run_test "nslookup"      "busybox nslookup 127.0.0.1 2>&1"       ""
+run_test "traceroute_h"  "busybox traceroute -h 2>&1"             "Usage"
+run_test "traceroute6_h" "busybox traceroute6 -h 2>&1"            "Usage"
+run_test "ping_loopback" "busybox ping -c 1 127.0.0.1 2>&1"      "1 packets transmitted"
+run_test "ping6_loopback" "busybox ping6 -c 1 ::1 2>&1"           ""
+
+echo ""
+echo "DONE: $pass pass, $fail fail"
+'
+'''
+success_regex = ["(?m)DONE: \\d+ pass, \\d+ fail"]
+fail_regex = ['(?i)\bpanic(?:ked)?\b']
+timeout = 120

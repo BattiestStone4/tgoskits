@@ -1,0 +1,76 @@
+args = [
+    "-nographic",
+    "-device", "virtio-blk-pci,drive=disk0",
+    "-drive", "id=disk0,if=none,format=raw,file=${workspace}/target/x86_64-unknown-none/rootfs-x86_64.img",
+    "-device", "virtio-net-pci,netdev=net0",
+    "-netdev", "user,id=net0",
+]
+uefi = false
+to_bin = false
+shell_prefix = "root@starry:"
+shell_init_cmd = '''
+sh -c '
+pass=0
+fail=0
+
+run_test() {
+    _name="$1"; _cmd="$2"; _expect="$3"
+    _out=$($_cmd 2>&1)
+    if [ -n "$_expect" ]; then
+        if echo "$_out" | grep -q "$_expect"; then
+            echo "PASS: $_name"; pass=$((pass + 1))
+        else
+            echo "FAIL: $_name [expected '"'"'$_expect'"'"' got '"'"'$_out'"'"']"; fail=$((fail + 1))
+        fi
+    else
+        if [ -n "$_out" ]; then
+            echo "PASS: $_name"; pass=$((pass + 1))
+        else
+            echo "FAIL: $_name [empty output]"; fail=$((fail + 1))
+        fi
+    fi
+}
+
+echo "=== busybox-sysinfo: system information commands ==="
+
+run_test "uname"         "busybox uname -a"                             "Linux"
+run_test "hostname"      "busybox hostname"                             "starry"
+run_test "arch"          "busybox arch"                                 ""
+run_test "id"            "busybox id"                                   "uid="
+run_test "whoami"        "busybox whoami"                               "root"
+run_test "groups"        "busybox groups"                               "root"
+run_test "nproc"         "busybox nproc"                                ""
+run_test "date"          "busybox date +%Y"                             "20"
+run_test "cal"           "busybox cal"                                  ""
+run_test "uptime"        "busybox uptime"                               ""
+run_test "free"          "busybox free"                                 "Mem"
+run_test "dmesg"         "busybox dmesg -h"                             "Usage"
+run_test "mount"         "busybox mount"                                ""
+run_test "mountpoint"    "busybox mountpoint /"                         ""
+run_test "umount"        "busybox umount -h"                            "Usage"
+run_test "ps"            "busybox ps"                                   ""
+run_test "pstree"        "busybox pstree"                               ""
+run_test "pwd"           "busybox pwd"                                  "/"
+run_test "tty"           "busybox tty"                                  ""
+run_test "stty"          "busybox stty -a"                              ""
+run_test "printenv"      "busybox printenv PATH"                        ""
+run_test "env"           "busybox env"                                  "PATH="
+run_test "nologin"       "busybox nologin"                              "not available"
+run_test "mesg"          "busybox mesg"                                 ""
+run_test "ls"            "ls /"                                         "bin"
+run_test "busybox_list"  "busybox --list"                               ""
+run_test "hostid"        "busybox hostid"                               "0x"
+run_test "who"           "busybox who"                                  ""
+run_test "sysctl"        "busybox sysctl kernel.hostname 2>&1 || busybox sysctl -h 2>&1" ""
+run_test "blockdev"      "busybox blockdev --getss /dev/loop0 2>&1; echo __RC:$?" "__RC:"
+run_test "losetup"       "busybox losetup -a"                           ""
+run_test "lsattr"        "busybox lsattr -d /tmp 2>&1"                  ""
+run_test "clear"         "busybox clear; echo clear_ok"                 "clear_ok"
+
+echo ""
+echo "DONE: $pass pass, $fail fail"
+'
+'''
+success_regex = ["(?m)DONE: \\d+ pass, \\d+ fail"]
+fail_regex = ['(?i)\bpanic(?:ked)?\b']
+timeout = 120

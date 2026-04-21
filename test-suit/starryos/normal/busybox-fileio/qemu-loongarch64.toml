@@ -1,0 +1,245 @@
+args = [
+  "-machine", "virt", "-cpu", "la464", "-nographic", "-m", "128M",
+  "-device",
+  "virtio-blk-pci,drive=disk0",
+  "-drive",
+  "id=disk0,if=none,format=raw,file=${workspace}/target/loongarch64-unknown-none-softfloat/rootfs-loongarch64.img",
+  "-device",
+  "virtio-net-pci,netdev=net0",
+  "-netdev",
+  "user,id=net0",
+]
+uefi = false
+to_bin = true
+shell_prefix = "root@starry:"
+shell_init_cmd = '''
+sh -c '
+pass=0
+fail=0
+
+run_test() {
+    _name="$1"; _cmd="$2"; _expect="$3"
+    _out=$($_cmd 2>&1)
+    if [ -n "$_expect" ]; then
+        if echo "$_out" | grep -q "$_expect"; then
+            echo "PASS: $_name"; pass=$((pass + 1))
+        else
+            echo "FAIL: $_name [expected '"'"'$_expect'"'"' got '"'"'$_out'"'"']"; fail=$((fail + 1))
+        fi
+    else
+        if [ -n "$_out" ]; then
+            echo "PASS: $_name"; pass=$((pass + 1))
+        else
+            echo "FAIL: $_name [empty output]"; fail=$((fail + 1))
+        fi
+    fi
+}
+
+echo "=== busybox-fileio: file I/O commands ==="
+
+# 1. cat
+run_test "cat" "cat /etc/passwd" "root:"
+
+# 2. head
+run_test "head" "busybox head -n1 /etc/passwd" "root:"
+
+# 3. tail
+run_test "tail" "busybox tail -n1 /etc/passwd" ""
+
+# 4. cp
+busybox echo cp_content > /tmp/bb_cp_src 2>/dev/null
+run_test "cp" "busybox cp /tmp/bb_cp_src /tmp/bb_cp_dst && cat /tmp/bb_cp_dst" "cp_content"
+rm -f /tmp/bb_cp_src /tmp/bb_cp_dst 2>/dev/null
+
+# 5. mv
+busybox echo mv_content > /tmp/bb_mv_src 2>/dev/null
+run_test "mv" "busybox mv /tmp/bb_mv_src /tmp/bb_mv_dst && cat /tmp/bb_mv_dst" "mv_content"
+rm -f /tmp/bb_mv_dst 2>/dev/null
+
+# 6. rm
+busybox echo rm_test > /tmp/bb_rm_file 2>/dev/null
+run_test "rm" "busybox rm /tmp/bb_rm_file && test ! -e /tmp/bb_rm_file && echo rm_ok" "rm_ok"
+
+# 7. rmdir
+mkdir -p /tmp/bb_rmdir_dir 2>/dev/null
+run_test "rmdir" "busybox rmdir /tmp/bb_rmdir_dir && test ! -e /tmp/bb_rmdir_dir && echo rmdir_ok" "rmdir_ok"
+
+# 8. mkdir
+run_test "mkdir" "busybox mkdir -p /tmp/bb_test_dir && ls -d /tmp/bb_test_dir" "bb_test_dir"
+rm -rf /tmp/bb_test_dir 2>/dev/null
+
+# 9. touch
+run_test "touch" "busybox touch /tmp/bb_touch && test -f /tmp/bb_touch && echo touch_ok" "touch_ok"
+rm -f /tmp/bb_touch 2>/dev/null
+
+# 10. chmod
+busybox echo chmod_test > /tmp/bb_chmod 2>/dev/null
+run_test "chmod" "busybox chmod 600 /tmp/bb_chmod && ls -l /tmp/bb_chmod" "rw-------"
+rm -f /tmp/bb_chmod 2>/dev/null
+
+# 11. chown
+busybox echo chown_test > /tmp/bb_chown 2>/dev/null
+run_test "chown" "busybox chown root /tmp/bb_chown && ls -l /tmp/bb_chown" ""
+rm -f /tmp/bb_chown 2>/dev/null
+
+# 12. chgrp
+busybox echo chgrp_test > /tmp/bb_chgrp 2>/dev/null
+run_test "chgrp" "busybox chgrp root /tmp/bb_chgrp && ls -l /tmp/bb_chgrp" ""
+rm -f /tmp/bb_chgrp 2>/dev/null
+
+# 13. ln (symlink)
+busybox echo ln_content > /tmp/bb_ln_target 2>/dev/null
+run_test "ln" "busybox ln -s /tmp/bb_ln_target /tmp/bb_ln_link && busybox readlink /tmp/bb_ln_link" "bb_ln_target"
+rm -f /tmp/bb_ln_target /tmp/bb_ln_link 2>/dev/null
+
+# 14. link (hard link)
+busybox echo link_content > /tmp/bb_link_src 2>/dev/null
+run_test "link" "busybox link /tmp/bb_link_src /tmp/bb_link_dst && cat /tmp/bb_link_dst" "link_content"
+rm -f /tmp/bb_link_src /tmp/bb_link_dst 2>/dev/null
+
+# 15. unlink
+busybox echo unlink_test > /tmp/bb_unlink_file 2>/dev/null
+run_test "unlink" "busybox unlink /tmp/bb_unlink_file && test ! -e /tmp/bb_unlink_file && echo unlink_ok" "unlink_ok"
+
+# 16. dd
+run_test "dd" "busybox dd if=/etc/passwd of=/tmp/bb_dd 2>/dev/null && cat /tmp/bb_dd" "root:"
+rm -f /tmp/bb_dd 2>/dev/null
+
+# 17. install
+busybox echo install_content > /tmp/bb_install_src 2>/dev/null
+run_test "install" "busybox install -m 644 /tmp/bb_install_src /tmp/bb_install_dst && cat /tmp/bb_install_dst" "install_content"
+rm -f /tmp/bb_install_src /tmp/bb_install_dst 2>/dev/null
+
+# 18. truncate
+run_test "truncate" "busybox truncate -s 2 /tmp/bb_trunc && cat /tmp/bb_trunc" ""
+rm -f /tmp/bb_trunc 2>/dev/null
+
+# 19. shred
+busybox echo shred_content > /tmp/bb_shred 2>/dev/null
+run_test "shred" "busybox shred -n 1 -u /tmp/bb_shred && test ! -e /tmp/bb_shred && echo shred_ok" "shred_ok"
+
+# 20. tar
+busybox echo tar_content > /tmp/bb_tar_file 2>/dev/null
+run_test "tar" "cd /tmp && busybox tar -cf /tmp/bb_tar.tar bb_tar_file && busybox tar -tf /tmp/bb_tar.tar" "bb_tar_file"
+rm -f /tmp/bb_tar_file /tmp/bb_tar.tar 2>/dev/null
+
+# 21. gzip
+busybox echo gzip_content > /tmp/bb_gzip 2>/dev/null
+run_test "gzip" "busybox gzip /tmp/bb_gzip && ls /tmp/bb_gzip.gz" "bb_gzip.gz"
+rm -f /tmp/bb_gzip.gz 2>/dev/null
+
+# 22. gunzip
+run_test "gunzip" "busybox echo -n hello | busybox gzip -c | busybox gunzip -c" "hello"
+
+# 23. zcat
+run_test "zcat" "busybox echo -n hello | busybox gzip -c | busybox zcat" "hello"
+
+# 24. bzip2
+busybox echo bunzip_ok > /tmp/bb_bzip2 2>/dev/null
+run_test "bzip2" "busybox bzip2 /tmp/bb_bzip2 && ls /tmp/bb_bzip2.bz2" "bb_bzip2.bz2"
+rm -f /tmp/bb_bzip2.bz2 2>/dev/null
+
+# 25. bunzip2
+busybox echo bunzip_ok > /tmp/bb_bunzip2 2>/dev/null
+run_test "bunzip2" "busybox bzip2 /tmp/bb_bunzip2 && busybox bunzip2 /tmp/bb_bunzip2.bz2 && cat /tmp/bb_bunzip2" "bunzip_ok"
+rm -f /tmp/bb_bunzip2 /tmp/bb_bunzip2.bz2 2>/dev/null
+
+# 26. lzma
+busybox echo lzma_content > /tmp/bb_lzma 2>/dev/null
+run_test "lzma" "busybox lzma /tmp/bb_lzma && busybox lzma -dc /tmp/bb_lzma.lzma" "lzma_content"
+rm -f /tmp/bb_lzma /tmp/bb_lzma.lzma 2>/dev/null
+
+# 27. lzcat
+run_test "lzcat" "busybox echo test | busybox lzma -c | busybox lzcat" "test"
+
+# 28. split
+busybox echo -n abcdef > /tmp/bb_split 2>/dev/null
+run_test "split" "cd /tmp && busybox split -b 2 bb_split bb_split_ && cat /tmp/bb_split_aa" "ab"
+rm -f /tmp/bb_split /tmp/bb_split_a* 2>/dev/null
+
+# 29. tee
+run_test "tee" "busybox echo tee_line | busybox tee /tmp/bb_tee && cat /tmp/bb_tee" "tee_line"
+rm -f /tmp/bb_tee 2>/dev/null
+
+# 30. mktemp
+_tmpdir=$(busybox mktemp -d 2>/dev/null)
+run_test "mktemp" "echo $_tmpdir" ""
+rm -rf "$_tmpdir" 2>/dev/null
+
+# 31. mkfifo
+run_test "mkfifo" "busybox mkfifo /tmp/bb_fifo && ls -l /tmp/bb_fifo" "bb_fifo"
+rm -f /tmp/bb_fifo 2>/dev/null
+
+# 32. find
+run_test "find" "busybox find / -maxdepth 1 -name proc" "proc"
+
+# 33. stat
+run_test "stat" "busybox stat /etc/passwd" "File:"
+
+# 34. realpath
+run_test "realpath" "busybox realpath /tmp" "/tmp"
+
+# 35. readlink
+busybox echo rl_content > /tmp/bb_rl_target 2>/dev/null
+busybox ln -s /tmp/bb_rl_target /tmp/bb_rl_link 2>/dev/null
+run_test "readlink" "busybox readlink -f /tmp/bb_rl_link" ""
+rm -f /tmp/bb_rl_target /tmp/bb_rl_link 2>/dev/null
+
+# 36. which
+run_test "which" "busybox which busybox" "busybox"
+
+# 37. du
+run_test "du" "busybox du -s ." "."
+
+# 38. df
+run_test "df" "busybox df" "Filesystem"
+
+# 39. diff
+busybox echo line1 > /tmp/bb_diff1 2>/dev/null
+busybox echo line2 > /tmp/bb_diff2 2>/dev/null
+run_test "diff" "busybox diff /tmp/bb_diff1 /tmp/bb_diff2" ""
+rm -f /tmp/bb_diff1 /tmp/bb_diff2 2>/dev/null
+
+# 40. cmp (same files => no output, so we check for empty via echo marker)
+busybox echo cmp_content > /tmp/bb_cmp1 2>/dev/null
+busybox cp /tmp/bb_cmp1 /tmp/bb_cmp2 2>/dev/null
+run_test "cmp" "busybox cmp /tmp/bb_cmp1 /tmp/bb_cmp2 && echo cmp_ok" "cmp_ok"
+rm -f /tmp/bb_cmp1 /tmp/bb_cmp2 2>/dev/null
+
+# 41. dos2unix
+printf '"'"'hello\r\n'"'"' > /tmp/bb_d2u 2>/dev/null
+run_test "dos2unix" "busybox dos2unix /tmp/bb_d2u && busybox od -tx1 /tmp/bb_d2u" "0a"
+rm -f /tmp/bb_d2u 2>/dev/null
+
+# 42. unix2dos
+printf '"'"'hello\n'"'"' > /tmp/bb_u2d 2>/dev/null
+run_test "unix2dos" "busybox unix2dos /tmp/bb_u2d && busybox od -tx1 /tmp/bb_u2d" ""
+rm -f /tmp/bb_u2d 2>/dev/null
+
+# 43. flock
+run_test "flock" "busybox flock -x /tmp/bb_flock -c '"'"'echo flock_ok'"'"'" "flock_ok"
+rm -f /tmp/bb_flock 2>/dev/null
+
+# 44. fsync
+busybox echo fsync_content > /tmp/bb_fsync 2>/dev/null
+run_test "fsync" "busybox fsync /tmp/bb_fsync && cat /tmp/bb_fsync" "fsync_content"
+rm -f /tmp/bb_fsync 2>/dev/null
+
+# 45. cpio
+mkdir -p /tmp/bb_cpio_dir 2>/dev/null
+busybox echo cpio_content > /tmp/bb_cpio_dir/file 2>/dev/null
+run_test "cpio" "cd /tmp/bb_cpio_dir && busybox find . | busybox cpio -o -H newc 2>/dev/null | busybox cpio -t 2>/dev/null" ""
+rm -rf /tmp/bb_cpio_dir 2>/dev/null
+
+# 46. tree
+mkdir -p /tmp/bb_tree/a/b 2>/dev/null
+run_test "tree" "busybox tree /tmp/bb_tree" "a"
+rm -rf /tmp/bb_tree 2>/dev/null
+
+echo ""
+echo "DONE: $pass pass, $fail fail"
+'
+'''
+success_regex = ["(?m)DONE: \\d+ pass, \\d+ fail"]
+fail_regex = ['(?i)\bpanic(?:ked)?\b']
+timeout = 120
