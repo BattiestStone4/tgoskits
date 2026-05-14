@@ -1,6 +1,8 @@
 pub mod epoll;
 pub mod event;
 mod fs;
+#[cfg(all(feature = "sg2002", not(any(windows, unix))))]
+pub mod ion;
 mod net;
 mod pidfd;
 mod pipe;

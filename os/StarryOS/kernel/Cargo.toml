@@ -18,6 +18,7 @@ dev-log = []
 input = ["dep:ax-input", "ax-feat/input"]
 memtrack = ["ax-feat/dwarf", "ax-alloc/tracking", "dep:gimli"]
 rknpu = ["dep:axplat-dyn", "axplat-dyn/rknpu"]
+sg2002 = ["dep:dw_uart_rs", "dep:sg200x-bsp", "dep:ax-dma", "dep:tock-registers", "dep:num_enum"]
 vsock = ["ax-feat/vsock"]
 
 [dependencies]
@@ -89,7 +90,7 @@ linux-raw-sys = { version = "0.12", default-features = false, features = [
 lock_api = { version = "0.4", features = ["arc_lock"] }
 ax-memory-addr = { workspace = true }
 ax-memory-set = { workspace = true }
-num_enum = { version = "0.7", default-features = false }
+num_enum = { version = "0.7", default-features = false, optional = true }
 ouroboros = { version = "0.18", default-features = false }
 ax-percpu = { workspace = true }
 rand = { version = "0.10", default-features = false, features = ["alloc"] }
@@ -106,6 +107,10 @@ uluru = "3.1.0"
 weak-map = "0.1.1"
 xmas-elf = "0.9"
 zerocopy = { version = "0.8", features = ["derive"] }
+dw_uart_rs = { git = "https://github.com/elliott10/dw_apb_uart.git", optional = true }
+sg200x-bsp = { git = "https://github.com/pengzechen/sg200x-bsp.git", branch = "main", optional = true }
+ax-dma = { workspace = true, optional = true }
+tock-registers = { version = "0.9", optional = true }
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 x86 = "0.52"
