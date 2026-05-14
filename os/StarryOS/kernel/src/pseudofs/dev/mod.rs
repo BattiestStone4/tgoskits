@@ -19,6 +19,19 @@ mod memtrack;
 mod rtc;
 pub mod tty;
 
+#[cfg(all(feature = "sg2002", not(any(windows, unix))))]
+pub mod ion;
+#[cfg(all(feature = "sg2002", not(any(windows, unix))))]
+mod tty_serial;
+#[cfg(all(feature = "sg2002", not(any(windows, unix))))]
+pub(super) mod pwm;
+#[cfg(all(feature = "sg2002", not(any(windows, unix))))]
+mod cvi_camera;
+#[cfg(all(feature = "sg2002", not(any(windows, unix))))]
+mod tpu;
+#[cfg(all(feature = "sg2002", not(any(windows, unix))))]
+mod devmem;
+
 use alloc::{format, sync::Arc};
 use core::any::Any;
 
@@ -28,8 +41,12 @@ use axfs_ng_vfs::{DeviceId, Filesystem, NodeFlags, NodeType, VfsResult};
 #[cfg(feature = "dev-log")]
 pub use log::bind_dev_log;
 use rand::{Rng, SeedableRng, rngs::SmallRng};
+use spin::Once;
 
 use crate::pseudofs::{Device, DeviceOps, DirMaker, DirMapping, SimpleDir, SimpleFs};
+
+#[cfg(all(feature = "sg2002", not(any(windows, unix))))]
+pub static ION_DEVICE: Once<Arc<ion::IonDevice>> = Once::new();
 
 const RANDOM_SEED: &[u8; 32] = b"0123456789abcdef0123456789abcdef";
 
@@ -344,6 +361,69 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
         "input",
         SimpleDir::new_maker(fs.clone(), Arc::new(event::input_devices(fs.clone()))),
     );
+
+    // SG2002 devices: ion, ttyS1, ttyS2, cvi-camera0
+    #[cfg(all(feature = "sg2002", not(any(windows, unix))))]
+    {
+        let ion_dev = Arc::new(ion::IonDevice::new());
+        ION_DEVICE.call_once(|| ion_dev.clone());
+        root.add(
+            "ion",
+            Device::new(
+                fs.clone(),
+                NodeType::CharacterDevice,
+                DeviceId::new(10, 200),
+                ion_dev,
+            ),
+        );
+        root.add(
+            "ttyS1",
+            Device::new(
+                fs.clone(),
+                NodeType::CharacterDevice,
+                DeviceId::new(4, 65),
+                Arc::new(tty_serial::new_tty_s1(115200)),
+            ),
+        );
+        root.add(
+            "ttyS2",
+            Device::new(
+                fs.clone(),
+                NodeType::CharacterDevice,
+                DeviceId::new(4, 66),
+                Arc::new(tty_serial::new_tty_s2(115200)),
+            ),
+        );
+        root.add(
+            "cvi-camera0",
+            Device::new(
+                fs.clone(),
+                NodeType::CharacterDevice,
+                DeviceId::new(10, 201),
+                Arc::new(cvi_camera::CviCamera::new()),
+            ),
+        );
+        let tpu_dev = Arc::new(unsafe { tpu::TpuDevice::new() });
+        let _ = tpu_dev.init();
+        root.add(
+            "cvi-tpu0",
+            Device::new(
+                fs.clone(),
+                NodeType::CharacterDevice,
+                DeviceId::new(10, 202),
+                tpu_dev,
+            ),
+        );
+        root.add(
+            "devmem",
+            Device::new(
+                fs.clone(),
+                NodeType::CharacterDevice,
+                DeviceId::new(1, 1),
+                Arc::new(devmem::DevMem),
+            ),
+        );
+    }
 
     SimpleDir::new_maker(fs, Arc::new(root))
 }

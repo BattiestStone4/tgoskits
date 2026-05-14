@@ -285,7 +285,19 @@ pub fn sys_mmap(
     };
 
     let populate = map_flags.contains(MmapFlags::POPULATE);
-    aspace.map(start, length, permission_flags.into(), populate, backend)?;
+    let mut mapping_flags: MappingFlags = permission_flags.into();
+    // Ion buffers must be mapped UNCACHED to keep userspace and the
+    // kernel's coherent DMA view in sync; otherwise data written via
+    // the cached userspace mapping is invisible to TPU/DMA reads of
+    // the same physical page (and vice versa).
+    #[cfg(all(feature = "sg2002", not(any(windows, unix))))]
+    if let Some(ref f) = file {
+        use crate::file::ion::IonBufferFile;
+        if f.clone().downcast_arc::<IonBufferFile>().is_ok() {
+            mapping_flags |= MappingFlags::UNCACHED;
+        }
+    }
+    aspace.map(start, length, mapping_flags, populate, backend)?;
 
     Ok(start.as_usize() as _)
 }

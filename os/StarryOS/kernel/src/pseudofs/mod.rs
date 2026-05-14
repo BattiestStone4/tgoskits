@@ -77,6 +77,14 @@ pub fn mount_all() -> LinuxResult<()> {
     }
     path.push("subsystem");
     fs.symlink("whatever", &path)?;
+
+    // SG2002: mount pwm sysfs at /sys/class/pwm
+    #[cfg(all(feature = "sg2002", not(any(windows, unix))))]
+    {
+        fs.create_dir("/sys/class", DIR_PERMISSION).ok();
+        mount_at(&fs, "/sys/class/pwm", dev::pwm::new_pwm_sysfs())?;
+    }
+
     drop(fs);
 
     #[cfg(feature = "dev-log")]
