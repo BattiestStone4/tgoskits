@@ -1,11 +1,16 @@
 //! A SD Card driver for cv181x-sd device
 
+use core::sync::atomic::{AtomicU64, Ordering};
+
 use ax_driver_base::{BaseDriverOps, DevError, DevResult, DeviceType};
 use sg200x_bsp::sdmmc::Sdmmc;
 
 use crate::BlockDriverOps;
 
 const BLOCK_SIZE: usize = 512;
+
+/// 全局 SD 卡操作计数器（用于验证 WiFi init 期间是否有并发 SD 卡 I/O）
+pub static CVSD_IO_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// CVSD driver based on SG200x BSP SD/MMC.
 pub struct CvsdDriver(Sdmmc);
@@ -50,6 +55,7 @@ impl BlockDriverOps for CvsdDriver {
     }
 
     fn read_block(&mut self, block_id: u64, buf: &mut [u8]) -> DevResult {
+        CVSD_IO_COUNT.fetch_add(1, Ordering::Relaxed);
         let (blocks, remainder) = buf.as_chunks_mut::<{ BLOCK_SIZE }>();
 
         if !remainder.is_empty() {
@@ -66,6 +72,7 @@ impl BlockDriverOps for CvsdDriver {
     }
 
     fn write_block(&mut self, block_id: u64, buf: &[u8]) -> DevResult {
+        CVSD_IO_COUNT.fetch_add(1, Ordering::Relaxed);
         let (blocks, remainder) = buf.as_chunks::<{ BLOCK_SIZE }>();
 
         if !remainder.is_empty() {

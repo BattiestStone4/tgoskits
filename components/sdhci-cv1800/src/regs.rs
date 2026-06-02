@@ -74,20 +74,19 @@ pub const ERR_INT_CMD_MASK: u16 =
 
 pub const ERR_INT_DAT_MASK: u16 = ERR_INT_DAT_TIMEOUT | ERR_INT_DAT_CRC | ERR_INT_DAT_END_BIT;
 
-/// Signal Enable: 中断驱动模式下使能的信号
-pub const NORM_INT_SIG_MASK: u16 = NORM_INT_CMD_COMPLETE
-    | NORM_INT_XFER_COMPLETE
-    | NORM_INT_BUF_WR_READY
-    | NORM_INT_BUF_RD_READY
-    | NORM_INT_CARD_INT
-    | NORM_INT_ERROR;
+/// Signal Enable: 仅使能 CARD_INT (PIO 事件由 wait 函数直接轮询 INT_STATUS)
+pub const NORM_INT_SIG_MASK: u16 = NORM_INT_CARD_INT;
 
-pub const ERR_INT_SIG_MASK: u16 = ERR_INT_CMD_MASK | ERR_INT_DAT_MASK;
+pub const ERR_INT_SIG_MASK: u16 = 0;
 
 /// Transfer Mode Register (0x0C) 位定义 (16-bit)
 pub const TM_BLK_CNT_EN: u16 = 1 << 1;
 pub const TM_DATA_DIR_READ: u16 = 1 << 4;
 pub const TM_MULTI_BLOCK: u16 = 1 << 5;
+
+/// BLOCK_SIZE register SDMA buffer boundary (bits [14:12])
+/// 0x7 = 512 KiB boundary, standard default even in PIO mode
+pub const SDHCI_SDMA_BOUNDARY_512K: u16 = 0x7 << 12;
 
 /// Clock Control Register (0x2C) 位定义
 pub const CC_INT_CLK_EN: u16 = 0x0001;
@@ -151,6 +150,20 @@ pub const DIV_FACTOR: u32 = 2; // SDHCI 分频因子（固定为 2）
 pub const MAX_DIVISOR: u16 = 0x3FF; // 10-bit 分频器最大值 (1023)
 pub const DIVISOR_LOW_MASK: u16 = 0xFF; // 低 8 位掩码
 pub const DIVISOR_HIGH_MASK: u16 = 0x03; // 高 2 位掩码
+
+/// ---- Vendor registers (CV1800/SG2002 specific, offset from controller base) ----
+pub const VENDOR_MSHC_CTRL: u32 = 0x200;
+pub const VENDOR_PHY_TX_RX_DLY: u32 = 0x240;
+pub const VENDOR_PHY_CONFIG: u32 = 0x24C;
+
+/// VENDOR_MSHC_CTRL (0x200) bit definitions
+pub const VENDOR_MSHC_CTRL_FEEDBACK_CLK: u32 = 1 << 1;
+pub const VENDOR_MSHC_CTRL_TX_DLY_EN: u32 = 1 << 8;
+pub const VENDOR_MSHC_CTRL_RX_DLY_EN: u32 = 1 << 9;
+pub const VENDOR_MSHC_CTRL_SD1_SEL: u32 = 1 << 16;
+
+/// VENDOR_PHY_CONFIG (0x24C) bit definitions
+pub const VENDOR_PHY_ENABLE: u32 = 1 << 0;
 
 /// Capabilities Register 时钟基频字段
 pub const CAPS_BASE_FREQ_SHIFT: u32 = 8; // 基频字段起始位

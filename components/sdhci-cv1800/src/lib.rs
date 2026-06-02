@@ -1,15 +1,15 @@
-//! CVI SoC (CV1800/SG2002) SDHCI 控制器驱动  
-//!  
-//! 职责:  
-//!   - SDHCI 标准寄存器操作 (CMD52/CMD53/PIO)  
-//!   - SDIO 卡枚举 (CMD5/CMD3/CMD7)  
-//!   - 中断处理 (ISR + AtomicBool 标志)  
-//!   - 时钟/电源/总线宽度配置  
-//!  
-//! 设计:  
-//!   - init 阶段: 轮询 MMIO 寄存器 (ISR 未注册)  
-//!   - 运行阶段: ISR 做 W1C + 设标志, wait_* 检查 AtomicBool  
-//!   - 上层可用 irq::try_take_* + poll_fn 组装异步等待  
+//! CVI SoC (CV1800/SG2002) SDHCI 控制器驱动
+//!
+//! 职责:
+//!   - SDHCI 标准寄存器操作 (CMD52/CMD53/PIO)
+//!   - SDIO 卡枚举 (CMD5/CMD3/CMD7)
+//!   - 中断处理 (ISR 仅 CARD_INT, PIO 事件直接轮询 INT_STATUS)
+//!   - 时钟/电源/总线宽度配置
+//!
+//! 设计:
+//!   - ISR: 仅处理 CARD_INT (WiFi 芯片通知有数据可读)
+//!   - PIO: wait_* 方法直接轮询 INT_STATUS 寄存器，W1C 清除
+//!   - 分离 ISR/PIO 消除竞态条件
 
 #![no_std]
 
@@ -62,7 +62,7 @@ impl SdioCardIrq for CviCardIrqCtrl {
     }
 }
 
-/// CVI SoC WiFi SDIO 控制器  
+/// CVI SoC WiFi SDIO 控制器
 pub struct CviSdhci {
     base: usize, // MMIO 基地址
     rca: u16,    // 相对卡地址
@@ -89,7 +89,6 @@ impl CviSdhci {
         mmio_write::<T>(self.base + off as usize, val)
     }
 
-    /// 中断驱动等待（零 spin，任务睡眠，ISR 唤醒）
     fn classify_error(err: u16) -> SdioError {
         if err & ERR_INT_CMD_CRC != 0 {
             log::error!("[SDHCI] CMD CRC error (err_sts=0x{:04x})", err);
@@ -110,53 +109,77 @@ impl CviSdhci {
         }
     }
 
-    /// 尝试消费一个 IRQ 标志，返回 Some(result) 表示已决，None 表示未就绪  
-    fn try_take(&self, take: fn() -> bool) -> Option<Result<(), SdioError>> {
-        if let Some(err) = irq::take_error() {
-            self.reset_dat_line();
-            return Some(Err(Self::classify_error(err)));
-        }
-        if take() {
-            return Some(Ok(()));
-        }
-        None
-    }
-
-    fn wait_irq_flag(&self, take: fn() -> bool) -> Result<(), SdioError> {
+    /// 直接轮询 INT_STATUS_NORM，等待指定 bit 置位后 W1C 清除
+    ///
+    /// 同时检测 Error 中断：如果 ERROR bit (bit 15) 置位，
+    /// 读取 ERR_STATUS 并 W1C 清除所有状态位，然后返回错误。
+    fn poll_int_status(&self, bit: u16) -> Result<(), SdioError> {
+        // Phase 1: 快速自旋
         for _ in 0..1000 {
-            if let Some(r) = self.try_take(take) {
-                return r;
+            let norm = self.read::<u16>(SDHCI_INT_STATUS_NORM);
+            if norm & NORM_INT_ERROR != 0 {
+                let err = self.read::<u16>(SDHCI_INT_STATUS_ERR);
+                self.write::<u16>(SDHCI_INT_STATUS_ERR, err);
+                self.write::<u16>(SDHCI_INT_STATUS_NORM, norm);
+                self.reset_dat_line();
+                return Err(Self::classify_error(err));
+            }
+            if norm & bit != 0 {
+                self.write::<u16>(SDHCI_INT_STATUS_NORM, bit);
+                return Ok(());
             }
             core::hint::spin_loop();
         }
-        for _ in 0..200_000 {
-            if let Some(r) = self.try_take(take) {
-                return r;
+        // Phase 2: 协作式等待
+        for i in 0..200_000 {
+            let norm = self.read::<u16>(SDHCI_INT_STATUS_NORM);
+            if norm & NORM_INT_ERROR != 0 {
+                let err = self.read::<u16>(SDHCI_INT_STATUS_ERR);
+                self.write::<u16>(SDHCI_INT_STATUS_ERR, err);
+                self.write::<u16>(SDHCI_INT_STATUS_NORM, norm);
+                self.reset_dat_line();
+                return Err(Self::classify_error(err));
+            }
+            if norm & bit != 0 {
+                self.write::<u16>(SDHCI_INT_STATUS_NORM, bit);
+                return Ok(());
+            }
+            if i == 100_000 {
+                let pres = self.read::<u32>(SDHCI_PRESENT_STATE);
+                log::warn!(
+                    "[SDHCI] poll_int mid-timeout: bit=0x{:04x} PRES=0x{:08x} INT_STS=0x{:04x}",
+                    bit, pres, norm
+                );
             }
             ax_task::yield_now();
         }
-        log::error!("[SDHCI] wait_irq_flag timeout");
+        let pres = self.read::<u32>(SDHCI_PRESENT_STATE);
+        let sts = self.read::<u16>(SDHCI_INT_STATUS_NORM);
+        log::error!(
+            "[SDHCI] poll_int_status timeout: bit=0x{:04x} PRES=0x{:08x} INT_STS=0x{:04x}",
+            bit, pres, sts
+        );
         Err(SdioError::Timeout)
     }
 
     fn wait_cmd_complete(&self) -> Result<u32, SdioError> {
-        self.wait_irq_flag(irq::take_cmd_complete)?;
+        self.poll_int_status(NORM_INT_CMD_COMPLETE)?;
         Ok(self.read::<u32>(SDHCI_RESPONSE))
     }
 
     fn wait_buffer_read_ready(&self) -> Result<(), SdioError> {
-        self.wait_irq_flag(irq::take_buf_rd_ready)
+        self.poll_int_status(NORM_INT_BUF_RD_READY)
     }
 
     fn wait_buffer_write_ready(&self) -> Result<(), SdioError> {
-        self.wait_irq_flag(irq::take_buf_wr_ready)
+        self.poll_int_status(NORM_INT_BUF_WR_READY)
     }
 
     fn wait_transfer_complete(&self) -> Result<(), SdioError> {
-        self.wait_irq_flag(irq::take_xfer_complete)
+        self.poll_int_status(NORM_INT_XFER_COMPLETE)
     }
 
-    /// 硬件轮询（无对应中断，只能 spin）
+    /// 等待 CMD 线空闲 (仅检查 CMD_INHIBIT)
     fn wait_cmd_idle(&self) -> Result<(), SdioError> {
         for _ in 0..CMD_RESPONSE_TIMEOUT {
             if self.read::<u32>(SDHCI_PRESENT_STATE) & SDHCI_CMD_INHIBIT == 0 {
@@ -164,6 +187,25 @@ impl CviSdhci {
             }
             core::hint::spin_loop();
         }
+        Err(SdioError::Timeout)
+    }
+
+    /// 等待 CMD 和 DAT 线都空闲 (数据命令前使用)
+    fn wait_data_idle(&self) -> Result<(), SdioError> {
+        for _ in 0..CMD_RESPONSE_TIMEOUT {
+            if self.read::<u32>(SDHCI_PRESENT_STATE)
+                & (SDHCI_CMD_INHIBIT | SDHCI_DATA_INHIBIT)
+                == 0
+            {
+                return Ok(());
+            }
+            core::hint::spin_loop();
+        }
+        let pres = self.read::<u32>(SDHCI_PRESENT_STATE);
+        log::error!(
+            "[SDHCI] wait_data_idle timeout: PRES=0x{:08x}",
+            pres
+        );
         Err(SdioError::Timeout)
     }
 
@@ -197,10 +239,32 @@ impl CviSdhci {
         }
     }
 
-    /// SD 命令
+    /// Clear stale INT_STATUS bits (W1C clear all set bits)
+    fn clear_stale_status(&self) {
+        let norm = self.read::<u16>(SDHCI_INT_STATUS_NORM);
+        if norm != 0 {
+            if norm & NORM_INT_ERROR != 0 {
+                let err = self.read::<u16>(SDHCI_INT_STATUS_ERR);
+                if err != 0 {
+                    self.write::<u16>(SDHCI_INT_STATUS_ERR, err);
+                }
+            }
+            self.write::<u16>(SDHCI_INT_STATUS_NORM, norm);
+        }
+    }
+
+    /// Clear DAT state machine and stale INT_STATUS for first data transfer.
+    pub fn prepare_first_data_xfer(&self) {
+        self.write::<u16>(SDHCI_INT_STATUS_NORM, 0xFFFF);
+        self.write::<u16>(SDHCI_INT_STATUS_ERR, 0xFFFF);
+        self.reset_dat_line();
+        log::debug!("[SDHCI] DAT line reset + INT_STATUS cleared for first data xfer");
+    }
+
+    /// SD 命令 (非数据命令: CMD0/3/5/7/52)
     fn send_cmd(&self, cmd_idx: u8, arg: u32) -> Result<u32, SdioError> {
         self.wait_cmd_idle()?;
-        irq::drain_flags();
+        self.clear_stale_status();
 
         self.write::<u32>(SDHCI_ARGUMENT, arg);
         let flags = match cmd_idx {
@@ -209,7 +273,6 @@ impl CviSdhci {
             5 => CMD_FLAGS_R4,
             7 => CMD_FLAGS_R1B,
             52 => CMD_FLAGS_R5,
-            53 => CMD_FLAGS_R5_DATA,
             _ => return Err(SdioError::Unsupported),
         };
 
@@ -256,8 +319,12 @@ impl CviSdhci {
         Ok(())
     }
 
-    /// CMD53
-    /// 返回 (blk_sz, nblocks) 供 PIO 使用
+    /// CMD53 数据传输设置
+    ///
+    /// 关键改进:
+    ///   - 检查 DATA_INHIBIT (确保前一次数据传输完成)
+    ///   - TRANSFER_MODE + COMMAND 作为 32-bit 原子写入
+    ///   - BLOCK_SIZE 寄存器设置 SDMA boundary 字段
     #[allow(clippy::too_many_arguments)]
     fn cmd53_xfer(
         &self,
@@ -307,18 +374,30 @@ impl CviSdhci {
         }
 
         let xfer_blocks = if blk_mode { count as u16 } else { 1 };
-        self.write::<u16>(SDHCI_BLOCK_SIZE, blk_sz);
+
+        // 等待 CMD 和 DAT 线都空闲
+        self.wait_data_idle()?;
+        self.clear_stale_status();
+
+        // BLOCK_SIZE: bits[11:0]=block size, bits[14:12]=SDMA boundary (0x7=512K)
+        self.write::<u16>(SDHCI_BLOCK_SIZE, blk_sz | SDHCI_SDMA_BOUNDARY_512K);
         self.write::<u16>(SDHCI_BLOCK_COUNT, xfer_blocks);
-        self.write::<u16>(
+
+        // TRANSFER_MODE (offset 0x0C) + COMMAND (offset 0x0E) 作为 32-bit 原子写入
+        let tm = if blk_mode {
+            TM_MULTI_BLOCK | TM_BLK_CNT_EN
+        } else {
+            0
+        } | if !write { TM_DATA_DIR_READ } else { 0 };
+
+        let cmd_val = (53u16) << CMD_INDEX_SHIFT as u16 | CMD_FLAGS_R5_DATA;
+        self.write::<u32>(SDHCI_ARGUMENT, arg);
+        self.write::<u32>(
             SDHCI_TRANSFER_MODE,
-            if blk_mode {
-                TM_MULTI_BLOCK | TM_BLK_CNT_EN
-            } else {
-                0
-            } | if !write { TM_DATA_DIR_READ } else { 0 },
+            ((cmd_val as u32) << 16) | (tm as u32),
         );
 
-        self.send_cmd(53, arg)?;
+        self.wait_cmd_complete()?;
         Ok((blk_sz, xfer_blocks))
     }
 
@@ -353,13 +432,12 @@ impl CviSdhci {
         let mut offset = 0;
 
         for _ in 0..nblocks {
-            self.wait_buffer_read_ready()?; // 等待 Buffer Read Ready 中断状态位
+            self.wait_buffer_read_ready()?;
 
-            // 每次从 Buffer Data Port 读 4 字节
-            let words = (block_size as usize).div_ceil(4); // 向上取整
+            let words = (block_size as usize).div_ceil(4);
             for _ in 0..words {
                 let data = self.read::<u32>(SDHCI_BUFFER);
-                let byte_offset = data.to_le_bytes(); // 转换为字节数组，处理未对齐的最后一个 word
+                let byte_offset = data.to_le_bytes();
                 let remaining = buf.len() - offset;
                 let copy_len = core::cmp::min(4, remaining);
                 buf[offset..offset + copy_len].copy_from_slice(&byte_offset[..copy_len]);
@@ -375,9 +453,9 @@ impl CviSdhci {
         let mut offset = 0;
 
         for _ in 0..nblocks {
-            self.wait_buffer_write_ready()?; // 等待 Buffer Write Ready 中断状态位
+            self.wait_buffer_write_ready()?;
 
-            let words = (block_size as usize).div_ceil(4); // 向上取整
+            let words = (block_size as usize).div_ceil(4);
             for _ in 0..words {
                 let mut data: [u8; 4] = [0; 4];
                 let remaining = buf.len() - offset;
@@ -392,8 +470,7 @@ impl CviSdhci {
         Ok(())
     }
 
-    /// 读取 CIS 指针 (3 字节, little-endian)  
-    /// func=0 从 CCCR 读, func=1..7 从 FBR 读
+    /// 读取 CIS 指针 (3 字节, little-endian)
     fn read_cis_ptr(&self, func: u8) -> Result<u32, SdioError> {
         let base = if func == 0 {
             CCCR_CIS_POINTER
@@ -412,36 +489,27 @@ impl CviSdhci {
         for _ in 0..256 {
             let tuple_code = self.cmd52_read(0, addr)?;
             if tuple_code == CISTPL_END {
-                break; // 遍历结束
+                break;
             }
             if tuple_code == CISTPL_NULL {
-                // NULL tuple 没有 link 字段，直接跳过 1 字节
                 addr += 1;
                 continue;
             }
-            let tuple_link = self.cmd52_read(0, addr + 1)? as u32; // link 字段: 后续 tuple 的偏移量
+            let tuple_link = self.cmd52_read(0, addr + 1)? as u32;
             if tuple_code == CISTPL_MANFID && tuple_link >= 4 {
                 let v0 = self.cmd52_read(0, addr + 2)? as u16;
                 let v1 = self.cmd52_read(0, addr + 3)? as u16;
                 let v2 = self.cmd52_read(0, addr + 4)? as u16;
                 let v3 = self.cmd52_read(0, addr + 5)? as u16;
-                return Ok((v0 | (v1 << 8), v2 | (v3 << 8))); // 返回 vendor_id 和 device_id
+                return Ok((v0 | (v1 << 8), v2 | (v3 << 8)));
             }
-            addr += 2 + tuple_link; // 移动到下一个 tuple
+            addr += 2 + tuple_link;
         }
 
-        Err(SdioError::Unsupported) // 没有找到 Manfid
+        Err(SdioError::Unsupported)
     }
 
     // ========== SDIO 初始化辅助函数 ==========
-
-    /// SoC 级硬件初始化（如果需要）
-    #[allow(dead_code)]
-    fn soc_hw_init(&mut self) -> Result<(), SdioError> {
-        // TODO: 实现 SoC 级硬件初始化
-        // 需要传入正确的硬件配置和延时函数
-        Ok(())
-    }
 
     /// SDHCI 控制器软件复位
     fn controller_reset(&self) -> Result<(), SdioError> {
@@ -451,9 +519,6 @@ impl CviSdhci {
 
     /// 设置卡检测覆写（WiFi 模块无物理 CD 引脚）
     fn setup_card_detect(&self) -> Result<(), SdioError> {
-        // WiFi 模块无物理 CD 引脚, 通过 HOST_CTL1 强制 CARD_INSERTED
-        // bit7: CARD_DET_SEL = 1 (使用 CARD_DET_TEST 而非 SD_CD 引脚)
-        // bit6: CARD_DET_TEST = 1 (卡已插入)
         let hc = self.read::<u8>(SDHCI_HOST_CONTROL);
         self.write::<u8>(SDHCI_HOST_CONTROL, hc | HC_CARD_DET_TEST | HC_CARD_DET_SEL);
         Ok(())
@@ -465,17 +530,18 @@ impl CviSdhci {
         Ok(())
     }
 
-    /// 设置初始低速时钟 400KHz（SD 规范：初始化阶段 ≤ 400KHz）
+    /// 设置初始低速时钟 400KHz
     fn setup_initial_clock(&self) -> Result<(), SdioError> {
         self.set_clock(400_000)
     }
 
-    /// 使能中断状态位 + 信号（IRQ 驱动模式）
+    /// 使能中断状态位 + CARD_INT 信号
     fn enable_interrupts_irq(&self) -> Result<(), SdioError> {
         irq::irq_state_init(self.base);
+        // Status Enable: 使能所有状态位 (用于 poll_int_status 轮询)
         self.write::<u16>(SDHCI_NORM_INT_STS_EN, NORM_INT_ENABLE_MASK);
         self.write::<u16>(SDHCI_ERR_INT_STS_EN, ERR_INT_ENABLE_MASK);
-        // IRQ 驱动模式: 使能硬件中断信号
+        // Signal Enable: 仅使能 CARD_INT (ISR 只处理 CARD_INT)
         irq::enable_irq_signals();
         Ok(())
     }
@@ -489,23 +555,25 @@ impl SdioHost for CviSdhci {
         // Step 1: SDHCI 控制器软件复位
         self.controller_reset()?;
 
-        // Step 2: 设置卡检测覆写（WiFi 模块无物理 CD 引脚）
+        // Step 1.5: 设置数据超时
+        self.write::<u8>(SDHCI_TIMEOUT_CONTROL, 0x0E);
+
+        // Step 2: 设置卡检测覆写
         self.setup_card_detect()?;
 
         // Step 3: 上电 3.3V
         self.power_on()?;
 
-        // Step 3.5: 等待电源稳定 (Linux mmc_power_up: 2×mmc_delay(10ms) = 20ms)
+        // Step 3.5: 等待电源稳定
         delay_ms(20);
 
         // Step 4: 设置初始低速时钟 400KHz
         self.setup_initial_clock()?;
 
-        // Step 4.5: 74+ clocks 稳定时间 (SD 规范要求)
+        // Step 4.5: 74+ clocks 稳定时间
         delay_ms(2);
 
-        // Step 5: 使能中断状态位 + 信号（IRQ 驱动模式）
-        // PLIC ISR 已在 aic8800_wireless::connect() 中注册
+        // Step 5: 使能中断状态位 + CARD_INT 信号
         self.enable_interrupts_irq()?;
 
         // Step 6: CMD5 探测 SDIO 卡
@@ -566,11 +634,20 @@ impl SdioHost for CviSdhci {
             delay_ms(10);
         }
 
-        // Step 10: 4-bit 总线宽度
+        // Step 9.5: VENDOR_MSHC_CTRL — 设置 SD1_SEL (bit16)
+        let vendor = self.read::<u32>(VENDOR_MSHC_CTRL);
+        self.write::<u32>(VENDOR_MSHC_CTRL, vendor | VENDOR_MSHC_CTRL_SD1_SEL);
+        log::info!(
+            "[SDIO] VENDOR_MSHC_CTRL: 0x{:08x} -> 0x{:08x}",
+            vendor,
+            vendor | VENDOR_MSHC_CTRL_SD1_SEL
+        );
+
+        // Step 10: 4-bit bus mode
         let bus_if = self.cmd52_read(0, CCCR_BUS_INTERFACE)?;
         self.cmd52_write(0, CCCR_BUS_INTERFACE, (bus_if & 0xFC) | 0x02)?;
-        let hc1 = self.read::<u8>(SDHCI_HOST_CONTROL);
-        self.write::<u8>(SDHCI_HOST_CONTROL, hc1 | HC_BUS_WIDTH_4);
+        let hc = self.read::<u8>(SDHCI_HOST_CONTROL);
+        self.write::<u8>(SDHCI_HOST_CONTROL, hc | HC_BUS_WIDTH_4);
 
         // Step 11: 使能 Function 1 并设置块大小
         self.enable_func(1)?;
@@ -588,7 +665,6 @@ impl SdioHost for CviSdhci {
         Ok(())
     }
 
-    /// 获取 MMIO 基地址（ISR 等需要直接访问寄存器的场景）
     fn mmio_base(&self) -> usize {
         self.base
     }
@@ -625,29 +701,18 @@ impl SdioHost for CviSdhci {
         self.wait_transfer_complete()
     }
 
-    /// 设置指定 SDIO function 的 block size
-    ///
-    /// Block size 寄存器位置:
-    /// - Function 0: CCCR 0x10-0x11
-    /// - Function N (1-7): FBR 0x100*N + 0x10-0x11
-    ///
-    /// 始终通过 function 0 的 CMD52 访问 (CCCR/FBR 地址空间)
     fn set_block_size(&self, func: u8, size: u16) -> Result<(), SdioError> {
         if func > 7 {
             return Err(SdioError::Unsupported);
         }
 
-        // SDIO block size 合法范围: 1-2048, 推荐 2 的幂
         if size == 0 || size > 2048 {
             return Err(SdioError::Unsupported);
         }
 
         let base = 0x100 * (func as u32);
-        // 写低字节
         self.cmd52_write(0, base + 0x10, (size & 0xFF) as u8)?;
-        // 写高字节
         self.cmd52_write(0, base + 0x11, ((size >> 8) & 0xFF) as u8)?;
-        // 回读验证
         let lo = self.cmd52_read(0, base + 0x10)? as u16;
         let hi = self.cmd52_read(0, base + 0x11)? as u16;
         let readback = (hi << 8) | lo;
@@ -658,108 +723,48 @@ impl SdioHost for CviSdhci {
         Ok(())
     }
 
-    /// 设置 SDIO 总线时钟频率
-    ///
-    /// # 参数
-    /// * `hz` - 目标时钟频率（Hz）
-    ///
-    /// # 实现步骤
-    /// 1. 从 Capabilities 寄存器读取基频
-    /// 2. 计算分频值（确保实际频率 ≤ 目标频率）
-    /// 3. 停止 SD 时钟输出
-    /// 4. 配置并写入分频值
-    /// 5. 等待内部时钟稳定
-    /// 6. 启用 SD 时钟输出
-    ///
-    /// # 时钟公式
-    /// ```text
-    /// 实际频率 = 基频 / (2 × 分频值)
-    /// 其中：
-    ///   - 基频：来自 Capabilities 寄存器 bits[15:8]，单位 MHz
-    ///   - 分频值：10-bit (0-1023)，0 表示不分频
-    ///   - 因子 2：SDHCI 规范固定的分频因子
-    /// ```
-    ///
-    /// # 示例
-    /// ```ignore
-    /// set_clock(400_000)?;    // 设置 400KHz 初始化时钟
-    /// set_clock(50_000_000)?;  // 设置 50MHz 高速时钟
-    /// ```
     fn set_clock(&self, hz: u32) -> Result<(), SdioError> {
-        // ========== Step 1: 读取基频 ==========
-        // 从 Capabilities Register (0x40) 读取基频
-        // bits[15:8]: Base Clock Frequency (MHz)
         let caps = self.read::<u32>(SDHCI_CAPABILITIES);
         let base_clock_mhz = (caps >> CAPS_BASE_FREQ_SHIFT) & CAPS_BASE_FREQ_MASK;
         let mut base_clock = base_clock_mhz * MHZ_TO_HZ;
 
-        // 如果硬件报告基频为 0，使用 CVI SoC 默认值
         if base_clock == 0 {
             base_clock = FALLBACK_BASE_CLOCK;
         }
 
-        // ========== Step 2: 计算分频值 ==========
-        // 目标：确保 base_clock / (2 × divisor) ≤ hz
-        // 即：divisor ≥ base_clock / (2 × hz)
         let divisor = if hz >= base_clock {
-            // 目标频率 ≥ 基频，不分频
             0u16
         } else {
-            // 计算最小分频值（向上取整）
-            // 公式：divisor = ceil(base_clock / (2 × hz))
             let div = base_clock.div_ceil(DIV_FACTOR * hz);
-
-            // 限制在 10-bit 分频器范围内 (0-1023)
             div.min(MAX_DIVISOR as u32) as u16
         };
 
-        // ========== Step 3: 停止 SD 时钟输出 ==========
-        // 读取当前时钟控制寄存器
         let mut clk_reg = self.read::<u16>(SDHCI_CLOCK_CONTROL);
-
-        // 清除 SD_CLK_EN 和 INT_CLK_EN，停止时钟输出
         clk_reg &= !(CC_SD_CLK_EN | CC_INT_CLK_EN);
         self.write::<u16>(SDHCI_CLOCK_CONTROL, clk_reg);
 
-        // ========== Step 4: 配置分频器 ==========
-        // SDHCI 使用 10-bit 分频值：
-        //   - 低 8 位写入 bits[15:8] (CC_FREQ_SEL_MASK)
-        //   - 高 2 位写入 bits[7:6]   (CC_FREQ_SEL_EXT_MASK)
         clk_reg &= !(CC_FREQ_SEL_MASK | CC_FREQ_SEL_EXT_MASK);
-
-        // 提取分频值的低 8 位，左移 8 位到 bits[15:8]
         let freq_sel = (divisor & DIVISOR_LOW_MASK) << CC_DIV_SHIFT;
-
-        // 提取分频值的高 2 位，左移 6 位到 bits[7:6]
         let ext_sel = ((divisor >> 8) & DIVISOR_HIGH_MASK) << CC_EXT_DIV_SHIFT;
-
-        // 写入分频值并使能内部时钟
         clk_reg |= freq_sel | ext_sel | CC_INT_CLK_EN;
         self.write::<u16>(SDHCI_CLOCK_CONTROL, clk_reg);
 
-        // ========== Step 5: 等待内部时钟稳定 ==========
         self.wait_clock_stable()?;
 
-        // ========== Step 6: 启用 SD 时钟输出 ==========
         clk_reg = self.read::<u16>(SDHCI_CLOCK_CONTROL);
         self.write::<u16>(SDHCI_CLOCK_CONTROL, clk_reg | CC_SD_CLK_EN);
 
         Ok(())
     }
 
-    /// 使能指定 SDIO function (1-7)  
-    ///  
-    /// 写 CCCR IO_ENABLE (0x02) 对应位，然后轮询 IO_READY (0x03) 等待就绪  
     fn enable_func(&self, func: u8) -> Result<(), SdioError> {
         if func == 0 || func > 7 {
             return Err(SdioError::Unsupported);
         }
 
-        // 使能对应 function 位
         let io_en = self.cmd52_read(0, CCCR_IO_ENABLE)?;
         self.cmd52_write(0, CCCR_IO_ENABLE, io_en | (1 << func))?;
 
-        // 轮询等待 IO_READY 位被设置
         for _ in 0..1000u32 {
             let io_ready = self.cmd52_read(0, CCCR_IO_READY)?;
             if io_ready & (1 << func) != 0 {

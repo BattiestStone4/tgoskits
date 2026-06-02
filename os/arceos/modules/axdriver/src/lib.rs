@@ -63,6 +63,9 @@ extern crate log;
 #[cfg(feature = "dyn")]
 extern crate alloc;
 
+#[cfg(all(feature = "dyn-net", not(feature = "dyn")))]
+extern crate alloc;
+
 #[macro_use]
 mod macros;
 

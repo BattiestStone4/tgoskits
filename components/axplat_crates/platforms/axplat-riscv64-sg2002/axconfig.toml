@@ -45,9 +45,13 @@ mmio-ranges = [
     [0x0415_0000, 0x1000],          # UART1
     [0x0416_0000, 0x1000],          # UART2
     [0x0417_0000, 0x1000],          # UART3
-    [0x0431_0000, 0x1000],          # cv sdmmc
+    [0x0431_0000, 0x1000],          # CV SDMMC (SD0, SD card)
+    [0x0432_0000, 0x1000],          # SDIO1 (WiFi SDHCI controller)
     [0x0434_0000, 0x1000],          # USB DWC2
-    [0x0502_6000, 0x2000],          # RTC + IOBLK_GRTC (0x5026000..0x5028000)
+    [0x0502_1000, 0x1000],          # PortE GPIO (WiFi poweron)
+    [0x0502_5000, 0x1000],          # RTCSYS_CTRL (RTC domain control)
+    [0x0502_6000, 0x1000],          # RTC + IOBLK_GRTC
+    [0x0502_7000, 0x1000],          # RTCSYS_IO (RTC domain IO mux)
     [0x0c10_0000, 0x2000],          # TPU
     [0x7000_0000, 0x0400_0000],     # PLIC
     [0x7400_0000, 0x1_0000],        # CLINT
@@ -79,6 +83,11 @@ uart-paddr = 0x0414_0000            # uint
 uart-irq = 0x2c                     # uint
 
 syscon-paddr = 0x0300_0000          # uint
+crg-paddr = 0x0300_2000             # uint
 cvsd-paddr = 0x0431_0000            # uint
+rtcsys-ctrl-paddr = 0x0502_5000     # uint
+rtcsys-io-paddr = 0x0502_7000       # uint
+sdio1-paddr = 0x0432_0000           # uint
+wifi-irq = 38                       # uint
 root-partition-name = "rootfs"      # str
 bootargs = "root=/dev/mmcblk0p3"    # str

@@ -5,8 +5,8 @@ use core::ops::{Deref, DerefMut};
 use ax_driver_base::{BaseDriverOps, DeviceType};
 use smallvec::SmallVec;
 
-#[cfg_attr(feature = "dyn", path = "dyn.rs")]
-#[cfg_attr(not(feature = "dyn"), path = "static.rs")]
+#[cfg_attr(any(feature = "dyn", feature = "dyn-net"), path = "dyn.rs")]
+#[cfg_attr(not(any(feature = "dyn", feature = "dyn-net")), path = "static.rs")]
 mod imp;
 
 pub use imp::*;

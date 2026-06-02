@@ -100,9 +100,30 @@ impl Sdio1HwConfig {
     }
 }
 
-/// SDIO1 SoC 级硬件使能: Pinmux → 时钟 → 复位 → 卡检测覆写  
+/// SDIO1 SoC 级硬件使能: Pinmux → 时钟 → 复位 → 卡检测覆写
 pub fn sdio1_hw_init(cfg: &Sdio1HwConfig) {
-    // 1. Pinmux: 选择 SD1 功能 (与 VO[32..37] 复用)
+    // 0. FMUX per-pin FSEL: 将 SD1_D3/D2/D1/D0/CMD/CLK 从 SPI NOR 切换到 SD1
+    //    FMUX 基址 = SYSCON + 0x1000, SD1 引脚 FSEL 在偏移 0xD0-0xE4
+    //    默认 FSEL=6 (SPI NOR1), 写 0 选择 SD1 功能
+    let fmux_base = cfg.sysctrl_base_va + 0x1000;
+    for offset in [0xD0u32, 0xD4, 0xD8, 0xDC, 0xE0, 0xE4] {
+        let addr = fmux_base + offset as usize;
+        let prev = mmio_read::<u32>(addr);
+        if prev & 0x7 != 0 {
+            mmio_write::<u32>(addr, prev & !0x7); // FSEL = 0 = SD1
+        }
+    }
+
+    // 0b. IOBLK GRTC pad control: 为 RTC 域 SD1 引脚启用 pull-up
+    //     Linux pinctrl cvitek_pinctrl_unlock() 对 0x0502_7088..0x0502_70D8
+    //     的 20 个寄存器写 0x11111111, 每字节 bit[4]=1 表示 pull-up 使能
+    //     SD1_DAT0-DAT3/CMD/CLK 均为 RTC 域引脚, 需要 pull-up 保证信号完整
+    for i in 0..20u32 {
+        let addr = cfg.rtcsys_io_base_va + 0x88 + (i as usize) * 4;
+        mmio_write::<u32>(addr, 0x11111111);
+    }
+
+    // 1. Pinmux: 选择 SD1 功能 (与 VO[32..37] 复用) — bulk override
     mmio_write::<u32>(cfg.rtcsys_io_base_va + FMUX_SD1_VO, FMUX_SEL_SD1);
 
     // 2. CRG 主系统时钟

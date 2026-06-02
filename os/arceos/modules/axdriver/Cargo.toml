@@ -39,6 +39,7 @@ fxmac = ["net", "ax-driver-net/fxmac", "dep:ax-alloc", "dep:ax-hal", "dep:ax-dma
 
 irq = []
 dyn = ["dep:ax-errno", "dep:axplat-dyn"]
+dyn-net = ["dep:ax-errno"]
 
 default = ["bus-pci"]
 
