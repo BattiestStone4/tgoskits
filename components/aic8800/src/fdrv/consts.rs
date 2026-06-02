@@ -282,21 +282,52 @@ pub const MAX_TX_QUEUE_LEN: usize = 256;
 pub const DATA_FLOW_CTRL_THRESH: u8 = 2;
 
 // ============================================================
-// 过滤器常量
+// 过滤器常量 (NXMAC RX filter)
+//
+// 位定义照搬 vendor reg_access.h。注意：早期版本这里的位偏移是错的
+// (用了 0/1/2/3)，导致 AP 模式收不到 Auth 帧。真实位偏移见下。
+// STA 模式实际用的是硬编码的 RWNX_DEFAULT_RX_FILTER 值，一直正确；
+// AP 模式之前误用错误位拼出的值，故 Auth/Assoc 被固件丢弃。
 // ============================================================
 
-/// 接受单播帧
-pub const NXMAC_ACCEPT_UNICAST_BIT: u32 = 1 << 0;
-
+/// 接收发往本机 MAC 的单播帧 (Auth/单播管理帧依赖此位)
+pub const NXMAC_ACCEPT_MY_UNICAST_BIT: u32 = 1 << 7;
+/// 接收任意单播帧 (混杂)
+pub const NXMAC_ACCEPT_UNICAST_BIT: u32 = 1 << 6;
 /// 接收多播帧
-pub const NXMAC_ACCEPT_MULTICAST_BIT: u32 = 1 << 1;
-
+pub const NXMAC_ACCEPT_MULTICAST_BIT: u32 = 1 << 2;
 /// 接收广播帧
-pub const NXMAC_ACCEPT_BROADCAST_BIT: u32 = 1 << 2;
-
+pub const NXMAC_ACCEPT_BROADCAST_BIT: u32 = 1 << 3;
 /// 接收 Probe Request 帧 (AP 模式)
-pub const NXMAC_ACCEPT_PROBE_REQ_BIT: u32 = 1 << 3;
+pub const NXMAC_ACCEPT_PROBE_REQ_BIT: u32 = 1 << 8;
+/// 接收 Probe Response 帧
+pub const NXMAC_ACCEPT_PROBE_RESP_BIT: u32 = 1 << 9;
+/// 接收 Beacon 帧
+pub const NXMAC_ACCEPT_BEACON_BIT: u32 = 1 << 10;
+/// 接收所有 Beacon
+pub const NXMAC_ACCEPT_ALL_BEACON_BIT: u32 = 1 << 13;
+/// 接收其他 BSSID 的帧
+pub const NXMAC_ACCEPT_OTHER_BSSID_BIT: u32 = 1 << 4;
+/// 接收 Auth/Assoc 等"其他管理帧" (AP 接客必需)
+pub const NXMAC_ACCEPT_OTHER_MGMT_FRAMES_BIT: u32 = 1 << 15;
+/// 接收 QoS-Null 帧
+pub const NXMAC_ACCEPT_QO_S_NULL_BIT: u32 = 1 << 28;
+/// 接收 QoS 数据帧
+pub const NXMAC_ACCEPT_Q_DATA_BIT: u32 = 1 << 26;
+/// 接收数据帧
+pub const NXMAC_ACCEPT_DATA_BIT: u32 = 1 << 24;
+/// 接收 Block-Ack 帧
+pub const NXMAC_ACCEPT_BA_BIT: u32 = 1 << 17;
 
-/// STA 模式默认过滤器
-pub const STA_MODE_FILTER_DEFAULT: u32 =
-    NXMAC_ACCEPT_UNICAST_BIT | NXMAC_ACCEPT_MULTICAST_BIT | NXMAC_ACCEPT_BROADCAST_BIT;
+/// STA 模式过滤器：vendor 已验证的硬编码值 (RWNX_DEFAULT_RX_FILTER)。
+/// 含 MY_UNICAST/OTHER_MGMT/DATA/MULTICAST/BA 等接收必需位。
+pub const STA_MODE_FILTER_DEFAULT: u32 = 0x1502_868C;
+
+/// AP 模式过滤器：在已验证的 STA filter 基础上，叠加 AP 接客所需的
+/// ProbeReq(8) + AllBeacon(13) + OtherBSSID(4)。直接派生而非手拼，
+/// 确保 Auth 帧依赖的 MY_UNICAST(7)/OTHER_MGMT(15) 一定在位。
+/// = 0x1502A79C。对齐 vendor AP set_filter(FIF_PROBE_REQ|FIF_OTHER_BSS|...)。
+pub const AP_MODE_FILTER_DEFAULT: u32 = STA_MODE_FILTER_DEFAULT
+    | NXMAC_ACCEPT_PROBE_REQ_BIT
+    | NXMAC_ACCEPT_ALL_BEACON_BIT
+    | NXMAC_ACCEPT_OTHER_BSSID_BIT;

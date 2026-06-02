@@ -241,6 +241,23 @@ fn send_single_data_frame(
     };
     bus.tx.pktcnt.fetch_sub(1, Ordering::AcqRel);
 
+    // 管理帧(raw 802.11)走独立构造路径
+    if frame.is_mgmt {
+        let buf = match build_mgmt_frame(&frame.data, vif_idx, transport.is_v3()) {
+            Ok(b) => b,
+            Err(_) => return false,
+        };
+        if let Err(e) = transport.write_fifo(1, transport.wr_fifo_addr(), &buf) {
+            log::error!("[wifi-tx] MGMT write_fifo failed: {:?}", e);
+            return false;
+        }
+        log::info!(
+            "[wifi-tx] MGMT frame sent ({} bytes 802.11)",
+            frame.data.len()
+        );
+        return true;
+    }
+
     let eth_frame = &frame.data;
     if eth_frame.len() < ETH_HEADER_LEN {
         return false;
@@ -359,7 +376,70 @@ fn fill_hostdesc(
     // flags [26..28] = 0
 }
 
-// ===== 主处理函数 =====
+/// 构造 SDIO 管理帧 (raw 802.11)。
+///
+/// 与数据帧的区别：payload 是完整 802.11 管理帧，hostdesc 的 flags 设
+/// TXU_CNTRL_MGMT(BIT3)，staid=0xFF(未关联)，tid=0xFF，固件原样发送。
+/// 对齐 vendor rwnx_start_mgmt_xmit。
+fn build_mgmt_frame(
+    mgmt_frame: &[u8],
+    vif_idx: u8,
+    is_v3: bool,
+) -> Result<Vec<u8>, DataFrameBuildError> {
+    const SDIO_HEADER_LEN: usize = 4;
+    const HOSTDESC_SIZE: usize = 28;
+    const TXU_CNTRL_MGMT: u16 = 1 << 3;
+
+    if mgmt_frame.len() < 24 {
+        return Err(DataFrameBuildError::InvalidFrameLength);
+    }
+
+    let payload_len = mgmt_frame.len();
+    let sdio_payload_len = payload_len + HOSTDESC_SIZE;
+    let raw_len = sdio_payload_len + SDIO_HEADER_LEN;
+    let aligned_len = align_up(raw_len, TX_ALIGNMENT);
+    let sdio_hdr_len = aligned_len - SDIO_HEADER_LEN;
+
+    let final_len = if aligned_len % SDIOWIFI_FUNC_BLOCKSIZE != 0 {
+        align_up(aligned_len + TAIL_LEN, SDIOWIFI_FUNC_BLOCKSIZE)
+    } else {
+        aligned_len
+    };
+
+    let mut buf = vec![0u8; final_len];
+
+    // SDIO header
+    buf[0] = (sdio_hdr_len & 0xFF) as u8;
+    buf[1] = ((sdio_hdr_len >> 8) & 0x0F) as u8;
+    buf[2] = SDIO_TYPE_DATA;
+    buf[3] = if is_v3 {
+        crc8_ponl_107(&buf[0..3])
+    } else {
+        0x00
+    };
+
+    // HostDesc：管理帧专用字段
+    {
+        let hd = &mut buf[SDIO_HEADER_LEN..SDIO_HEADER_LEN + HOSTDESC_SIZE];
+        hd[0..2].copy_from_slice(&(payload_len as u16).to_le_bytes());
+        // flags_ext [2..4] = 0
+        // hostid [4..8]: bit31 请求 TX CFM
+        hd[4..8].copy_from_slice(&0x8000_0001u32.to_le_bytes());
+        // eth_dest/eth_src/ethertype 对管理帧无意义，置 0
+        hd[20..22].copy_from_slice(&0u16.to_le_bytes()); // ethertype = 0
+        hd[22] = 0; // ac
+        hd[23] = 0xFF; // tid = 0xFF (非 QoS)
+        hd[24] = vif_idx;
+        hd[25] = 0xFF; // staid = 0xFF (未关联 STA)
+        hd[26..28].copy_from_slice(&TXU_CNTRL_MGMT.to_le_bytes()); // flags
+    }
+
+    // payload：完整 802.11 管理帧
+    let payload_start = SDIO_HEADER_LEN + HOSTDESC_SIZE;
+    buf[payload_start..payload_start + payload_len].copy_from_slice(mgmt_frame);
+
+    Ok(buf)
+}
 
 /// TX 处理主逻辑
 fn tx_process(bus: &WifiBus) -> bool {
@@ -392,6 +472,30 @@ pub fn enqueue_data_frame(bus: &Arc<WifiBus>, eth_frame: Vec<u8>) -> Result<(), 
     queue.push_back(TxFrame {
         data: eth_frame,
         priority: 0,
+        is_mgmt: false,
+    });
+    drop(queue);
+
+    bus.tx.pktcnt.fetch_add(1, Ordering::AcqRel);
+    bus.tx.wake_pollset.wake();
+    Ok(())
+}
+
+/// 将一个完整的 802.11 管理帧入队 TX 队列(AP 模式回 Auth/Assoc Response 用)。
+///
+/// `mgmt_frame` 必须是完整的 802.11 管理帧(从 frame control 开始)。
+/// 固件按 TXU_CNTRL_MGMT 原样发送，不做以太网转换。优先级高于数据帧。
+pub fn enqueue_mgmt_frame(bus: &WifiBus, mgmt_frame: Vec<u8>) -> Result<(), TxError> {
+    let mut queue = bus.tx.queue.lock();
+    if queue.len() >= MAX_TX_QUEUE_LEN {
+        return Err(TxError::QueueFull);
+    }
+
+    // 管理帧入队头，尽快发出(auth/assoc 对时延敏感)
+    queue.push_front(TxFrame {
+        data: mgmt_frame,
+        priority: 1,
+        is_mgmt: true,
     });
     drop(queue);
 

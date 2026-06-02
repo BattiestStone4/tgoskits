@@ -105,16 +105,38 @@ fn read_block_count_with_retry(bus: &WifiBus, other_int_retries: &mut u32) -> (u
 }
 
 /// 读取 FIFO 数据
-fn read_fifo_data(bus: &WifiBus, block_cnt: u8) -> Option<Vec<u8>> {
-    let data_len = (block_cnt as usize) * SDIOWIFI_FUNC_BLOCKSIZE;
-    let mut buf = vec![0u8; data_len];
+///
+/// 将大的 CMD53 多块传输拆分为较小的段，避免 1-bit SDIO 模式下
+/// 单次传输 block 数量过多导致 SDHCI 控制器超时。
+const MAX_BLOCKS_PER_CMD53: usize = 1;
 
-    if let Err(e) = bus
-        .transport
-        .read_fifo(1, bus.transport.rd_fifo_addr(), &mut buf)
-    {
-        log::error!("[wifi-rx] read_fifo failed: {:?}", e);
-        return None;
+fn read_fifo_data(bus: &WifiBus, block_cnt: u8) -> Option<Vec<u8>> {
+    let total = block_cnt as usize;
+    let data_len = total * SDIOWIFI_FUNC_BLOCKSIZE;
+    let mut buf = vec![0u8; data_len];
+    let mut offset = 0;
+    let mut remaining = total;
+
+    while remaining > 0 {
+        let chunk = core::cmp::min(remaining, MAX_BLOCKS_PER_CMD53);
+        let chunk_len = chunk * SDIOWIFI_FUNC_BLOCKSIZE;
+
+        if let Err(e) = bus.transport.read_fifo(
+            1,
+            bus.transport.rd_fifo_addr(),
+            &mut buf[offset..offset + chunk_len],
+        ) {
+            log::error!(
+                "[wifi-rx] read_fifo failed at block {}/{}: {:?}",
+                total - remaining,
+                total,
+                e
+            );
+            return None;
+        }
+
+        offset += chunk_len;
+        remaining -= chunk;
     }
 
     Some(buf)
@@ -200,6 +222,100 @@ fn extract_hw_rxhdr_info(data_payload: &[u8]) -> HwRxHdrInfo {
 /// 检查是否为 802.11 数据帧
 fn is_80211_data_frame(fc0: u8) -> bool {
     (fc0 & 0x0C) == 0x08
+}
+
+/// 检查是否为 802.11 管理帧 (type=00)
+fn is_80211_mgmt_frame(fc0: u8) -> bool {
+    (fc0 & 0x0C) == 0x00
+}
+
+/// 管理帧子类型 (fc0 高 4 位) 的可读名称
+fn mgmt_subtype_name(fc0: u8) -> &'static str {
+    match (fc0 >> 4) & 0x0F {
+        0x0 => "AssocReq",
+        0x1 => "AssocResp",
+        0x2 => "ReassocReq",
+        0x3 => "ReassocResp",
+        0x4 => "ProbeReq",
+        0x5 => "ProbeResp",
+        0x8 => "Beacon",
+        0xA => "Disassoc",
+        0xB => "Auth",
+        0xC => "Deauth",
+        0xD => "Action",
+        _ => "Other",
+    }
+}
+
+/// AP 模式：处理固件转发上来的管理帧。
+///
+/// 当前实现开放网络的 auth 握手:收到 Auth Request(alg=0,seq=1) 即回
+/// Auth Response(alg=0,seq=2,status=0)。Assoc 等后续帧先记录。
+fn handle_mgmt_frame(bus: &WifiBus, mpdu: &[u8], pkt_len: usize) {
+    let fc0 = mpdu[0];
+    let subtype = mgmt_subtype_name(fc0);
+
+    // 管理帧地址布局固定：addr1=DA@4, addr2=SA@10, addr3=BSSID@16
+    if pkt_len < 16 {
+        return;
+    }
+    let sa = &mpdu[10..16];
+
+    match (fc0 >> 4) & 0x0F {
+        // Auth: alg(2)@24 + seq(2)@26 + status(2)@28
+        0xB if pkt_len >= 30 => {
+            let alg = u16::from_le_bytes([mpdu[24], mpdu[25]]);
+            let seq = u16::from_le_bytes([mpdu[26], mpdu[27]]);
+            log::info!("[ap-rx] Auth from {:02x?}: alg={} seq={}", sa, alg, seq);
+
+            // 开放认证(alg=0)、Auth Request(seq=1) → 回 Auth Response
+            if alg == 0 && seq == 1 {
+                send_auth_response(bus, sa);
+            }
+        }
+        // Assoc/Reassoc Req → 交给 AP worker 线程处理(ME_STA_ADD + Assoc Resp)
+        0x0 | 0x2 if pkt_len >= 28 => {
+            let cap = u16::from_le_bytes([mpdu[24], mpdu[25]]);
+            log::info!("[ap-rx] {} from {:02x?}: cap=0x{:04x}", subtype, sa, cap);
+            // 不能在 RX 线程做 ME_STA_ADD(send_cmd 会死锁)，整帧入队转给 AP worker
+            bus.ap
+                .assoc_queue
+                .lock()
+                .push_back(mpdu[..pkt_len].to_vec());
+            bus.ap.assoc_pollset.wake();
+        }
+        _ => {
+            log::info!("[ap-rx] {} from {:02x?} (fc0=0x{:02x})", subtype, sa, fc0);
+        }
+    }
+}
+
+/// 构造并发送开放网络 Auth Response (alg=0, seq=2, status=0)。
+fn send_auth_response(bus: &WifiBus, dst: &[u8]) {
+    let ap_mac = match *bus.conn.sta_mac.lock() {
+        Some(m) => m,
+        None => {
+            log::warn!("[ap-rx] no AP mac, cannot send Auth Response");
+            return;
+        }
+    };
+
+    // 802.11 Auth 帧: mgmt 头(24) + alg(2) + seq(2) + status(2) = 30 字节
+    let mut frame = Vec::with_capacity(30);
+    frame.extend_from_slice(&[0xB0, 0x00]); // fc: mgmt, subtype=Auth(0xB)
+    frame.extend_from_slice(&[0x00, 0x00]); // duration
+    frame.extend_from_slice(dst); // addr1 = DA (手机)
+    frame.extend_from_slice(&ap_mac); // addr2 = SA (AP)
+    frame.extend_from_slice(&ap_mac); // addr3 = BSSID
+    frame.extend_from_slice(&[0x00, 0x00]); // seq ctrl (固件填)
+    frame.extend_from_slice(&0u16.to_le_bytes()); // auth algorithm = Open(0)
+    frame.extend_from_slice(&2u16.to_le_bytes()); // auth seq = 2
+    frame.extend_from_slice(&0u16.to_le_bytes()); // status = success(0)
+
+    match crate::fdrv::thread::tx::enqueue_mgmt_frame(bus, frame) {
+        Ok(()) => log::info!("[ap-tx] Auth Response queued -> {:02x?}", dst),
+        Err(e) => log::warn!("[ap-tx] Auth Response enqueue failed: {:?}", e),
+    }
 }
 
 /// 获取 802.11 头部长度
@@ -339,6 +455,10 @@ fn process_data_frame(bus: &WifiBus, data_payload: &[u8], pkt_len: usize, _mpdu_
     let fc1 = mpdu[1];
 
     if !is_80211_data_frame(fc0) {
+        // AP 模式：管理帧(Auth/Assoc 等)由固件转发上来，处理握手。
+        if is_80211_mgmt_frame(fc0) {
+            handle_mgmt_frame(bus, mpdu, pkt_len);
+        }
         return;
     }
 

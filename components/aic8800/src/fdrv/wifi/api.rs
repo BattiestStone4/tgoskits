@@ -30,12 +30,14 @@ use crate::fdrv::net::device::store_wifi_net_device;
 use crate::{
     common::ChipVariant,
     fdrv::{
+        consts::AP_MODE_FILTER_DEFAULT,
         core::bus::WifiBus,
         crypto::wpa2::*,
         protocol::{
-            lmac_msg::*, send_eapol_data_frame, send_get_mac_addr_req, send_me_chan_config_req,
-            send_me_config_req, send_mm_add_if_req, send_mm_set_filter_req, send_mm_start_req,
-            send_reset_req, send_rf_calib_req, send_set_control_port_req, wait_for_eapol,
+            lmac_msg::*, send_apm_stop_req, send_eapol_data_frame, send_get_mac_addr_req,
+            send_me_chan_config_req, send_me_config_req, send_mm_add_if_req,
+            send_mm_add_if_req_typed, send_mm_set_filter_req, send_mm_start_req, send_reset_req,
+            send_rf_calib_req, send_set_control_port_req, start_open_ap, wait_for_eapol,
         },
         wifi::manager::{self, build_wpa2_rsn_ie_from_ap, disconnect},
     },
@@ -277,6 +279,97 @@ impl WifiClient {
             vif_idx
         );
         Ok(mac)
+    }
+
+    // ================================================================
+    // Phase 1 (AP): 启动开放网络 softAP
+    // ================================================================
+
+    /// 启动一个开放网络 softAP。
+    ///
+    /// 完整执行 vendor 在 SDIO 下的起 AP 序列：
+    ///   1. LMAC 基础配置（RF calib / get_mac / reset / me_config / me_chan_config）
+    ///   2. 以 MM_AP 类型添加接口（而非 STA）
+    ///   3. MM_START + 设置过滤器（含 ACCEPT_PROBE_REQ）
+    ///   4. 构造 beacon → APM_SET_BEACON_IE_REQ → APM_START_REQ（带真实 bcn 元信息）
+    ///
+    /// 返回 `Ok(cfm)`（APM_START_CFM 的 param，首字节 status==0 为成功）。
+    /// `Err(Timeout)` 多为固件镜像未含 APM task，或参数被固件拒绝。
+    pub fn start_ap_open(
+        &mut self,
+        chip: ChipVariant,
+        ssid: &[u8],
+        channel: u8,
+        timeout_ms: u64,
+    ) -> Result<Vec<u8>, WifiError> {
+        log::info!("[WifiClient] === start_ap_open START ===");
+
+        // ---- 基础 LMAC 配置 ----
+        send_rf_calib_req(&self.bus, chip, timeout_ms).map_err(WifiError::from)?;
+        let mac = send_get_mac_addr_req(&self.bus, timeout_ms).map_err(WifiError::from)?;
+        send_reset_req(&self.bus, timeout_ms).map_err(WifiError::from)?;
+        send_me_config_req(&self.bus, chip, timeout_ms).map_err(WifiError::from)?;
+        send_me_chan_config_req(&self.bus, timeout_ms).map_err(WifiError::from)?;
+
+        // ---- 以 AP 类型添加接口 ----
+        let vif_idx =
+            send_mm_add_if_req_typed(&self.bus, &mac, MM_AP, timeout_ms).map_err(|e| {
+                log::error!("[WifiClient] MM_ADD_IF(AP) failed: {:?}", e);
+                WifiError::from(e)
+            })?;
+        self.vif_idx = vif_idx;
+        log::info!(
+            "[WifiClient] AP interface added: vif_idx={}, mac={:02x?}",
+            vif_idx,
+            mac
+        );
+
+        send_mm_start_req(&self.bus, timeout_ms).map_err(WifiError::from)?;
+
+        // AP 模式过滤器：NOT_CHANGEABLE(含 MY_UNICAST/OTHER_MGMT，Auth 帧依赖)
+        // + ProbeReq/AllBeacon/OtherBSSID。之前误用错误位偏移导致 Auth 收不到。
+        send_mm_set_filter_req(&self.bus, AP_MODE_FILTER_DEFAULT, timeout_ms)
+            .map_err(WifiError::from)?;
+
+        self.sta_mac = Some(mac);
+        self.bus
+            .conn
+            .vif_idx
+            .store(vif_idx, core::sync::atomic::Ordering::Release);
+        // 存 AP 自身 MAC，供 rx 线程构造 Auth/Assoc Response 的 SA/BSSID
+        self.bus.conn.sta_mac.lock().replace(mac);
+
+        // ---- 完整起 AP 序列：beacon 下发 + APM_START ----
+        log::info!("[WifiClient] Starting AP (beacon + APM_START)...");
+        let cfm =
+            start_open_ap(&self.bus, vif_idx, &mac, ssid, channel, timeout_ms).map_err(|e| {
+                log::error!("[WifiClient] start_open_ap failed: {:?}", e);
+                WifiError::from(e)
+            })?;
+
+        let status = cfm.first().copied().unwrap_or(0xFF);
+        log::info!(
+            "[WifiClient] === APM_START_CFM received! status={}, cfm={:02x?} ===",
+            status,
+            &cfm[..cfm.len().min(8)]
+        );
+        if status == 0 {
+            log::info!("[WifiClient] *** AP STARTED — SSID broadcasting ***");
+        } else {
+            log::warn!(
+                "[WifiClient] APM_START_CFM status != 0 ({}), AP may not be up",
+                status
+            );
+        }
+
+        Ok(cfm)
+    }
+
+    /// 停止 AP（探测后清理）
+    pub fn stop_ap(&self, timeout_ms: u64) -> Result<(), WifiError> {
+        send_apm_stop_req(&self.bus, self.vif_idx, timeout_ms).map_err(WifiError::from)?;
+        log::info!("[WifiClient] AP stopped (vif_idx={})", self.vif_idx);
+        Ok(())
     }
 
     // ================================================================

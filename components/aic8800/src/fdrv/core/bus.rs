@@ -17,6 +17,9 @@ pub enum BusState {
 pub struct TxFrame {
     pub data: Vec<u8>,
     pub priority: u8,
+    /// true: data 为完整 802.11 管理帧(raw)，按 TXU_CNTRL_MGMT 发送，
+    /// 固件不做以太网→802.11 转换；false: data 为以太网帧。
+    pub is_mgmt: bool,
 }
 
 /// 连接状态
@@ -131,6 +134,26 @@ impl TxState {
     }
 }
 
+/// AP 模式状态：待处理的关联请求队列。
+///
+/// RX 线程收到 AssocReq 时把整帧 mpdu 入队(非阻塞)，由独立的 AP worker
+/// 线程取出处理(ME_STA_ADD + Assoc Response)。必须用独立线程，因为
+/// ME_STA_ADD 走 send_cmd 阻塞等 CFM，而 CFM 由 RX 线程处理 —— 在 RX
+/// 线程里 send_cmd 会死锁。
+pub struct ApState {
+    pub assoc_queue: SpinNoIrq<VecDeque<Vec<u8>>>,
+    pub assoc_pollset: PollSet,
+}
+
+impl ApState {
+    pub fn new() -> Self {
+        Self {
+            assoc_queue: SpinNoIrq::new(VecDeque::new()),
+            assoc_pollset: PollSet::new(),
+        }
+    }
+}
+
 /// SDIO 总线共享资源
 pub struct WifiBus {
     /// SDIO 传输层
@@ -150,6 +173,9 @@ pub struct WifiBus {
 
     /// TX 状态
     pub tx: TxState,
+
+    /// AP 模式状态
+    pub ap: ApState,
 }
 
 impl WifiBus {
@@ -161,6 +187,7 @@ impl WifiBus {
             cmd: CmdState::new(),
             rx: RxState::new(),
             tx: TxState::new(),
+            ap: ApState::new(),
         })
     }
 
@@ -177,6 +204,9 @@ impl WifiBus {
         self.rx.irq_pollset.wake();
 
         self.rx.data_queue.lock().clear();
+
+        self.ap.assoc_pollset.wake();
+        self.ap.assoc_queue.lock().clear();
 
         self.cmd.rsp_error.store(true, Ordering::Release);
         self.cmd.rsp_pollset.wake();

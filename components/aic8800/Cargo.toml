@@ -28,8 +28,6 @@ ax-driver-net = { workspace = true }
 
 ax-net = { workspace = true, optional = true }
 
-ax-plat-riscv64-sg2002 = { workspace = true, features = ["irq"] }
-
 hmac = { version = "0.12", default-features = false }
 sha1 = { version = "0.10", default-features = false }
 digest = { version = "0.10", default-features = false }

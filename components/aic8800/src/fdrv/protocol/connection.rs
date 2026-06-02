@@ -226,8 +226,20 @@ pub fn send_mm_add_if_req(
     mac_addr: &[u8; 6],
     timeout_ms: u64,
 ) -> Result<u8, CmdError> {
+    send_mm_add_if_req_typed(bus, mac_addr, MM_STA, timeout_ms)
+}
+
+/// 发送 MM_ADD_IF_REQ（指定接口类型）
+///
+/// `if_type`: MM_STA(0) / MM_IBSS(1) / MM_AP(2)
+pub fn send_mm_add_if_req_typed(
+    bus: &Arc<WifiBus>,
+    mac_addr: &[u8; 6],
+    if_type: u8,
+    timeout_ms: u64,
+) -> Result<u8, CmdError> {
     let mut param = [0u8; MM_ADD_IF_REQ_SIZE];
-    param[0] = MM_STA; // type at offset 0
+    param[0] = if_type; // type at offset 0
     // param[1] = 0 (padding for mac_addr alignment)
     param[2..8].copy_from_slice(mac_addr); // addr at offset 2
     param[8] = 0; // p2p = false

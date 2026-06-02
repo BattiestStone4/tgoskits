@@ -175,6 +175,13 @@ pub const ME_CHAN_CONFIG_REQ: u16 = 0x1402;
 pub const ME_CHAN_CONFIG_CFM: u16 = 0x1403;
 pub const ME_SET_CONTROL_PORT_REQ: u16 = 0x1404;
 pub const ME_SET_CONTROL_PORT_CFM: u16 = 0x1405;
+// ME_TKIP_MIC_FAILURE_IND = 0x1406
+pub const ME_STA_ADD_REQ: u16 = 0x1407;
+pub const ME_STA_ADD_CFM: u16 = 0x1408;
+/// me_sta_add_req 大小 (实测 offsetof，u8_l=uint8_t)
+pub const ME_STA_ADD_REQ_SIZE: usize = 136;
+/// STA flags (mac_sta_flags)
+pub const STA_QOS_CAPA: u32 = 1 << 0;
 
 // ========== VIF 类型 ==========
 pub const MM_STA: u8 = 0;
@@ -282,6 +289,18 @@ pub struct ScanResult {
 // ================================================================
 // 以下为扫描 + 连接 + 密钥管理 + 断连所需的补充定义
 // ================================================================
+
+// ========== APM messages (TASK_APM = 7, base = 0x1C00) ==========
+pub const APM_START_REQ: u16 = lmac_first_msg(TASK_APM); // 0x1C00
+pub const APM_START_CFM: u16 = lmac_first_msg(TASK_APM) + 1; // 0x1C01
+pub const APM_STOP_REQ: u16 = lmac_first_msg(TASK_APM) + 2; // 0x1C02
+pub const APM_STOP_CFM: u16 = lmac_first_msg(TASK_APM) + 3; // 0x1C03
+pub const APM_START_CAC_REQ: u16 = lmac_first_msg(TASK_APM) + 4; // 0x1C04
+pub const APM_START_CAC_CFM: u16 = lmac_first_msg(TASK_APM) + 5; // 0x1C05
+pub const APM_STOP_CAC_REQ: u16 = lmac_first_msg(TASK_APM) + 6; // 0x1C06
+pub const APM_STOP_CAC_CFM: u16 = lmac_first_msg(TASK_APM) + 7; // 0x1C07
+pub const APM_SET_BEACON_IE_REQ: u16 = lmac_first_msg(TASK_APM) + 8; // 0x1C08
+pub const APM_SET_BEACON_IE_CFM: u16 = lmac_first_msg(TASK_APM) + 9; // 0x1C09
 
 // ========== SM messages (TASK_SM = 6, base = 0x1800) ==========
 pub const SM_CONNECT_REQ: u16 = lmac_first_msg(TASK_SM); // 0x1800  

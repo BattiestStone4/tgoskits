@@ -1,5 +1,6 @@
 //! 协议和命令模块
 
+pub mod apm;
 pub mod cmd;
 pub mod config;
 pub mod connection;
@@ -8,6 +9,10 @@ pub mod lmac_msg;
 pub mod scan;
 
 // 重导出 cmd 中的公共 API（CMD 框架 + EAPOL）
+pub use apm::{
+    send_apm_set_beacon_ie_req, send_apm_start_req, send_apm_stop_req, send_me_sta_add_req,
+    start_open_ap,
+};
 pub use cmd::*;
 pub use config::{
     send_get_mac_addr_req, send_me_chan_config_req, send_me_config_req, send_mm_set_filter_req,
@@ -15,11 +20,14 @@ pub use config::{
     send_set_control_port_req, send_set_stack_start_req, send_txpwr_idx_req, send_txpwr_ofst_req,
 };
 pub use connection::{
-    send_mm_add_if_req, send_sm_connect_req, send_sm_disconnect_req, wait_for_indication,
+    send_mm_add_if_req, send_mm_add_if_req_typed, send_sm_connect_req, send_sm_disconnect_req,
+    wait_for_indication,
 };
 pub use key::{send_key_add_req, send_key_del_req};
 // 显式重导出 lmac_msg 中的协议定义
 pub use lmac_msg::{
+    APM_SET_BEACON_IE_CFM, APM_SET_BEACON_IE_REQ, APM_START_CAC_CFM, APM_START_CAC_REQ,
+    APM_START_CFM, APM_START_REQ, APM_STOP_CAC_CFM, APM_STOP_CAC_REQ, APM_STOP_CFM, APM_STOP_REQ,
     CHAN_2G4_FREQS, CMD_TIMEOUT_MS, CMD_TX_TIMEOUT_DEFAULT_MS, CONTROL_PORT_HOST,
     CONTROL_PORT_NO_ENC, CmdError, ConnectResult, DISABLE_HT, DRV_TASK_ID, DisconnectInfo, LmacMsg,
     MAC_ADDR_LEN, MAC_ADDR_SIZE, MAC_CHAN_DEF_SIZE, MAC_CIPHER_CCMP, MAC_CIPHER_TKIP,

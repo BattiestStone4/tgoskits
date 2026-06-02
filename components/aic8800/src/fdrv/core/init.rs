@@ -24,7 +24,7 @@ use crate::{
             sdio_transport::SdioTransport,
         },
         protocol::{DRV_TASK_ID, MM_SET_STACK_START_REQ, TASK_MM},
-        thread::{rx, tx},
+        thread::{ap, rx, tx},
     },
 };
 
@@ -441,6 +441,7 @@ fn start_driver_threads(bus: &alloc::sync::Arc<WifiBus>) {
     *bus.state.lock() = BusState::Up;
     rx::start(alloc::sync::Arc::clone(&bus));
     tx::start(alloc::sync::Arc::clone(&bus));
+    ap::start(alloc::sync::Arc::clone(&bus));
 }
 
 /// FDRV 初始化入口
