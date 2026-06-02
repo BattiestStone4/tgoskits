@@ -216,6 +216,18 @@ impl Service {
         self.dhcp.is_some()
     }
 
+    pub fn register_ethernet_device(
+        &mut self,
+        name: alloc::string::String,
+        dev: ax_driver::prelude::AxNetDevice,
+    ) {
+        let mac = EthernetAddress(dev.mac_address().0);
+        let eth_dev = self.router.add_device(Box::new(
+            crate::device::EthernetDevice::new(name, dev, None),
+        ));
+        self.enable_dhcp(eth_dev, mac);
+    }
+
     pub fn dhcp_configured(&self) -> bool {
         self.dhcp
             .as_ref()

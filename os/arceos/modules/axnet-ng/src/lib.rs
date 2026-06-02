@@ -158,6 +158,22 @@ pub fn init_network(mut net_devs: AxDeviceContainer<AxNetDevice>) {
     }
 }
 
+/// Register a WiFi network device after initial boot.
+///
+/// For platforms where the NIC is initialized after `init_network()` has
+/// already been called (e.g., WiFi drivers that need firmware download first).
+/// Enables DHCP for the new device and spawns the DHCP bootstrap task.
+pub fn register_wifi_device(dev: AxNetDevice) {
+    info!("Registering late WiFi network device");
+    let service = SERVICE
+        .get()
+        .expect("Network service not initialized; call init_network() first");
+    let mut s = service.lock();
+    s.register_ethernet_device("wlan0".to_owned(), dev);
+    drop(s);
+    ax_task::spawn_with_name(dhcp_bootstrap, "dhcp-bootstrap".to_owned());
+}
+
 /// Init vsock subsystem by vsock devices.
 #[cfg(feature = "vsock")]
 pub fn init_vsock(mut vsock_devs: AxDeviceContainer<AxVsockDevice>) {

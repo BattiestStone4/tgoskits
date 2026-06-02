@@ -28,3 +28,6 @@ mod syscall;
 mod task;
 mod time;
 mod trap;
+
+#[cfg(feature = "sg2002-wifi")]
+mod wifi;
