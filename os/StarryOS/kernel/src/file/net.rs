@@ -22,6 +22,9 @@ use crate::file::{IoDst, IoSrc, get_file_like};
 
 const ETH0_NAME: &[u8] = b"eth0";
 const ETH0_HWADDR: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
+const WLAN0_NAME: &[u8] = b"wlan0";
+const WLAN0_HWADDR: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x02];
+const WLAN0_IPV4: [u8; 4] = [192, 168, 50, 1];
 const LO_NAME: &[u8] = b"lo";
 const ARPHRD_ETHER: u16 = 1;
 const ARPHRD_LOOPBACK: u16 = 772;
@@ -53,6 +56,7 @@ impl Socket {
 #[derive(Clone, Copy)]
 enum NetInterface {
     Eth0,
+    Wlan0,
     Loopback,
 }
 
@@ -87,6 +91,7 @@ fn read_ifreq_interface(arg: usize) -> AxResult<NetInterface> {
     let end = name.iter().position(|&b| b == 0).unwrap_or(name.len());
     match &name[..end] {
         ETH0_NAME => Ok(NetInterface::Eth0),
+        WLAN0_NAME => Ok(NetInterface::Wlan0),
         LO_NAME => Ok(NetInterface::Loopback),
         _ => Err(AxError::NoSuchDevice),
     }
@@ -132,6 +137,10 @@ fn write_eth0_ifconf(arg: usize) -> AxResult<()> {
         let mut written = 0;
         if ifc_len >= IFREQ_COMPAT_LEN as i32 {
             write_ifconf_entry(buf, written, ETH0_NAME, configured_eth0_ipv4())?;
+            written += IFREQ_COMPAT_LEN;
+        }
+        if ifc_len >= (written + IFREQ_COMPAT_LEN) as i32 {
+            write_ifconf_entry(buf, written, WLAN0_NAME, WLAN0_IPV4)?;
             written += IFREQ_COMPAT_LEN;
         }
         if ifc_len >= (written + IFREQ_COMPAT_LEN) as i32 {
@@ -197,7 +206,9 @@ impl FileLike for Socket {
             SIOCGIFCONF => write_eth0_ifconf(arg)?,
             SIOCGIFFLAGS => {
                 let flags = match read_ifreq_interface(arg)? {
-                    NetInterface::Eth0 => IFF_UP | IFF_BROADCAST | IFF_RUNNING | IFF_MULTICAST,
+                    NetInterface::Eth0 | NetInterface::Wlan0 => {
+                        IFF_UP | IFF_BROADCAST | IFF_RUNNING | IFF_MULTICAST
+                    }
                     NetInterface::Loopback => IFF_UP | IFF_LOOPBACK | IFF_RUNNING,
                 };
                 write_ifreq_data(arg, &flags.to_ne_bytes())?;
@@ -205,13 +216,14 @@ impl FileLike for Socket {
             SIOCGIFADDR => {
                 let addr = match read_ifreq_interface(arg)? {
                     NetInterface::Eth0 => configured_eth0_ipv4(),
+                    NetInterface::Wlan0 => WLAN0_IPV4,
                     NetInterface::Loopback => [127, 0, 0, 1],
                 };
                 write_ifreq_sockaddr(arg, addr)?;
             }
             SIOCGIFDSTADDR => {
                 let addr = match read_ifreq_interface(arg)? {
-                    NetInterface::Eth0 => [0, 0, 0, 0],
+                    NetInterface::Eth0 | NetInterface::Wlan0 => [0, 0, 0, 0],
                     NetInterface::Loopback => [127, 0, 0, 1],
                 };
                 write_ifreq_sockaddr(arg, addr)?;
@@ -223,24 +235,30 @@ impl FileLike for Socket {
                         addr[3] = 255;
                         addr
                     }
+                    NetInterface::Wlan0 => {
+                        let mut addr = WLAN0_IPV4;
+                        addr[3] = 255;
+                        addr
+                    }
                     NetInterface::Loopback => [127, 0, 0, 1],
                 };
                 write_ifreq_sockaddr(arg, addr)?;
             }
             SIOCGIFNETMASK => {
                 let addr = match read_ifreq_interface(arg)? {
-                    NetInterface::Eth0 => [255, 255, 255, 0],
+                    NetInterface::Eth0 | NetInterface::Wlan0 => [255, 255, 255, 0],
                     NetInterface::Loopback => [255, 0, 0, 0],
                 };
                 write_ifreq_sockaddr(arg, addr)?;
             }
             SIOCGIFHWADDR => match read_ifreq_interface(arg)? {
                 NetInterface::Eth0 => write_ifreq_hwaddr(arg, ARPHRD_ETHER, &ETH0_HWADDR)?,
+                NetInterface::Wlan0 => write_ifreq_hwaddr(arg, ARPHRD_ETHER, &WLAN0_HWADDR)?,
                 NetInterface::Loopback => write_ifreq_hwaddr(arg, ARPHRD_LOOPBACK, &[])?,
             },
             SIOCGIFMTU => {
                 let mtu = match read_ifreq_interface(arg)? {
-                    NetInterface::Eth0 => ETH0_MTU,
+                    NetInterface::Eth0 | NetInterface::Wlan0 => ETH0_MTU,
                     NetInterface::Loopback => LO_MTU,
                 };
                 write_ifreq_data(arg, &mtu.to_ne_bytes())?;

@@ -97,6 +97,27 @@ pub fn probe_wifi() {
             info!("[wifi] AP started! APM_START_CFM={:02x?}", cfm);
             info!("[wifi] SSID=PicoClaw-Car channel={} (open network)", channel);
             info!("==========================================================");
+
+            // 注册 wlan0 到网络栈:静态 IP 192.168.50.1/24 + 内建 DHCP server
+            // 给连入的手机分配 192.168.50.2。手机随后可 ping 192.168.50.1。
+            client.store_net_device();
+            match aic8800::fdrv::take_wifi_net_device() {
+                Some(netdev) => {
+                    axnet::register_wifi_ap_device(
+                        netdev,
+                        [192, 168, 50, 1], // server (wlan0) IP
+                        [192, 168, 50, 2], // client (phone) IP
+                        24,
+                    );
+                    // AIC8800 RX 走自己的线程独占 SDIO CARD_INT,不经 ax_net 的
+                    // 以太网 IRQ 框架。注册回调,收到数据帧时驱动网络栈 poll 并
+                    // 唤醒阻塞的 socket,否则进来的 ARP/ICMP/数据包在空闲时无人处理、
+                    // 且阻塞在 recv 的进程要等自己下一次发包才醒(延迟卡在发包间隔)。
+                    aic8800::fdrv::register_rx_data_callback(axnet::notify_wifi_rx);
+                    info!("[wifi] wlan0 registered: 192.168.50.1/24, DHCP -> 192.168.50.2");
+                }
+                None => error!("[wifi] no net device to register"),
+            }
         }
         Err(e) => {
             error!("==========================================================");

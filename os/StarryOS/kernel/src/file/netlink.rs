@@ -48,6 +48,11 @@ use crate::{
     task::AsThread,
 };
 
+/// SoftAP WiFi interface (wlan0). Index follows eth0 (`ETH0_IFINDEX` = 2);
+/// MAC mirrors the placeholder used by the SIOCGIF* path in `net.rs`.
+const WLAN0_IFINDEX: i32 = ETH0_IFINDEX + 1;
+const WLAN0_HWADDR: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x02];
+
 /// Maximum number of queued receive messages per socket.  Matches
 /// libudev's default monitor buffer expectation (~32 messages × 4 KiB).
 const MAX_QUEUED: usize = 128;
@@ -209,6 +214,18 @@ const LINKS: &[LinkInfo] = &[
         address: ETH0_HWADDR,
         broadcast: [0xff; 6],
     },
+    LinkInfo {
+        index: WLAN0_IFINDEX,
+        name: "wlan0",
+        ty: ARPHRD_ETHER,
+        flags: IFF_UP | IFF_BROADCAST | IFF_RUNNING | IFF_MULTICAST | IFF_LOWER_UP,
+        mtu: 1500,
+        qlen: 1000,
+        qdisc: "mq",
+        operstate: IF_OPER_UP,
+        address: WLAN0_HWADDR,
+        broadcast: [0xff; 6],
+    },
 ];
 
 const ADDRS: &[AddrInfo] = &[
@@ -227,6 +244,14 @@ const ADDRS: &[AddrInfo] = &[
         scope: RT_SCOPE_UNIVERSE,
         local: [10, 0, 2, 15],
         broadcast: Some([10, 0, 2, 255]),
+    },
+    AddrInfo {
+        index: WLAN0_IFINDEX as u32,
+        label: "wlan0",
+        prefix_len: 24,
+        scope: RT_SCOPE_UNIVERSE,
+        local: [192, 168, 50, 1],
+        broadcast: Some([192, 168, 50, 255]),
     },
 ];
 
