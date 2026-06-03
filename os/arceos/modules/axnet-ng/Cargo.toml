@@ -43,6 +43,9 @@ features = [
   "medium-ip",
   "proto-ipv4",
   "proto-ipv6",
+  # in smoltcp's default set, dropped by default-features=false; without it the
+  # iface silently ignores inbound ping (no userspace echo responder exists)
+  "auto-icmp-echo-reply",
   "socket-raw",
   "socket-icmp",
   "socket-udp",

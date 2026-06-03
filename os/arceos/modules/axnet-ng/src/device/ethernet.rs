@@ -516,4 +516,8 @@ impl Device for EthernetDevice {
             self.inner.poll_ready.register(waker);
         }
     }
+
+    fn wake_rx(&self) {
+        self.inner.poll_ready.wake();
+    }
 }

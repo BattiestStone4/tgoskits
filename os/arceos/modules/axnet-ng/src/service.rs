@@ -17,7 +17,9 @@ use smoltcp::{
     },
 };
 
-use crate::{SOCKET_SET, consts::STANDARD_MTU, device::ArpEntry, router::Router};
+use crate::{
+    SOCKET_SET, consts::STANDARD_MTU, device::ArpEntry, dhcp_server::DhcpServer, router::Router,
+};
 
 fn now() -> Instant {
     Instant::from_micros_const((wall_time_nanos() / NANOS_PER_MICROS) as i64)
@@ -28,6 +30,7 @@ pub struct Service {
     router: Router,
     timeout: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
     dhcp: Option<DhcpState>,
+    dhcp_server: Option<DhcpServer>,
 }
 
 struct DhcpState {
@@ -204,6 +207,7 @@ impl Service {
             router,
             timeout: None,
             dhcp: None,
+            dhcp_server: None,
         }
     }
 
@@ -222,10 +226,45 @@ impl Service {
         dev: ax_driver::prelude::AxNetDevice,
     ) {
         let mac = EthernetAddress(dev.mac_address().0);
-        let eth_dev = self.router.add_device(Box::new(
-            crate::device::EthernetDevice::new(name, dev, None),
-        ));
+        let eth_dev = self
+            .router
+            .add_device(Box::new(crate::device::EthernetDevice::new(
+                name, dev, None,
+            )));
         self.enable_dhcp(eth_dev, mac);
+    }
+
+    /// 注册一个使用静态 IP 的以太网设备(不启用 DHCP 客户端)。
+    /// 返回设备索引,供随后启用 DHCP 服务器使用。用于 SoftAP 的 wlan0。
+    pub fn register_static_device(
+        &mut self,
+        name: alloc::string::String,
+        dev: ax_driver::prelude::AxNetDevice,
+        cidr: Ipv4Cidr,
+    ) -> usize {
+        let eth_dev = self
+            .router
+            .add_device(Box::new(crate::device::EthernetDevice::new(
+                name,
+                dev,
+                Some(cidr),
+            )));
+        // 配置静态路由(本子网直连,无默认网关)+ 接口地址
+        self.router.set_ipv4_config(eth_dev, Some(cidr), None);
+        Self::set_interface_ipv4(&mut self.iface, None, Some(cidr));
+        eth_dev
+    }
+
+    /// 在指定设备上启用 DHCP 服务器,给客户端分配 `client_ip`。
+    pub fn enable_dhcp_server(
+        &mut self,
+        dev: usize,
+        server_ip: Ipv4Address,
+        client_ip: Ipv4Address,
+        subnet_mask: Ipv4Address,
+    ) {
+        self.dhcp_server = Some(DhcpServer::new(dev, server_ip, client_ip, subnet_mask));
+        info!("wlan0: DHCP server enabled (offering {client_ip})");
     }
 
     pub fn dhcp_configured(&self) -> bool {
@@ -237,9 +276,12 @@ impl Service {
     pub fn poll(&mut self, sockets: &mut SocketSet) -> bool {
         let timestamp = now();
         let mut dhcp_events = Vec::new();
+        // DHCP 服务器:在 snoop(只读)里构造应答,闭包外广播发出
+        let mut dhcp_server_replies: Vec<(usize, Vec<u8>)> = Vec::new();
 
         {
             let dhcp = &mut self.dhcp;
+            let dhcp_server = &mut self.dhcp_server;
             self.router.poll(timestamp, sockets, |dev, packet| {
                 if let Some(event) = dhcp
                     .as_mut()
@@ -247,14 +289,29 @@ impl Service {
                 {
                     dhcp_events.push(event);
                 }
+                if let Some(reply) = dhcp_server
+                    .as_mut()
+                    .and_then(|srv| srv.process_packet(dev, packet))
+                {
+                    dhcp_server_replies.push((dev, reply));
+                }
             });
         }
         for event in dhcp_events {
             self.handle_dhcp_event(event);
         }
+        let server_sent = !dhcp_server_replies.is_empty();
+        for (dev, reply) in dhcp_server_replies {
+            self.router.send_on_device(
+                dev,
+                IpAddress::Ipv4(Ipv4Address::BROADCAST),
+                &reply,
+                timestamp,
+            );
+        }
         self.iface.poll(timestamp, &mut self.router, sockets);
         let dhcp_poll_next = self.poll_dhcp(timestamp);
-        self.router.dispatch(timestamp) || dhcp_poll_next
+        self.router.dispatch(timestamp) || dhcp_poll_next || server_sent
     }
 
     fn poll_dhcp(&mut self, timestamp: Instant) -> bool {
@@ -347,6 +404,14 @@ impl Service {
                 .lookup(&addr)
                 .map_or(0, |it| 1u32 << it.dev),
             None => u32::MAX,
+        }
+    }
+
+    /// Wakes RX-readiness wakers on all devices. Used to nudge blocked sockets
+    /// after a frame arrives on a device that isn't IRQ-driven (SDIO WiFi).
+    pub fn wake_all_devices(&self) {
+        for device in self.router.devices.iter() {
+            device.wake_rx();
         }
     }
 

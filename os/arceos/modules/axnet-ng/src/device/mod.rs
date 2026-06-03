@@ -49,4 +49,12 @@ pub trait Device: Send + Sync {
     }
 
     fn register_waker(&self, waker: &Waker);
+
+    /// Wakes any tasks blocked waiting for RX readiness on this device.
+    ///
+    /// For IRQ-driven NICs this happens automatically from the IRQ handler.
+    /// SDIO WiFi (AIC8800) drives RX from its own thread outside the ethernet
+    /// IRQ framework, so the kernel calls this (via a registered callback) when
+    /// a frame arrives, mirroring what the IRQ handler would do.
+    fn wake_rx(&self) {}
 }

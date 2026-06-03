@@ -21,6 +21,7 @@ extern crate std;
 
 mod consts;
 mod device;
+mod dhcp_server;
 mod general;
 mod listen_table;
 /// Socket option types and the [`Configurable`](options::Configurable) trait.
@@ -44,12 +45,16 @@ mod wrapper;
 
 use alloc::{borrow::ToOwned, boxed::Box, vec::Vec};
 use core::{
+    future::poll_fn,
     sync::atomic::{AtomicBool, Ordering},
+    task::Poll,
     time::Duration,
 };
 
 use ax_driver::{AxDeviceContainer, prelude::*};
 use ax_sync::Mutex;
+use ax_task::future::block_on;
+use axpoll::PollSet;
 use smoltcp::wire::{EthernetAddress, Ipv4Address, Ipv4Cidr};
 use spin::{Lazy, Once};
 
@@ -69,6 +74,12 @@ static SOCKET_SET: Lazy<SocketSetWrapper> = Lazy::new(SocketSetWrapper::new);
 static SERVICE: Once<Mutex<Service>> = Once::new();
 static POLLING_INTERFACES: AtomicBool = AtomicBool::new(false);
 static POLL_AGAIN: AtomicBool = AtomicBool::new(false);
+
+/// Signal raised by the WiFi RX thread when a frame arrives, consumed by the
+/// dedicated `wlan0-poll` task. Decouples SDIO RX (which owns the bus) from
+/// stack polling so RX never blocks behind `poll_interfaces`.
+static WIFI_RX_SIGNAL: PollSet = PollSet::new();
+static WIFI_POLL_TASK_STARTED: AtomicBool = AtomicBool::new(false);
 
 const DHCP_BOOTSTRAP_ATTEMPTS: usize = 200;
 const DHCP_BOOTSTRAP_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -174,6 +185,45 @@ pub fn register_wifi_device(dev: AxNetDevice) {
     ax_task::spawn_with_name(dhcp_bootstrap, "dhcp-bootstrap".to_owned());
 }
 
+/// Register a WiFi AP network device with a static IP and a DHCP server.
+///
+/// For SoftAP mode: the board is the access point. wlan0 gets a static IP
+/// (`server_ip`), and a built-in DHCP server hands `client_ip` to a single
+/// connecting station. No DHCP client is started for this interface.
+pub fn register_wifi_ap_device(
+    dev: AxNetDevice,
+    server_ip: [u8; 4],
+    client_ip: [u8; 4],
+    prefix_len: u8,
+) {
+    let server_ip = Ipv4Address::new(server_ip[0], server_ip[1], server_ip[2], server_ip[3]);
+    let client_ip = Ipv4Address::new(client_ip[0], client_ip[1], client_ip[2], client_ip[3]);
+    info!("Registering WiFi AP device wlan0 (static {server_ip}/{prefix_len})");
+    let service = SERVICE
+        .get()
+        .expect("Network service not initialized; call init_network() first");
+    let mut s = service.lock();
+    let cidr = Ipv4Cidr::new(server_ip, prefix_len);
+    let dev_idx = s.register_static_device("wlan0".to_owned(), dev, cidr);
+    let subnet_mask = prefix_to_mask(prefix_len);
+    s.enable_dhcp_server(dev_idx, server_ip, client_ip, subnet_mask);
+    drop(s);
+    // SDIO WiFi drives RX from its own thread; start the dedicated poll task so
+    // inbound frames are serviced (DHCP/ICMP/ARP) without blocking that thread.
+    start_wifi_poll_task();
+}
+
+/// 由前缀长度构造 IPv4 子网掩码。
+fn prefix_to_mask(prefix_len: u8) -> Ipv4Address {
+    let bits: u32 = if prefix_len == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix_len as u32)
+    };
+    let o = bits.to_be_bytes();
+    Ipv4Address::new(o[0], o[1], o[2], o[3])
+}
+
 /// Init vsock subsystem by vsock devices.
 #[cfg(feature = "vsock")]
 pub fn init_vsock(mut vsock_devs: AxDeviceContainer<AxVsockDevice>) {
@@ -212,6 +262,46 @@ pub fn poll_interfaces() {
 
 pub fn arp_entries() -> Vec<ArpEntry> {
     get_service().arp_entries()
+}
+
+/// Notify the stack that a WiFi RX frame arrived.
+///
+/// AIC8800 is SDIO WiFi: its RX thread owns the SDIO interrupt and is outside
+/// the ethernet IRQ framework, so incoming frames never wake the device's
+/// `poll_ready`. The kernel registers this as the aic8800 RX callback.
+///
+/// This runs **on the SDIO RX thread**, so it must stay cheap: it only raises
+/// a signal. The dedicated `wlan0-poll` task (see [`start_wifi_poll_task`])
+/// wakes on that signal and does the actual `poll_interfaces` + socket wake
+/// from its own context. Doing the poll here would re-enter the stack on the
+/// RX thread, starving SDIO RX and overflowing the TX queue (ENOBUFS).
+pub fn notify_wifi_rx() {
+    WIFI_RX_SIGNAL.wake();
+}
+
+/// Spawn the dedicated WiFi poll task (idempotent).
+///
+/// The task sleeps on [`WIFI_RX_SIGNAL`]; each time the RX thread signals a
+/// frame, it polls all interfaces (generating DHCP/ICMP/ARP replies) and then
+/// wakes RX-readiness wakers so sockets blocked in `recv` wake promptly. This
+/// keeps heavy stack work off the SDIO RX thread.
+pub fn start_wifi_poll_task() {
+    if WIFI_POLL_TASK_STARTED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    ax_task::spawn_with_name(
+        || {
+            block_on(poll_fn(|cx| {
+                // Register first so a signal racing with the poll below is not
+                // lost: if it fires after register, we are woken again.
+                WIFI_RX_SIGNAL.register(cx.waker());
+                poll_interfaces();
+                get_service().wake_all_devices();
+                Poll::Pending
+            }))
+        },
+        "wlan0-poll".to_owned(),
+    );
 }
 
 fn dhcp_bootstrap() {
