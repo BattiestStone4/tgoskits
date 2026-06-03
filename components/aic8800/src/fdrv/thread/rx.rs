@@ -1,7 +1,7 @@
 use alloc::{sync::Arc, vec, vec::Vec};
 use core::{
     future::poll_fn,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     task::Poll,
 };
 
@@ -20,6 +20,36 @@ use crate::{
 };
 
 pub static RX_WAKE_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// 上层(StarryOS)注册的"收到数据帧"回调,存为 `fn()` 裸指针。
+///
+/// AIC8800 是 SDIO WiFi,RX 走自己的线程并独占 SDIO CARD_INT (IRQ#38),
+/// 不经过 ax_net 的以太网 IRQ 框架。因此数据帧入队后,需主动通知网络栈
+/// 来驱动一轮 poll(否则进来的 ARP/ICMP/数据包无人处理)。上层把此回调
+/// 设为 `ax_net::poll_interfaces`,反转依赖,避免本 crate 直接依赖网络栈。
+static RX_DATA_CALLBACK: AtomicUsize = AtomicUsize::new(0);
+
+/// 本批 RX 是否有数据帧入队(由 `build_and_enqueue_eth_frame` 置位,
+/// RX 线程处理完一批后读取并清除,据此决定是否驱动网络栈 poll)。
+static RX_DATA_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// 注册"收到数据帧"回调(由 StarryOS 在注册 wlan0 后调用)。
+pub fn register_rx_data_callback(cb: fn()) {
+    RX_DATA_CALLBACK.store(cb as usize, Ordering::Release);
+}
+
+/// 若本批有数据帧入队且已注册回调,则调用回调驱动网络栈 poll。
+fn invoke_rx_data_callback() {
+    if !RX_DATA_PENDING.swap(false, Ordering::AcqRel) {
+        return;
+    }
+    let ptr = RX_DATA_CALLBACK.load(Ordering::Acquire);
+    if ptr != 0 {
+        // SAFETY: ptr 来自 register_rx_data_callback 存入的 `fn()`。
+        let cb: fn() = unsafe { core::mem::transmute(ptr) };
+        cb();
+    }
+}
 
 fn align_up(val: usize, align: usize) -> usize {
     (val + align - 1) & !(align - 1)
@@ -53,10 +83,14 @@ pub fn start(bus: Arc<WifiBus>) {
                 // 如果 ISR 在 unmask 后立即触发，waker 已经注册好了
                 bus.transport.unmask_card_irq();
 
+                // 若本批有数据帧入队,驱动网络栈处理(AP/STA 收包)。
+                invoke_rx_data_callback();
+
                 // 双重检查：如果 ISR 在 register 和 unmask 之间触发了
                 if bus.rx.irq_pending.swap(false, Ordering::AcqRel) {
                     process_rx_frames(&bus);
                     bus.transport.unmask_card_irq();
+                    invoke_rx_data_callback();
                     cx.waker().wake_by_ref();
                     return Poll::Pending;
                 }
@@ -285,7 +319,9 @@ fn handle_mgmt_frame(bus: &WifiBus, mpdu: &[u8], pkt_len: usize) {
             bus.ap.assoc_pollset.wake();
         }
         _ => {
-            log::info!("[ap-rx] {} from {:02x?} (fc0=0x{:02x})", subtype, sa, fc0);
+            // Beacon / ProbeReq 等：周围 AP 和扫描设备的帧，与连接无关。
+            // 降为 trace，避免淹没握手/数据帧日志。
+            log::trace!("[ap-rx] {} from {:02x?} (fc0=0x{:02x})", subtype, sa, fc0);
         }
     }
 }
@@ -432,6 +468,15 @@ fn build_and_enqueue_eth_frame(
     eth_frame.extend_from_slice(&mpdu[ether_type_offset..ether_type_offset + 2]);
     eth_frame.extend_from_slice(payload);
 
+    // AP 模式数据帧(ARP/DHCP/IP):正常路径,降为 trace 避免淹没日志。
+    let et = u16::from_be_bytes([mpdu[ether_type_offset], mpdu[ether_type_offset + 1]]);
+    log::trace!(
+        "[ap-rx] DATA from {:02x?} ethertype=0x{:04x} len={}",
+        addr_info.sa,
+        et,
+        eth_frame.len()
+    );
+
     let mut queue = bus.rx.data_queue.lock();
     if queue.len() >= DATA_RX_QUEUE_MAX {
         queue.pop_front();
@@ -439,6 +484,8 @@ fn build_and_enqueue_eth_frame(
     queue.push_back(eth_frame);
     drop(queue);
     bus.rx.data_pollset.wake();
+    // 标记本批有数据帧入队,RX 线程稍后会驱动网络栈 poll。
+    RX_DATA_PENDING.store(true, Ordering::Release);
 }
 
 /// 处理单个数据帧

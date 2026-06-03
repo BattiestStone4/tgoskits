@@ -16,7 +16,7 @@ use ax_task::future::block_on;
 
 use crate::fdrv::{
     core::bus::{BusState, WifiBus},
-    protocol::send_me_sta_add_req,
+    protocol::{send_me_sta_add_req, send_set_control_port_req},
     thread::tx::enqueue_mgmt_frame,
 };
 
@@ -95,6 +95,14 @@ fn handle_assoc_req(bus: &Arc<WifiBus>, mpdu: &[u8]) {
     match enqueue_mgmt_frame(bus, frame) {
         Ok(()) => log::info!("[wifi-ap] Assoc Response queued -> {:02x?}", sta_mac),
         Err(e) => log::warn!("[wifi-ap] Assoc Response enqueue failed: {:?}", e),
+    }
+
+    // 3. 打开控制端口(authorize)。开放网络无 EAPOL，关联后必须显式授权，
+    // 否则固件只放行 EAPOL、丢弃该 STA 的所有普通数据帧(DHCP/ARP/IP)。
+    // 对应 vendor change_station(AUTHORIZED) → rwnx_send_me_set_control_port_req。
+    match send_set_control_port_req(bus, sta_idx, true, 0) {
+        Ok(_) => log::info!("[wifi-ap] control port OPENED for sta_idx={}", sta_idx),
+        Err(e) => log::warn!("[wifi-ap] open control port failed: {:?}", e),
     }
 }
 
