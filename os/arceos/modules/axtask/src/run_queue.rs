@@ -816,8 +816,17 @@ impl<G: GuardState> AxRunQueueRef<G> {
         // SAFETY: `AxRunQueueRef<G>` has already entered the run-queue
         // critical section represented by `G`.
         unsafe { self.inner.scheduler.lock_raw() }.add_task(task);
+        // A newly runnable task placed on a remote CPU may be one the spawner
+        // must see make progress (e.g. `fork` then `waitpid`, or a broadcast
+        // wake fanning a barrier out to idle CPUs). If that CPU is idle in
+        // `wait_for_irqs`, only the IPI wakes it — so do NOT let a stale
+        // coalescing bit suppress the kick, exactly as `migrate_entry` does.
+        // Coalescing here can otherwise drop the wake for a task that lands in
+        // the window after the target's in-flight reschedule already read its
+        // run queue, stranding it until the next tick or (tickless idle)
+        // indefinitely — the riscv64 SMP `test-fcntl-lock-lifecycle` hang.
         #[cfg(all(feature = "smp", feature = "ipi"))]
-        kick_remote_cpu(cpu_id);
+        force_kick_remote_cpu(cpu_id);
     }
 
     /// Unblock one task by inserting it into the run queue.
@@ -851,8 +860,13 @@ impl<G: GuardState> AxRunQueueRef<G> {
                 #[cfg(feature = "preempt")]
                 crate::current().set_preempt_pending(true);
             }
+            // Cross-core wake: the woken task must actually run (a waiter someone
+            // is blocked on — e.g. an `F_SETLKW` parked task woken when the lock
+            // is released). If its target CPU is idle in `wait_for_irqs`, only the
+            // IPI wakes it, so force the kick rather than let a stale coalescing
+            // bit drop it (same rationale as `migrate_entry` / `add_task`).
             #[cfg(all(feature = "smp", feature = "ipi"))]
-            kick_remote_cpu(cpu_id);
+            force_kick_remote_cpu(cpu_id);
         }
     }
 }
