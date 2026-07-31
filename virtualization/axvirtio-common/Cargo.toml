@@ -17,3 +17,4 @@ log.workspace = true
 
 [dev-dependencies]
 ax-memory-addr.workspace = true
+ax-kspin = { workspace = true, features = ["host-test"] }

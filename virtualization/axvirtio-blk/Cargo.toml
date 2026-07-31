@@ -16,8 +16,10 @@ default = []
 [dependencies]
 axvirtio-common.workspace = true
 axaddrspace.workspace = true
+axdevice_base.workspace = true
 axvm-types.workspace = true
 log.workspace = true
 
 [dev-dependencies]
 ax-memory-addr.workspace = true
+ax-kspin = { workspace = true, features = ["host-test"] }

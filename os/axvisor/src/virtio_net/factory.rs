@@ -13,13 +13,12 @@
 
 use core::sync::atomic::{AtomicU16, Ordering};
 
-use alloc::boxed::Box;
 use alloc::sync::{Arc, Weak};
 
 use axdevice::{
     DeviceBuildContext, DeviceBundle, DeviceFactory, DeviceManagerError, DeviceRegistration,
 };
-use axdevice_base::{DeviceError, InterruptTriggerMode, Resource};
+use axdevice_base::{DeviceError, InterruptTriggerMode};
 use axvirtio_net::{VirtioError, VirtioMmioNetDevice, VirtioNetConfig};
 use axvirtio_switch::SwitchPortId;
 use axvm::{AxVM, AxvmGuestMemoryAccessor, GuestPhysAddr};
@@ -102,12 +101,15 @@ impl DeviceFactory for VirtioNetDeviceFactory {
             )
             .map_err(construct_error)?,
         );
-        let resources = Box::new([Resource::MmioRange {
-            base: spec.base_gpa as u64,
-            size: spec.length as u64,
-        }]);
         let adapter = Arc::new(VirtioNetDeviceAdapter::new(
-            spec.name, device, irq, backend, attachment, resources,
+            spec.name,
+            device,
+            irq,
+            backend,
+            attachment,
+            spec.base_gpa as u64,
+            spec.length as u64,
+            spec.irq_id as u32,
         ));
         let endpoint: Arc<VirtioNetEndpoint> = Arc::new(VirtioNetEndpoint::from_adapter(&adapter));
         let bundle = DeviceBundle::from_registration(DeviceRegistration::Device(adapter));

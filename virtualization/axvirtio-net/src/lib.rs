@@ -26,6 +26,7 @@ mod constants;
 mod device;
 mod error;
 mod header;
+mod managed;
 
 pub use axvirtio_common::{VirtioError, VirtioResult};
 pub use backend::NetworkBackend;
@@ -34,3 +35,4 @@ pub use constants::*;
 pub use device::{DeviceEvent, RxOutcome, VirtioMmioNetDevice};
 pub use error::{NetError, NetworkBackendError};
 pub use header::VirtioNetHdr;
+pub use managed::ManagedVirtioNetDevice;

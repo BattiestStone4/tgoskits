@@ -15,3 +15,6 @@ default = []
 
 [dependencies]
 ax-kspin.workspace = true
+
+[dev-dependencies]
+ax-kspin = { workspace = true, features = ["host-test"] }

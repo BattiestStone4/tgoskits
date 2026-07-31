@@ -65,6 +65,7 @@ extern crate log;
 mod backend;
 mod block;
 mod constants;
+mod managed;
 mod mmio;
 
 // Re-export from axvirtio-common
@@ -72,4 +73,5 @@ pub use axvirtio_common::{VirtioConfig, VirtioError, VirtioQueue, VirtioResult};
 // Re-export device-specific types
 pub use backend::BlockBackend;
 pub use block::config::VirtioBlockConfig;
+pub use managed::ManagedVirtioBlockDevice;
 pub use mmio::VirtioMmioBlockDevice;

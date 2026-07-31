@@ -7,31 +7,25 @@
 //! a write reports [`DeviceEvent::InterruptPending`], pulses the IRQ so the
 //! backend interrupt reaches the target vCPU through the VM-local queued sink.
 
-use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::Arc;
 
-use axdevice_base::{
-    BusAccess, BusKind, BusResponse, Device, DeviceAccess, DeviceError, IrqLine, Resource,
-};
-use axvirtio_net::{DeviceEvent, VirtioError, VirtioMmioNetDevice};
-use axvm::{AxvmGuestMemoryAccessor, GuestPhysAddr};
+use axdevice_base::{BusAccess, BusResponse, Device, DeviceAccess, DeviceError, IrqLine, Resource};
+use axvirtio_net::{ManagedVirtioNetDevice, VirtioMmioNetDevice};
+use axvm::AxvmGuestMemoryAccessor;
 
 use super::backend::AxvisorNetworkBackend;
 use super::raw_uplink::PortAttachment;
 
 /// AxVisor adapter wrapping one virtio-net MMIO device model.
 pub struct VirtioNetDeviceAdapter {
-    name: String,
-    device: Arc<VirtioMmioNetDevice<AxvisorNetworkBackend, AxvmGuestMemoryAccessor>>,
-    irq: IrqLine,
+    managed: ManagedVirtioNetDevice<AxvisorNetworkBackend, AxvmGuestMemoryAccessor>,
     backend: AxvisorNetworkBackend,
     /// RAII switch-port attachment for raw-uplink devices. Dropping the adapter
     /// detaches the port (deactivate -> unregister); `None` for the
     /// deterministic echo backend, which owns no switch port. The field is
     /// drop-only by design, so it is never read directly.
     _attachment: Option<PortAttachment>,
-    resources: Box<[Resource]>,
 }
 
 impl VirtioNetDeviceAdapter {
@@ -42,15 +36,14 @@ impl VirtioNetDeviceAdapter {
         irq: IrqLine,
         backend: AxvisorNetworkBackend,
         attachment: Option<PortAttachment>,
-        resources: Box<[Resource]>,
+        mmio_base: u64,
+        mmio_size: u64,
+        irq_line: u32,
     ) -> Self {
         Self {
-            name,
-            device,
-            irq,
+            managed: ManagedVirtioNetDevice::new(name, device, irq, mmio_base, mmio_size, irq_line),
             backend,
             _attachment: attachment,
-            resources,
         }
     }
 
@@ -58,12 +51,12 @@ impl VirtioNetDeviceAdapter {
     pub fn device(
         &self,
     ) -> &Arc<VirtioMmioNetDevice<AxvisorNetworkBackend, AxvmGuestMemoryAccessor>> {
-        &self.device
+        self.managed.model()
     }
 
     /// Returns the interrupt line used to signal RX/TX completions.
     pub fn irq(&self) -> &IrqLine {
-        &self.irq
+        self.managed.irq()
     }
 
     /// Returns the backend handle (shared with the RX worker).
@@ -74,61 +67,18 @@ impl VirtioNetDeviceAdapter {
 
 impl Device for VirtioNetDeviceAdapter {
     fn name(&self) -> &str {
-        &self.name
+        self.managed.name()
     }
 
     fn resources(&self) -> &[Resource] {
-        &self.resources
+        self.managed.resources()
     }
 
     fn access(
         &self,
         access: &BusAccess,
-        _context: &mut dyn DeviceAccess,
+        context: &mut dyn DeviceAccess,
     ) -> Result<BusResponse, DeviceError> {
-        // The virtio-net model only participates in the MMIO bus; reject port and
-        // system-register accesses with a diagnostic instead of silently handling
-        // them (plan section 3).
-        if access.kind != BusKind::Mmio {
-            return Err(DeviceError::InvalidInput {
-                operation: "virtio-net handle",
-                detail: String::from("only MMIO bus accesses are supported"),
-            });
-        }
-
-        let address = GuestPhysAddr::from(access.addr as usize);
-        if access.is_read {
-            let value = self
-                .device
-                .mmio_read(address, access.width)
-                .map_err(map_virtio_error)?;
-            Ok(BusResponse::Read {
-                value: value as u64,
-            })
-        } else {
-            let event = self
-                .device
-                .mmio_write(address, access.width, access.data as usize)
-                .map_err(map_virtio_error)?;
-            // The transport completes its own reset on status=0 writes; the
-            // adapter only forwards the interrupt event and never re-resets.
-            if event == DeviceEvent::InterruptPending {
-                if let Err(error) = self.irq.pulse() {
-                    warn!("virtio-net[{}] IRQ pulse failed: {error:?}", self.name);
-                }
-            }
-            Ok(BusResponse::Write)
-        }
-    }
-
-}
-
-fn map_virtio_error(error: VirtioError) -> DeviceError {
-    // All transport/queue faults surface as invalid-input with the underlying
-    // variant so the MMIO router logs a diagnosable failure rather than a bare
-    // "internal error".
-    DeviceError::InvalidInput {
-        operation: "virtio-net mmio",
-        detail: alloc::format!("{error:?}"),
+        self.managed.access(access, context)
     }
 }

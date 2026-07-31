@@ -15,6 +15,7 @@ default = []
 
 [dependencies]
 axaddrspace.workspace = true
+axdevice_base.workspace = true
 axvm-types.workspace = true
 axvirtio-common.workspace = true
 ax-kspin.workspace = true
@@ -22,3 +23,4 @@ log.workspace = true
 
 [dev-dependencies]
 ax-memory-addr.workspace = true
+ax-kspin = { workspace = true, features = ["host-test"] }

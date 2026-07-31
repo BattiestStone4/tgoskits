@@ -10,8 +10,14 @@ use std::{
 
 use ax_memory_addr::PhysAddr;
 use axaddrspace::{AddrSpaceError, AddrSpaceResult, GuestMemoryAccessor};
-use axvirtio_blk::{BlockBackend, VirtioBlockConfig, VirtioMmioBlockDevice, VirtioResult};
-use axvm_types::GuestPhysAddr;
+use axdevice_base::{
+    BusAccess, BusKind, BusResponse, Device, DeviceId, InterruptTriggerMode, IrqLine, IrqLineId,
+    IrqResult, IrqSink, NoopDeviceAccess, Resource,
+};
+use axvirtio_blk::{
+    BlockBackend, ManagedVirtioBlockDevice, VirtioBlockConfig, VirtioMmioBlockDevice, VirtioResult,
+};
+use axvm_types::{AccessWidth, GuestPhysAddr};
 
 // ============================================================================
 // Mock Implementations
@@ -703,8 +709,6 @@ mod mmio_device_tests {
 // ============================================================================
 
 mod integration_tests {
-    use axvm_types::AccessWidth;
-
     use super::*;
 
     /// Simulates a simple driver initialization sequence
@@ -771,4 +775,65 @@ mod integration_tests {
         backend.read(1, &mut read_buffer).unwrap();
         assert_eq!(read_buffer, new_data);
     }
+}
+
+struct NoopIrqSink;
+
+impl IrqSink for NoopIrqSink {
+    fn set_level(&self, _line: IrqLineId, _asserted: bool) -> IrqResult {
+        Ok(())
+    }
+
+    fn pulse(&self, _line: IrqLineId) -> IrqResult {
+        Ok(())
+    }
+}
+
+#[test]
+fn managed_device_declares_resources_and_routes_mmio() {
+    let model = Arc::new(
+        VirtioMmioBlockDevice::new(
+            GuestPhysAddr::from(0x0a00_0000),
+            0x200,
+            MockBlockBackend::new(128, 512),
+            VirtioBlockConfig::default(),
+            MockGuestMemoryAccessor::new(0x1_0000),
+        )
+        .unwrap(),
+    );
+    let irq = IrqLine::new(
+        IrqLineId(49),
+        InterruptTriggerMode::EdgeTriggered,
+        Arc::new(NoopIrqSink),
+    );
+    let device =
+        ManagedVirtioBlockDevice::new("virtio-blk0".into(), model, irq, 0x0a00_0000, 0x200, 49);
+
+    assert_eq!(
+        device.resources(),
+        &[
+            Resource::MmioRange {
+                base: 0x0a00_0000,
+                size: 0x200,
+            },
+            Resource::IrqLine {
+                line: 49,
+                trigger: InterruptTriggerMode::EdgeTriggered,
+            },
+        ]
+    );
+    let mut context = NoopDeviceAccess::new(DeviceId::new(0));
+    let response = device
+        .access(
+            &BusAccess {
+                kind: BusKind::Mmio,
+                is_read: true,
+                addr: 0x0a00_0000,
+                width: AccessWidth::Dword,
+                data: 0,
+            },
+            &mut context,
+        )
+        .unwrap();
+    assert!(matches!(response, BusResponse::Read { value } if value == 0x7472_6976));
 }

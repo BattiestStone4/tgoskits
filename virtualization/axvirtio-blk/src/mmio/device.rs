@@ -72,6 +72,11 @@ impl<B: BlockBackend, T: GuestMemoryAccessor + Clone> VirtioMmioBlockDevice<B, T
         self.state.status()
     }
 
+    /// Returns the current VirtIO MMIO interrupt status bits.
+    pub fn interrupt_status(&self) -> u32 {
+        self.state.interrupt_status()
+    }
+
     /// Set device status directly (bypasses validation; bring-up helper).
     pub fn set_status(&self, status: u32) {
         self.state.set_status(status);

@@ -4,11 +4,15 @@ use std::sync::{Arc, Mutex};
 
 use ax_memory_addr::PhysAddr;
 use axaddrspace::GuestMemoryAccessor;
+use axdevice_base::{
+    BusAccess, BusKind, BusResponse, Device, DeviceId, InterruptTriggerMode, IrqLine, IrqLineId,
+    IrqResult, IrqSink, NoopDeviceAccess, Resource,
+};
 // Re-export the MMIO register offsets from the common constants.
 use axvirtio_common::constants as vc;
 use axvirtio_net::{
-    DeviceEvent, LinkStatus, NetError, NetworkBackend, NetworkBackendError, RxOutcome,
-    VirtioMmioNetDevice, VirtioNetConfig,
+    DeviceEvent, LinkStatus, ManagedVirtioNetDevice, NetError, NetworkBackend, NetworkBackendError,
+    RxOutcome, VirtioMmioNetDevice, VirtioNetConfig,
 };
 use axvm_types::{AccessWidth, GuestPhysAddr};
 
@@ -666,4 +670,76 @@ fn end_to_end_guest_tx_rx_ack_reset() {
     assert_eq!(h.w(vc::VIRTIO_MMIO_STATUS, 0), DeviceEvent::Reset);
     assert_eq!(h.r(vc::VIRTIO_MMIO_STATUS), 0);
     assert_eq!(h.r(vc::VIRTIO_MMIO_INTERRUPT_STATUS), 0);
+}
+
+struct NoopIrqSink;
+
+impl IrqSink for NoopIrqSink {
+    fn set_level(&self, _line: IrqLineId, _asserted: bool) -> IrqResult {
+        Ok(())
+    }
+
+    fn pulse(&self, _line: IrqLineId) -> IrqResult {
+        Ok(())
+    }
+}
+
+#[test]
+fn managed_device_declares_resources_and_routes_mmio() {
+    let mem = Arc::new(MockMem::new(0x1_0000));
+    let (backend, _) = RecordBackend::new();
+    let model = Arc::new(
+        VirtioMmioNetDevice::new(
+            GuestPhysAddr::from(BASE_IPA),
+            REGION_LEN,
+            backend,
+            VirtioNetConfig::new([0x02, 0, 0, 0, 0, 1]),
+            SharedMem(mem),
+        )
+        .unwrap(),
+    );
+    let irq = IrqLine::new(
+        IrqLineId(48),
+        InterruptTriggerMode::EdgeTriggered,
+        Arc::new(NoopIrqSink),
+    );
+    let device = ManagedVirtioNetDevice::new(
+        "virtio-net0".into(),
+        model,
+        irq,
+        BASE_IPA as u64,
+        REGION_LEN as u64,
+        48,
+    );
+
+    assert_eq!(
+        device.resources(),
+        &[
+            Resource::MmioRange {
+                base: BASE_IPA as u64,
+                size: REGION_LEN as u64,
+            },
+            Resource::IrqLine {
+                line: 48,
+                trigger: InterruptTriggerMode::EdgeTriggered,
+            },
+        ]
+    );
+    let mut context = NoopDeviceAccess::new(DeviceId::new(0));
+    let response = device
+        .access(
+            &BusAccess {
+                kind: BusKind::Mmio,
+                is_read: true,
+                addr: BASE_IPA as u64,
+                width: AccessWidth::Dword,
+                data: 0,
+            },
+            &mut context,
+        )
+        .unwrap();
+    assert!(matches!(
+        response,
+        BusResponse::Read { value } if value == vc::MMIO_MAGIC_VALUE as u64
+    ));
 }
