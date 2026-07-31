@@ -1015,7 +1015,11 @@ pub(crate) mod test_support {
     use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
     use std::{
         panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
-        sync::{Mutex as StdMutex, Once},
+        sync::{
+            Mutex as StdMutex, Once, OnceLock,
+            mpsc::{self, Sender},
+        },
+        thread,
     };
 
     use ax_sync::Mutex;
@@ -1037,11 +1041,43 @@ pub(crate) mod test_support {
 
     static NETWORK_TEST_LOCK: StdMutex<()> = StdMutex::new(());
 
+    type NetworkTestJob = Box<dyn FnOnce() + Send + 'static>;
+
     pub(crate) fn run_in_network_test(f: impl FnOnce() + Send + 'static) {
         let _guard = NETWORK_TEST_LOCK.lock().unwrap();
-        if let Err(err) = catch_unwind(AssertUnwindSafe(f)) {
+        let (result_tx, result_rx) = mpsc::channel();
+        network_test_worker()
+            .send(Box::new(move || {
+                let result = catch_unwind(AssertUnwindSafe(f));
+                result_tx
+                    .send(result)
+                    .expect("network test result receiver must remain alive");
+            }))
+            .expect("network test worker must remain alive");
+        if let Err(err) = result_rx
+            .recv()
+            .expect("network test worker must report test result")
+        {
             resume_unwind(err);
         }
+    }
+
+    fn network_test_worker() -> &'static Sender<NetworkTestJob> {
+        static WORKER: OnceLock<Sender<NetworkTestJob>> = OnceLock::new();
+
+        WORKER.get_or_init(|| {
+            let (job_tx, job_rx) = mpsc::channel::<NetworkTestJob>();
+            thread::Builder::new()
+                .name("ax-net-test".into())
+                .spawn(move || {
+                    ax_task::init_scheduler();
+                    for job in job_rx {
+                        job();
+                    }
+                })
+                .expect("network test worker must start");
+            job_tx
+        })
     }
 
     pub(crate) fn init_split_route_network() {
