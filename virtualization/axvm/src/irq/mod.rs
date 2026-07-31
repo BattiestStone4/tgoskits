@@ -22,6 +22,7 @@ use axvm_types::VMInterruptMode;
 
 use crate::{AxVmResult, ax_err};
 
+pub(crate) mod edge;
 mod queued_sink;
 
 pub use queued_sink::VmQueuedIrqSink;

@@ -144,6 +144,14 @@ pub(crate) fn wait_queue_wait_until(
     api::task::ax_wait_queue_wait_until(queue, condition, None);
 }
 
+pub(crate) fn wait_queue_wait_timeout_until(
+    queue: &api::task::AxWaitQueueHandle,
+    duration: Duration,
+    condition: impl Fn() -> bool,
+) -> bool {
+    api::task::ax_wait_queue_wait_until(queue, condition, Some(duration))
+}
+
 pub(crate) fn wait_queue_wake(queue: &api::task::AxWaitQueueHandle, count: u32) {
     api::task::ax_wait_queue_wake(queue, count);
 }

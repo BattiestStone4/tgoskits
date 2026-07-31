@@ -82,13 +82,14 @@ impl IrqSink for VmQueuedIrqSink {
         // Queue the SPI for the target vCPU; the bound AArch64 run loop drains it
         // and performs the actual list-register write. `queue_interrupt` is a
         // no-op (returning BadState) when the VM is not Running/Paused.
-        crate::runtime::vcpus::queue_interrupt(vm.id(), self.target_vcpu, line.0).map_err(|err| {
-            IrqError::Backend {
+        crate::runtime::vcpus::queue_interrupt(vm.id(), self.target_vcpu, line.0).map_err(
+            |err| IrqError::Backend {
                 line,
                 operation: "pulse",
                 detail: alloc::format!("{err:?}"),
-            }
-        })
+            },
+        )?;
+        Ok(())
     }
 }
 

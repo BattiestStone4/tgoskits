@@ -44,6 +44,7 @@ use cpu_up::{CpuUpExit, CpuUpOps};
 pub use images::ImageLoader;
 use ipi::SendIpiExit;
 use sysreg::{SysRegReadExit, SysRegWriteExit};
+pub(crate) use vm::register_device_factories;
 
 pub(crate) struct Aarch64Arch;
 
@@ -62,6 +63,10 @@ impl ArchOps for Aarch64Arch {
 
     fn has_hardware_support() -> bool {
         arm_vcpu::has_hardware_support()
+    }
+
+    fn before_first_run(_vm: &crate::AxVMRef, _vcpu: &crate::vm::AxVCpuRef<Self::VCpu>) {
+        gic::enable_virtual_interrupt_interface();
     }
 
     fn clean_dcache_range(addr: VirtAddr, size: usize) {

@@ -28,7 +28,7 @@ use axdevice_base::IrqLine;
 use axvirtio_net::{RxOutcome, VirtioMmioNetDevice};
 use axvm::{
     AxVMRef, WorkerTask, get_vm_list, host_cpu_count, spawn_worker_task,
-    spawn_worker_task_with_affinity,
+    spawn_worker_task_with_affinity, yield_now,
 };
 
 use super::adapter::VirtioNetDeviceAdapter;
@@ -71,6 +71,7 @@ type VirtioNetRuntimeEndpoint = (
 
 /// Worker stack size (the delivery path and `receive_frame` copy are shallow).
 const WORKER_STACK_SIZE: usize = 0x2_0000;
+const REMOTE_WAKE_WATCHDOG: core::time::Duration = core::time::Duration::from_millis(10);
 
 /// Handle used to cancel and join a running worker.
 struct WorkerHandle {
@@ -114,18 +115,26 @@ pub fn start_for_vm(vm: &AxVMRef) {
     let name = alloc::format!("VM[{vm_id}]-virtio-net-rx");
     let handle_backend = backend.clone();
     let handle_cancel = cancel.clone();
+    let started = Arc::new(core::sync::atomic::AtomicBool::new(false));
     let worker_cpu = select_worker_cpu(vm);
     let task = if let Some(cpu_id) = worker_cpu {
         info!("VM[{vm_id}] virtio-net worker assigned to host CPU {cpu_id}");
+        let worker_started = started.clone();
         spawn_worker_task_with_affinity(name, WORKER_STACK_SIZE, 1usize << cpu_id, move || {
+            worker_started.store(true, core::sync::atomic::Ordering::Release);
             run_delivery_loop(device, irq, backend, cancel);
         })
     } else {
         warn!("VM[{vm_id}] has no host CPU reserved for its virtio-net worker");
+        let worker_started = started.clone();
         spawn_worker_task(name, WORKER_STACK_SIZE, move || {
+            worker_started.store(true, core::sync::atomic::Ordering::Release);
             run_delivery_loop(device, irq, backend, cancel);
         })
     };
+    while !started.load(core::sync::atomic::Ordering::Acquire) {
+        yield_now();
+    }
     WORKERS.lock().insert(
         vm_id,
         WorkerHandle {
@@ -195,17 +204,26 @@ fn run_delivery_loop(
     backend: AxvisorNetworkBackend,
     cancel: Arc<core::sync::atomic::AtomicBool>,
 ) {
+    let mut observed_event = 0;
     loop {
         if cancel.load(core::sync::atomic::Ordering::Acquire) {
             break;
         }
-        backend.wake_queue().wait_until(|| {
-            cancel.load(core::sync::atomic::Ordering::Acquire) || backend.rx_ready()
-        });
+        backend
+            .wake_queue()
+            .wait_timeout_until(REMOTE_WAKE_WATCHDOG, || {
+                cancel.load(core::sync::atomic::Ordering::Acquire)
+                    || backend.has_rx_event_after(observed_event)
+            });
         if cancel.load(core::sync::atomic::Ordering::Acquire) {
             break;
         }
-        backend.clear_rx_ready();
+        if !backend.has_rx_event_after(observed_event) {
+            continue;
+        }
+        // Snapshot before draining. An enqueue or guest kick racing with the
+        // drain advances the sequence and therefore remains visible next loop.
+        observed_event = backend.rx_event_sequence();
         drain_and_deliver(&device, &irq, &backend);
     }
 }

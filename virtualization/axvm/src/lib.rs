@@ -42,6 +42,7 @@ mod task;
 mod timer;
 mod vcpu;
 mod vm;
+mod worker_event;
 
 use crate::arch::ArchOps;
 
@@ -82,6 +83,7 @@ pub use vm::{
     AxVM, AxVMRef, FwCfgDeviceConfig, PreparedMemoryLayout, VMMemoryRegion, VcpuSnapshot,
     prepare::PrepareProfile,
 };
+pub use worker_event::WorkerEventSequence;
 
 /// The architecture-independent per-CPU type.
 pub(crate) type AxVMPerCpu = vcpu::AxPerCpu<arch::ArchPerCpu>;

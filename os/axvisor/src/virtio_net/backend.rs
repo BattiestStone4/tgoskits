@@ -22,7 +22,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use ax_kspin::SpinNoIrq as Mutex;
 use axvirtio_net::{NetworkBackend, NetworkBackendError};
 use axvirtio_switch::{SwitchPort, SwitchPortId};
-use axvm::WorkerWaitQueue;
+use axvm::{WorkerEventSequence, WorkerWaitQueue};
 
 use super::config::{
     ECHO_UDP_PORT, GUEST_IPV4, PEER_IPV4, PEER_MAC, RX_QUEUE_CAPACITY, TX_QUEUE_CAPACITY,
@@ -51,17 +51,17 @@ impl AxvisorNetworkBackend {
         }
     }
 
-    pub fn rx_ready(&self) -> bool {
+    pub fn rx_event_sequence(&self) -> u64 {
         match self {
-            Self::Deterministic(backend) => backend.rx_ready(),
-            Self::RawUplink(backend) => backend.endpoint.ingress_ready(),
+            Self::Deterministic(backend) => backend.rx_event_sequence(),
+            Self::RawUplink(backend) => backend.endpoint.ingress_event_sequence(),
         }
     }
 
-    pub fn clear_rx_ready(&self) {
+    pub fn has_rx_event_after(&self, observed: u64) -> bool {
         match self {
-            Self::Deterministic(backend) => backend.clear_rx_ready(),
-            Self::RawUplink(backend) => backend.endpoint.clear_ingress_ready(),
+            Self::Deterministic(backend) => backend.has_rx_event_after(observed),
+            Self::RawUplink(backend) => backend.endpoint.has_ingress_event_after(observed),
         }
     }
 
@@ -121,7 +121,7 @@ pub struct PortEndpoint {
     ingress: Mutex<VecDeque<Vec<u8>>>,
     uplink_signal: Arc<UplinkWorkSignal>,
     guest_wake: WorkerWaitQueue,
-    ingress_ready: AtomicBool,
+    ingress_events: WorkerEventSequence,
     active: AtomicBool,
     counters: PortCounters,
 }
@@ -142,7 +142,7 @@ impl PortEndpoint {
             ingress: Mutex::new(VecDeque::new()),
             uplink_signal,
             guest_wake: WorkerWaitQueue::new(),
-            ingress_ready: AtomicBool::new(false),
+            ingress_events: WorkerEventSequence::new(),
             active: AtomicBool::new(false),
             counters: PortCounters::default(),
         })
@@ -205,12 +205,12 @@ impl PortEndpoint {
 
     // -- ingress: switch/host -> guest delivery worker ---------------------
 
-    pub fn ingress_ready(&self) -> bool {
-        self.ingress_ready.load(Ordering::Acquire)
+    pub fn ingress_event_sequence(&self) -> u64 {
+        self.ingress_events.current()
     }
 
-    pub fn clear_ingress_ready(&self) {
-        self.ingress_ready.store(false, Ordering::Release);
+    pub fn has_ingress_event_after(&self, observed: u64) -> bool {
+        self.ingress_events.has_advanced_since(observed)
     }
 
     pub fn drain_ingress(&self) -> Option<Vec<u8>> {
@@ -224,7 +224,7 @@ impl PortEndpoint {
     /// Notifies the delivery worker that the guest added RX buffers (kicked the
     /// RX virtqueue), so a previously-`NoGuestBuffer` frame can be retried.
     pub fn on_guest_rx_kick(&self) {
-        self.ingress_ready.store(true, Ordering::Release);
+        self.ingress_events.advance();
         self.wake_guest();
     }
 
@@ -263,7 +263,7 @@ impl SwitchPort for PortEndpoint {
         }
         ingress.push_back(frame.to_vec());
         drop(ingress);
-        self.ingress_ready.store(true, Ordering::Release);
+        self.ingress_events.advance();
         self.wake_guest();
         true
     }
@@ -318,7 +318,7 @@ struct BackendShared {
     guest_mac: [u8; 6],
     rx_queue: Mutex<VecDeque<Vec<u8>>>,
     wake: WorkerWaitQueue,
-    rx_ready: AtomicBool,
+    rx_events: WorkerEventSequence,
     stats: Mutex<BackendStats>,
 }
 
@@ -347,7 +347,7 @@ impl DeterministicUdpEchoBackend {
                 guest_mac,
                 rx_queue: Mutex::new(VecDeque::new()),
                 wake: WorkerWaitQueue::new(),
-                rx_ready: AtomicBool::new(false),
+                rx_events: WorkerEventSequence::new(),
                 stats: Mutex::new(BackendStats::default()),
             }),
         }
@@ -364,14 +364,14 @@ impl DeterministicUdpEchoBackend {
         !self.shared.rx_queue.lock().is_empty()
     }
 
-    /// Returns whether an enqueue or guest RX kick made delivery retryable.
-    pub fn rx_ready(&self) -> bool {
-        self.shared.rx_ready.load(Ordering::Acquire)
+    /// Returns the current enqueue/guest-kick event sequence.
+    pub fn rx_event_sequence(&self) -> u64 {
+        self.shared.rx_events.current()
     }
 
-    /// Consumes the current delivery-readiness edge.
-    pub fn clear_rx_ready(&self) {
-        self.shared.rx_ready.store(false, Ordering::Release);
+    /// Returns whether an event occurred after the worker's last snapshot.
+    pub fn has_rx_event_after(&self, observed: u64) -> bool {
+        self.shared.rx_events.has_advanced_since(observed)
     }
 
     /// Restores a frame that could not be delivered because the guest had no buffer.
@@ -427,7 +427,7 @@ impl DeterministicUdpEchoBackend {
         } else {
             queue.push_back(reply.into_frame());
             drop(queue);
-            self.shared.rx_ready.store(true, Ordering::Release);
+            self.shared.rx_events.advance();
             TxOutcome::Enqueued
         }
     }
@@ -436,7 +436,10 @@ impl DeterministicUdpEchoBackend {
 impl NetworkBackend for DeterministicUdpEchoBackend {
     fn transmit(&self, frame: &[u8]) -> Result<(), NetworkBackendError> {
         match self.handle_tx(frame) {
-            TxOutcome::Enqueued => self.shared.wake.wake_one(),
+            TxOutcome::Enqueued => {
+                self.shared.wake.wake_one();
+                debug!("virtio-net echo peer queued a deterministic reply");
+            }
             TxOutcome::Dropped(reason) => debug!("virtio-net echo peer dropped frame: {reason}"),
         }
         // TX always completes from the device's perspective; peer-side drops are
@@ -445,7 +448,7 @@ impl NetworkBackend for DeterministicUdpEchoBackend {
     }
 
     fn rx_queue_notified(&self) {
-        self.shared.rx_ready.store(true, Ordering::Release);
+        self.shared.rx_events.advance();
         self.shared.wake.wake_one();
     }
 }

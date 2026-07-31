@@ -91,6 +91,18 @@ impl WorkerWaitQueue {
         crate::host::arceos::wait_queue_wait_until(&self.0, condition);
     }
 
+    /// Blocks until `condition` is true or `duration` elapses.
+    ///
+    /// Returns `true` only when the timeout elapsed without observing the
+    /// condition. A low-frequency timeout can serve as a remote-wake watchdog.
+    pub fn wait_timeout_until(
+        &self,
+        duration: core::time::Duration,
+        condition: impl Fn() -> bool,
+    ) -> bool {
+        crate::host::arceos::wait_queue_wait_timeout_until(&self.0, duration, condition)
+    }
+
     /// Wakes one waiter (if any).
     pub fn wake_one(&self) {
         crate::host::arceos::wait_queue_wake(&self.0, 1);

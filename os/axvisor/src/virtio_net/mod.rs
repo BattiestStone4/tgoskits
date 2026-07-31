@@ -58,6 +58,13 @@ impl PrepareProfile for VirtioNetPrepareProfile {
     fn build(&self, generation: usize) -> AxVmResult<(DeviceFactoryRegistry, InterruptFabric)> {
         let mut factories = DeviceFactoryRegistry::new();
         register_builtin_factories(&mut factories)?;
+        #[cfg(target_arch = "aarch64")]
+        axvm::register_aarch64_device_factories(&mut factories)?;
+        #[cfg(not(target_arch = "aarch64"))]
+        return Err(axvm::AxVmError::Unsupported {
+            operation: "build virtio-net prepare profile",
+            detail: "currently supported only on AArch64".into(),
+        });
         factories.register(Arc::new(factory::VirtioNetDeviceFactory::new(
             self.vm.clone(),
             generation,
