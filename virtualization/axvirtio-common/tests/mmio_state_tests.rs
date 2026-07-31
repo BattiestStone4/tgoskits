@@ -144,3 +144,37 @@ fn non_dword_standard_register_rejected() {
         .is_err()
     );
 }
+
+#[test]
+fn interrupt_ack_preserves_same_bit_raised_after_status_read() {
+    let s = state(0);
+    s.set_interrupt(vc::VIRTIO_MMIO_INT_VRING);
+    assert_eq!(
+        rd(&s, vc::VIRTIO_MMIO_INTERRUPT_STATUS),
+        vc::VIRTIO_MMIO_INT_VRING
+    );
+
+    // A second completion races in after the driver's status read. Its event
+    // must not be consumed by the acknowledgement for the first completion.
+    s.set_interrupt(vc::VIRTIO_MMIO_INT_VRING);
+    assert_eq!(
+        wr(&s, vc::VIRTIO_MMIO_INTERRUPT_ACK, vc::VIRTIO_MMIO_INT_VRING,),
+        MmioWriteAction::InterruptPending
+    );
+
+    assert_eq!(
+        s.interrupt_status(),
+        vc::VIRTIO_MMIO_INT_VRING,
+        "the post-read completion must remain pending"
+    );
+
+    assert_eq!(
+        rd(&s, vc::VIRTIO_MMIO_INTERRUPT_STATUS),
+        vc::VIRTIO_MMIO_INT_VRING
+    );
+    assert_eq!(
+        wr(&s, vc::VIRTIO_MMIO_INTERRUPT_ACK, vc::VIRTIO_MMIO_INT_VRING,),
+        MmioWriteAction::None
+    );
+    assert_eq!(s.interrupt_status(), 0);
+}

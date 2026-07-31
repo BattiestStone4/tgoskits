@@ -32,6 +32,15 @@ pub enum MmioWriteAction {
     QueueNotified(u16),
     /// The guest wrote status 0; the device is fully reset.
     Reset,
+    /// An acknowledged interrupt bit was raised again after the guest's last
+    /// interrupt-status read and must be signalled again.
+    InterruptPending,
+}
+
+#[derive(Default)]
+struct InterruptState {
+    pending: u32,
+    raised_after_read: u32,
 }
 
 /// Shared VirtIO MMIO transport state plus the device's queues.
@@ -51,7 +60,7 @@ pub struct VirtioMmioState<T: GuestMemoryAccessor + Clone> {
     driver_features_sel: Mutex<u32>,
     queue_sel: Mutex<u16>,
     queues: Mutex<Vec<VirtioQueue<T>>>,
-    interrupt_status: Mutex<u32>,
+    interrupt_status: Mutex<InterruptState>,
     config_generation: Mutex<u32>,
 }
 
@@ -78,7 +87,7 @@ impl<T: GuestMemoryAccessor + Clone> VirtioMmioState<T> {
             driver_features_sel: Mutex::new(0),
             queue_sel: Mutex::new(0),
             queues: Mutex::new(queues),
-            interrupt_status: Mutex::new(0),
+            interrupt_status: Mutex::new(InterruptState::default()),
             config_generation: Mutex::new(0),
         }
     }
@@ -138,12 +147,14 @@ impl<T: GuestMemoryAccessor + Clone> VirtioMmioState<T> {
 
     /// Current interrupt status bits.
     pub fn interrupt_status(&self) -> u32 {
-        *self.interrupt_status.lock()
+        self.interrupt_status.lock().pending
     }
 
     /// OR interrupt bits in (used-ring or config-change notification).
     pub fn set_interrupt(&self, bits: u32) {
-        *self.interrupt_status.lock() |= bits;
+        let mut interrupt = self.interrupt_status.lock();
+        interrupt.pending |= bits;
+        interrupt.raised_after_read |= bits;
     }
 
     /// Increment the config-space generation (call after changing config).
@@ -159,7 +170,7 @@ impl<T: GuestMemoryAccessor + Clone> VirtioMmioState<T> {
         *self.driver_features_sel.lock() = 0;
         *self.device_features_sel.lock() = 0;
         *self.queue_sel.lock() = 0;
-        *self.interrupt_status.lock() = 0;
+        *self.interrupt_status.lock() = InterruptState::default();
         *self.status.lock() = 0;
         for q in self.queues.lock().iter_mut() {
             q.reset();
@@ -220,7 +231,12 @@ impl<T: GuestMemoryAccessor + Clone> VirtioMmioState<T> {
                     .get(sel as usize)
                     .map_or(0, |q| if q.ready { 1 } else { 0 })
             }
-            vc::VIRTIO_MMIO_INTERRUPT_STATUS => *self.interrupt_status.lock(),
+            vc::VIRTIO_MMIO_INTERRUPT_STATUS => {
+                let mut interrupt = self.interrupt_status.lock();
+                let pending = interrupt.pending;
+                interrupt.raised_after_read = 0;
+                pending
+            }
             vc::VIRTIO_MMIO_STATUS => *self.status.lock(),
             vc::VIRTIO_MMIO_CONFIG_GENERATION => *self.config_generation.lock(),
             _ => {
@@ -283,7 +299,14 @@ impl<T: GuestMemoryAccessor + Clone> VirtioMmioState<T> {
                 }
             }
             vc::VIRTIO_MMIO_QUEUE_NOTIFY => return Ok(MmioWriteAction::QueueNotified(val as u16)),
-            vc::VIRTIO_MMIO_INTERRUPT_ACK => *self.interrupt_status.lock() &= !val,
+            vc::VIRTIO_MMIO_INTERRUPT_ACK => {
+                let mut interrupt = self.interrupt_status.lock();
+                let raised_after_read = interrupt.raised_after_read & val;
+                interrupt.pending &= !(val & !raised_after_read);
+                if raised_after_read != 0 {
+                    return Ok(MmioWriteAction::InterruptPending);
+                }
+            }
             vc::VIRTIO_MMIO_STATUS => return self.handle_status_write(val),
             reg @ (vc::VIRTIO_MMIO_QUEUE_DESC_LOW
             | vc::VIRTIO_MMIO_QUEUE_DESC_HIGH

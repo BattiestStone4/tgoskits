@@ -107,18 +107,19 @@ impl<B: BlockBackend, T: GuestMemoryAccessor + Clone> VirtioMmioBlockDevice<B, T
         addr: GuestPhysAddr,
         width: AccessWidth,
         val: usize,
-    ) -> VirtioResult<()> {
+    ) -> VirtioResult<bool> {
         if !self.is_enabled() {
-            return Ok(());
+            return Ok(false);
         }
         match self.state.mmio_write(addr, width, val)? {
             MmioWriteAction::None => {}
             MmioWriteAction::Reset => {}
+            MmioWriteAction::InterruptPending => return Ok(true),
             MmioWriteAction::QueueNotified(queue_index) => {
                 self.handle_queue_notify(queue_index);
             }
         }
-        Ok(())
+        Ok(false)
     }
 
     /// Handle queue notification.

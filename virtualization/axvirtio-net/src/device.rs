@@ -9,6 +9,7 @@ use axvirtio_common::{
     constants as vc,
 };
 use axvm_types::{AccessWidth, GuestPhysAddr};
+use log::warn;
 
 use crate::{
     NetError, NetworkBackend, VirtioNetConfig, VirtioNetHdr, config::LinkStatus, constants::*,
@@ -154,6 +155,7 @@ impl<B: NetworkBackend, T: GuestMemoryAccessor + Clone> VirtioMmioNetDevice<B, T
         match self.state.mmio_write(addr, width, val)? {
             MmioWriteAction::None => Ok(DeviceEvent::None),
             MmioWriteAction::Reset => Ok(DeviceEvent::Reset),
+            MmioWriteAction::InterruptPending => Ok(DeviceEvent::InterruptPending),
             MmioWriteAction::QueueNotified(idx) => {
                 if idx == TX_QUEUE_INDEX {
                     Ok(self.handle_tx_notify())
@@ -194,8 +196,11 @@ impl<B: NetworkBackend, T: GuestMemoryAccessor + Clone> VirtioMmioNetDevice<B, T
                 Err(_) => break, // ring corruption; stop draining
             };
             let notify = match self.process_one_tx(tx, head) {
-                Ok(n) => n,
-                Err(_) => tx.complete(head, 0).unwrap_or(false),
+                Ok(notify) => notify,
+                Err(error) => {
+                    warn!("virtio-net failed to process TX descriptor {head}: {error:?}");
+                    tx.complete(head, 0).unwrap_or(false)
+                }
             };
             if notify {
                 event = DeviceEvent::InterruptPending;
@@ -327,7 +332,7 @@ impl<B: NetworkBackend, T: GuestMemoryAccessor + Clone> VirtioMmioNetDevice<B, T
 
     fn header_len(&self) -> usize {
         if self.state.driver_features() & vc::VIRTIO_F_VERSION_1 != 0 {
-            VIRTIO_NET_HDR_VERSION_1_SIZE
+            VIRTIO_NET_HDR_MODERN_SIZE
         } else {
             VirtioNetHdr::SIZE
         }

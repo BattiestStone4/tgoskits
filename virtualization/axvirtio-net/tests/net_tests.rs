@@ -19,7 +19,7 @@ use axvm_types::{AccessWidth, GuestPhysAddr};
 const BASE_IPA: usize = 0x0a00_0000;
 const REGION_LEN: usize = 0x200;
 const DEFAULT_QSIZE: u16 = 4;
-const NEGOTIATED_HEADER_SIZE: usize = axvirtio_net::VIRTIO_NET_HDR_VERSION_1_SIZE;
+const NEGOTIATED_HEADER_SIZE: usize = axvirtio_net::VIRTIO_NET_HDR_MODERN_SIZE;
 
 /// Mock guest memory: flat backing buffer, guest phys -> real host pointer.
 #[derive(Clone)]
@@ -361,7 +361,7 @@ fn tx_header_split_from_payload_across_descriptors() {
     let h = Harness::new();
     h.bring_up();
 
-    // TX chain: desc0 readable = modern header, desc1 readable = payload.
+    // TX chain: desc0 readable = base header, desc1 readable = payload.
     let payload = [0xde, 0xad, 0xbe, 0xef, 0xc0, 0xfe];
     let hdr_bytes = [0u8; NEGOTIATED_HEADER_SIZE];
     h.write_desc(
@@ -392,12 +392,12 @@ fn tx_header_split_from_payload_across_descriptors() {
 }
 
 #[test]
-fn tx_version_1_header_is_not_forwarded_as_frame_data() {
+fn tx_version_1_uses_workspace_driver_header() {
     let h = Harness::new();
     h.bring_up();
 
-    // virtio-drivers uses the 12-byte modern header after negotiating
-    // VIRTIO_F_VERSION_1, including the trailing num_buffers field.
+    // virtio-drivers 0.13.0 emits its 12-byte header after negotiating
+    // VERSION_1, even though this device does not advertise MRG_RXBUF.
     let payload = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x52, 0x54];
     let mut combined = vec![0u8; NEGOTIATED_HEADER_SIZE];
     combined.extend_from_slice(&payload);
@@ -638,6 +638,10 @@ fn end_to_end_guest_tx_rx_ack_reset() {
     }
 
     // 10. ACK the TX interrupt.
+    assert_ne!(
+        h.r(vc::VIRTIO_MMIO_INTERRUPT_STATUS) & vc::VIRTIO_MMIO_INT_VRING,
+        0
+    );
     h.w(vc::VIRTIO_MMIO_INTERRUPT_ACK, vc::VIRTIO_MMIO_INT_VRING);
     assert_eq!(h.r(vc::VIRTIO_MMIO_INTERRUPT_STATUS), 0);
 

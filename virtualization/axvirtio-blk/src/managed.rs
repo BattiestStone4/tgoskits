@@ -98,11 +98,12 @@ where
             })
         } else {
             let interrupt_before = self.model.interrupt_status();
-            self.model
+            let reassert_interrupt = self
+                .model
                 .mmio_write(address, access.width, access.data as usize)
                 .map_err(map_virtio_error)?;
             let interrupt_after = self.model.interrupt_status();
-            if interrupt_after & !interrupt_before != 0 {
+            if reassert_interrupt || interrupt_after & !interrupt_before != 0 {
                 self.irq.pulse().map_err(|error| DeviceError::Backend {
                     operation: "pulse virtio-block interrupt",
                     detail: alloc::format!("{error}"),

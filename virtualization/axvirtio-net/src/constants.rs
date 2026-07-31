@@ -12,7 +12,6 @@ pub const VIRTIO_NET_F_MAC: u64 = 1 << 5;
 pub const VIRTIO_NET_F_STATUS: u64 = 1 << 16;
 /// Device feature: maximum MTU reported in config space (not in first version).
 pub const VIRTIO_NET_F_MTU: u64 = 1 << 3;
-
 /// Features advertised by the first version: only what is fully implemented.
 pub const AXVIRTIO_NET_FEATURES: u64 =
     axvirtio_common::VIRTIO_F_VERSION_1 | VIRTIO_NET_F_MAC | VIRTIO_NET_F_STATUS;
@@ -41,11 +40,12 @@ pub const VIRTIO_NET_HDR_GSO_NONE: u8 = 0;
 /// Size of the legacy `virtio_net_hdr` without the trailing `num_buffers` field.
 pub const VIRTIO_NET_HDR_SIZE: usize = 10;
 
-/// Size of the modern `virtio_net_hdr` used with `VIRTIO_F_VERSION_1`.
+/// Header size used by the workspace's modern `virtio-drivers` guest driver.
 ///
-/// The final two bytes hold `num_buffers`. The current single-buffer device
-/// does not negotiate `VIRTIO_NET_F_MRG_RXBUF`, so they remain zero.
-pub const VIRTIO_NET_HDR_VERSION_1_SIZE: usize = 12;
+/// `virtio-drivers` 0.13.0 includes the trailing `num_buffers` field whenever
+/// `VIRTIO_F_VERSION_1` is negotiated, even without `VIRTIO_NET_F_MRG_RXBUF`.
+/// The device follows that guest-facing ABI until the driver is corrected.
+pub const VIRTIO_NET_HDR_MODERN_SIZE: usize = 12;
 
 // --- Config space layout (relative to VIRTIO_MMIO_CONFIG_OFFSET = 0x100) ---
 
