@@ -27,8 +27,10 @@ fn switch_to_elx_inner(preserved_timer_mode: Option<ArchTimerMode>) -> ! {
     SPSel.write(SPSel::SP::ELx);
     SP_EL0.set(0);
     let current_el = CurrentEL.read(CurrentEL::EL);
+    let el2_available =
+        cfg!(feature = "el1-phys-timer") || timer::aarch64_el2_is_available(ID_AA64PFR0_EL1.get());
     let timer_mode = preserved_timer_mode
-        .unwrap_or_else(|| timer::select_aarch64_timer_mode(false, current_el >= 2));
+        .unwrap_or_else(|| timer::select_aarch64_timer_mode(false, el2_available));
     if current_el >= 2 {
         let el_entry = sym_addr!(el_entry);
         let sp = sym_addr!(__cpu0_stack_top);
