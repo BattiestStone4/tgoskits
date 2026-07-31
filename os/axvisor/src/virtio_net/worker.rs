@@ -63,6 +63,12 @@ impl ServiceKey for VirtioNetEndpointKey {
     const CARDINALITY: ServiceCardinality = ServiceCardinality::Single;
 }
 
+type VirtioNetRuntimeEndpoint = (
+    Arc<VirtioMmioNetDevice<AxvisorNetworkBackend, axvm::AxvmGuestMemoryAccessor>>,
+    IrqLine,
+    AxvisorNetworkBackend,
+);
+
 /// Worker stack size (the delivery path and `receive_frame` copy are shallow).
 const WORKER_STACK_SIZE: usize = 0x2_0000;
 
@@ -172,13 +178,7 @@ pub fn stop_for_vm(vm_id: usize) {
 
 /// Finds the virtio-net adapter in `vm`'s device registry and returns the
 /// runtime endpoint the worker needs (device model, IRQ line, backend).
-fn find_virtio_net_endpoint(
-    vm: &AxVMRef,
-) -> Option<(
-    Arc<VirtioMmioNetDevice<AxvisorNetworkBackend, axvm::AxvmGuestMemoryAccessor>>,
-    IrqLine,
-    AxvisorNetworkBackend,
-)> {
+fn find_virtio_net_endpoint(vm: &AxVMRef) -> Option<VirtioNetRuntimeEndpoint> {
     let devices = vm.get_devices().ok()?;
     let endpoint = devices.services().require::<VirtioNetEndpointKey>().ok()?;
     Some((

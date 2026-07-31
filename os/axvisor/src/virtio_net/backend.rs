@@ -682,8 +682,12 @@ fn parse_udp_header(ip_payload: &[u8]) -> Option<UdpHeader> {
 /// Computes the IPv4 header checksum (ones-complement sum of 16-bit words).
 fn ipv4_checksum(header: &[u8]) -> u16 {
     let mut sum: u32 = 0;
-    for chunk in header.chunks_exact(2) {
+    let (words, remainder) = header.as_chunks::<2>();
+    for chunk in words {
         sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
+    }
+    if let Some(byte) = remainder.first() {
+        sum += (*byte as u32) << 8;
     }
     while sum >> 16 != 0 {
         sum = (sum & 0xffff) + (sum >> 16);
@@ -693,15 +697,16 @@ fn ipv4_checksum(header: &[u8]) -> u16 {
 
 fn udp_ipv4_checksum(src: [u8; 4], dst: [u8; 4], datagram: &[u8]) -> u16 {
     let mut sum = 0u32;
-    for chunk in src.chunks_exact(2).chain(dst.chunks_exact(2)) {
+    for chunk in src.as_chunks::<2>().0.iter().chain(dst.as_chunks::<2>().0) {
         sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
     }
     sum += IP_PROTO_UDP as u32;
     sum += datagram.len() as u32;
-    for chunk in datagram.chunks_exact(2) {
+    let (words, remainder) = datagram.as_chunks::<2>();
+    for chunk in words {
         sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
     }
-    if let Some(byte) = datagram.chunks_exact(2).remainder().first() {
+    if let Some(byte) = remainder.first() {
         sum += (*byte as u32) << 8;
     }
     while sum >> 16 != 0 {

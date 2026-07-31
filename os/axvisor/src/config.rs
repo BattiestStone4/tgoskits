@@ -189,10 +189,8 @@ pub fn init_guest_vm(raw_cfg: &str) -> Result<usize> {
 
     // With the VM (and its prepared devices) registered, start the virtio-net RX
     // worker. It discovers the adapter by downcasting from the device registry.
-    if manages_virtio_net {
-        if let Some(registered_vm) = axvm::get_vm_by_id(vm_id) {
-            crate::virtio_net::start_workers_for_vm(&registered_vm);
-        }
+    if manages_virtio_net && let Some(registered_vm) = axvm::get_vm_by_id(vm_id) {
+        crate::virtio_net::start_workers_for_vm(&registered_vm);
     }
     #[cfg(target_arch = "loongarch64")]
     crate::manager::register_loongarch_passthrough_irq_routes(vm_id);

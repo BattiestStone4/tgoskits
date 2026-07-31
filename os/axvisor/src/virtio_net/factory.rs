@@ -102,14 +102,7 @@ impl DeviceFactory for VirtioNetDeviceFactory {
             .map_err(construct_error)?,
         );
         let adapter = Arc::new(VirtioNetDeviceAdapter::new(
-            spec.name,
-            device,
-            irq,
-            backend,
-            attachment,
-            spec.base_gpa as u64,
-            spec.length as u64,
-            spec.irq_id as u32,
+            spec, device, irq, backend, attachment,
         ));
         let endpoint: Arc<VirtioNetEndpoint> = Arc::new(VirtioNetEndpoint::from_adapter(&adapter));
         let bundle = DeviceBundle::from_registration(DeviceRegistration::Device(adapter));

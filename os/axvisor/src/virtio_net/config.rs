@@ -136,7 +136,7 @@ fn parse_mac_octets(cfg_list: &[usize], name: &str) -> Result<[u8; 6], DeviceMan
 }
 
 fn validate_mmio_window(base: usize, length: usize, name: &str) -> Result<(), DeviceManagerError> {
-    if base % PAGE_SIZE != 0 {
+    if !base.is_multiple_of(PAGE_SIZE) {
         return Err(invalid_config(
             name,
             alloc::format!("MMIO base {base:#x} is not page-aligned ({PAGE_SIZE:#x})"),

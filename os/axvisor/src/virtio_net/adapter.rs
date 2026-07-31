@@ -7,7 +7,6 @@
 //! a write reports [`DeviceEvent::InterruptPending`], pulses the IRQ so the
 //! backend interrupt reaches the target vCPU through the VM-local queued sink.
 
-use alloc::string::String;
 use alloc::sync::Arc;
 
 use axdevice_base::{BusAccess, BusResponse, Device, DeviceAccess, DeviceError, IrqLine, Resource};
@@ -15,6 +14,7 @@ use axvirtio_net::{ManagedVirtioNetDevice, VirtioMmioNetDevice};
 use axvm::AxvmGuestMemoryAccessor;
 
 use super::backend::AxvisorNetworkBackend;
+use super::config::VirtioNetDeviceSpec;
 use super::raw_uplink::PortAttachment;
 
 /// AxVisor adapter wrapping one virtio-net MMIO device model.
@@ -31,17 +31,21 @@ pub struct VirtioNetDeviceAdapter {
 impl VirtioNetDeviceAdapter {
     /// Creates a new adapter from its prepared components.
     pub(super) fn new(
-        name: String,
+        spec: VirtioNetDeviceSpec,
         device: Arc<VirtioMmioNetDevice<AxvisorNetworkBackend, AxvmGuestMemoryAccessor>>,
         irq: IrqLine,
         backend: AxvisorNetworkBackend,
         attachment: Option<PortAttachment>,
-        mmio_base: u64,
-        mmio_size: u64,
-        irq_line: u32,
     ) -> Self {
         Self {
-            managed: ManagedVirtioNetDevice::new(name, device, irq, mmio_base, mmio_size, irq_line),
+            managed: ManagedVirtioNetDevice::new(
+                spec.name,
+                device,
+                irq,
+                spec.base_gpa as u64,
+                spec.length as u64,
+                spec.irq_id as u32,
+            ),
             backend,
             _attachment: attachment,
         }

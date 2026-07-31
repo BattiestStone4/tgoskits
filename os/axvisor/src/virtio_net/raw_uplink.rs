@@ -381,16 +381,16 @@ fn progress_tx(core: &Arc<UplinkWorkerCore>) -> bool {
                 break; // this port is drained; next port
             };
             let outcome = core.switch.switch_from_port(id, &frame);
-            if let EgressOutcome::Forwarded { uplink } = outcome {
-                if uplink {
-                    match submit_host_tx(core, &frame) {
-                        HostTxResult::Submitted => submitted += 1,
-                        HostTxResult::Retried => {
-                            // Ring full: put the frame back at the head of this
-                            // port's egress and let a TX-completion IRQ retry.
-                            endpoint.requeue_egress(frame);
-                            return progressed || submitted > 0;
-                        }
+            if let EgressOutcome::Forwarded { uplink } = outcome
+                && uplink
+            {
+                match submit_host_tx(core, &frame) {
+                    HostTxResult::Submitted => submitted += 1,
+                    HostTxResult::Retried => {
+                        // Ring full: put the frame back at the head of this
+                        // port's egress and let a TX-completion IRQ retry.
+                        endpoint.requeue_egress(frame);
+                        return progressed || submitted > 0;
                     }
                 }
             }

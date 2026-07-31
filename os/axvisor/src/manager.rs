@@ -42,11 +42,13 @@ impl AxvmManager {
     }
 
     /// Create one VM from a TOML config string.
+    #[cfg(feature = "fs")]
     pub fn create_vm_from_toml(raw_cfg: &str) -> Result<VMId> {
         crate::config::init_guest_vm(raw_cfg).context("create VM from TOML configuration")
     }
 
     /// Start a VM by ID.
+    #[cfg(feature = "fs")]
     pub fn start_vm(vm_id: VMId) -> Result<()> {
         // A stopped VM is re-prepared (new generation) by `AxVM::start`; restart
         // the virtio-net RX worker for the new device generation so the RX path
