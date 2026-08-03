@@ -286,14 +286,14 @@ const ID_AA64MMFR2_EL1_SYSREG: usize = 0x34000e;
 
 fn is_id_aa64_feature_register(addr: usize) -> bool {
     const ID_AA64_OP0_OP1_CRN: usize = 0x300000;
-    const CRN_MASK: usize = 0x3fc000;
+    const OP0_OP1_CRN_MASK: usize = 0x303c00;
     const CRM_MASK: usize = 0x1e;
     const CRM_PFR: usize = 0x8;
     const CRM_DFR: usize = 0xa;
     const CRM_ISAR: usize = 0xc;
     const CRM_MMFR: usize = 0xe;
 
-    addr & CRN_MASK == ID_AA64_OP0_OP1_CRN
+    addr & OP0_OP1_CRN_MASK == ID_AA64_OP0_OP1_CRN
         && matches!(addr & CRM_MASK, CRM_PFR | CRM_DFR | CRM_ISAR | CRM_MMFR)
 }
 
@@ -579,6 +579,7 @@ mod tests {
         assert!(read_virtualized_id_register(ID_AA64PFR0_EL1_SYSREG).is_some());
         assert!(read_virtualized_id_register(ID_AA64DFR0_EL1_SYSREG).is_some());
         assert!(read_virtualized_id_register(ID_AA64MMFR0_EL1_SYSREG).is_some());
+        assert_eq!(read_virtualized_id_register(0x32000a), Some(0));
         assert_eq!(read_virtualized_id_register(0x36000c), Some(0));
         assert!(read_virtualized_id_register(0x3f_ffff).is_none());
     }
