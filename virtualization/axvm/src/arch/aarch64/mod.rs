@@ -69,6 +69,10 @@ impl ArchOps for Aarch64Arch {
         gic::enable_virtual_interrupt_interface();
     }
 
+    fn register_platform_irq_injector() {
+        crate::irq::register_aarch64_virtual_irq_injector(inject_virtual_irq);
+    }
+
     fn clean_dcache_range(addr: VirtAddr, size: usize) {
         aarch64_cpu_ext::cache::dcache_range(
             aarch64_cpu_ext::cache::CacheOp::Clean,
@@ -111,7 +115,7 @@ impl ArchOps for Aarch64Arch {
                     data,
                 },
             ),
-            ArmVmExit::SysRegRead { addr, reg } => sysreg::handle_read(
+            ArmVmExit::SysRegRead { addr, reg } => handle_sysreg_read(
                 vm,
                 vcpu,
                 SysRegReadExit {
@@ -205,6 +209,70 @@ impl ArchOps for Aarch64Arch {
             stop_reason: None,
         })
     }
+}
+
+fn inject_virtual_irq(irq_id: usize) -> bool {
+    const CNTV_PPI: usize = 27;
+
+    if irq_id != CNTV_PPI {
+        trace!("skip AArch64 virtual IRQ {irq_id}: only CNTV PPI is forwarded");
+        return false;
+    }
+
+    let Some(vm_id) = crate::current_vm_id() else {
+        trace!("skip AArch64 virtual IRQ {irq_id}: no current VM context");
+        return false;
+    };
+    let Some(vcpu_id) = crate::current_vcpu_id() else {
+        trace!("skip AArch64 virtual IRQ {irq_id}: no current vCPU context");
+        return false;
+    };
+
+    if let Err(err) = crate::runtime::vcpus::queue_interrupt(vm_id, vcpu_id, irq_id) {
+        warn!("failed to inject AArch64 virtual IRQ {irq_id}: {err:?}");
+        return false;
+    }
+    true
+}
+
+fn handle_sysreg_read(
+    vm: &crate::AxVMRef,
+    vcpu: &crate::vm::AxVCpuRef<AxvmArmVcpu>,
+    exit: SysRegReadExit,
+) -> AxVmResult<BoundVcpuExit<Aarch64DeferredRunWork>> {
+    const ID_AA64PFR0_EL1_SYSREG: usize = 0x300008;
+
+    if exit.addr.addr() == ID_AA64PFR0_EL1_SYSREG {
+        let value = virtualize_id_aa64pfr0_el1(read_id_aa64pfr0_el1());
+        vcpu.set_gpr(exit.reg, value as usize);
+        return Ok(BoundVcpuExit::Continue);
+    }
+
+    sysreg::handle_read(vm, vcpu, exit)
+}
+
+fn virtualize_id_aa64pfr0_el1(value: u64) -> u64 {
+    const EL2_SHIFT: u32 = 8;
+    const FEATURE_MASK: u64 = 0xf;
+    const NOT_IMPLEMENTED: u64 = 0xf;
+
+    (value & !(FEATURE_MASK << EL2_SHIFT)) | (NOT_IMPLEMENTED << EL2_SHIFT)
+}
+
+#[cfg(target_arch = "aarch64")]
+fn read_id_aa64pfr0_el1() -> u64 {
+    let value: u64;
+    // SAFETY: This reads an architectural ID register from the host CPU while
+    // handling a trapped guest read. It has no side effects.
+    unsafe {
+        core::arch::asm!("mrs {value}, ID_AA64PFR0_EL1", value = out(reg) value);
+    }
+    value
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn read_id_aa64pfr0_el1() -> u64 {
+    0
 }
 
 struct AxvmArmHostOps;
@@ -403,6 +471,21 @@ mod tests {
         assert_eq!(
             arm_sys_reg_addr_to_ax(ArmSysRegAddr::new(0x3a_3016)).addr(),
             0x3a_3016
+        );
+    }
+
+    #[test]
+    fn virtualized_id_aa64pfr0_hides_el2_from_guest() {
+        const EL2_SHIFT: u32 = 8;
+        const FEATURE_MASK: u64 = 0xf;
+        let host_value = 0x1234_5678_9abc_def0;
+
+        let guest_value = virtualize_id_aa64pfr0_el1(host_value);
+
+        assert_eq!((guest_value >> EL2_SHIFT) & FEATURE_MASK, 0xf);
+        assert_eq!(
+            guest_value & !(FEATURE_MASK << EL2_SHIFT),
+            host_value & !(FEATURE_MASK << EL2_SHIFT)
         );
     }
 }

@@ -25,7 +25,7 @@ use alloc::sync::Arc;
 use ax_kspin::SpinNoIrq as Mutex;
 use axdevice::{ServiceCardinality, ServiceKey};
 use axdevice_base::IrqLine;
-use axvirtio_net::{RxOutcome, VirtioMmioNetDevice};
+use axvirtio_net::{NetError, RxOutcome, VirtioMmioNetDevice};
 use axvm::{
     AxVMRef, WorkerTask, get_vm_list, host_cpu_count, spawn_worker_task,
     spawn_worker_task_with_affinity, yield_now,
@@ -257,7 +257,7 @@ fn deliver_one(
             debug!("virtio-net delivered RX frame ({frame_len} bytes)");
             Ok(())
         }
-        Ok(RxOutcome::NoGuestBuffer) => Err(frame),
+        Ok(RxOutcome::NoGuestBuffer) | Err(NetError::NotReady) => Err(frame),
         Err(error) => {
             warn!("virtio-net receive_frame failed, dropping frame: {error:?}");
             Ok(())

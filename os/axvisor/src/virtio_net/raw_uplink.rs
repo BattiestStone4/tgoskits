@@ -41,6 +41,9 @@ const HOST_RX_BUDGET: usize = 64;
 const HOST_TX_BUDGET: usize = 64;
 /// Per round, drain at most this many frames from one port's egress.
 const PORT_TX_QUANTUM: usize = 8;
+/// Fallback poll interval for host queues when the transport coalesces or loses
+/// an interrupt edge. The worker still sleeps; this only bounds RX/TX latency.
+const UPLINK_WAKE_WATCHDOG: core::time::Duration = core::time::Duration::from_millis(10);
 
 /// Uplink worker stack size (shallow: queue ops + frame copy + switch call).
 const UPLINK_WORKER_STACK_SIZE: usize = 0x2_0000;
@@ -87,8 +90,8 @@ impl UplinkWorkSignal {
         self.wake.wake_one();
     }
 
-    /// Worker side: block until the epoch has advanced past `observed`, then
-    /// update `observed` to the new value and return.
+    /// Worker side: block until the epoch has advanced past `observed` or the
+    /// watchdog expires, then update `observed` to the current value and return.
     fn wait_observed(&self, observed: &mut u64) {
         let target = *observed;
         let wake = &self.wake;
@@ -96,7 +99,9 @@ impl UplinkWorkSignal {
         // Predicate is read-only so the closure can be `Fn` (wait_until re-checks
         // it after every wake, so a signal that lands between the last drain and
         // the sleep is not lost).
-        wake.wait_until(|| epoch.load(core::sync::atomic::Ordering::Acquire) != target);
+        wake.wait_timeout_until(UPLINK_WAKE_WATCHDOG, || {
+            epoch.load(core::sync::atomic::Ordering::Acquire) != target
+        });
         *observed = epoch.load(core::sync::atomic::Ordering::Acquire);
     }
 }
