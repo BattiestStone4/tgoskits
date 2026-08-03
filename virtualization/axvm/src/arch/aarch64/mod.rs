@@ -87,9 +87,12 @@ impl ArchOps for Aarch64Arch {
         exit: <Self::VCpu as VmArchVcpuOps>::Exit,
     ) -> AxVmResult<BoundVcpuExit<Self::DeferredRunWork>> {
         match exit {
-            ArmVmExit::Hypercall { nr, args } => {
-                super::handle_hypercall(vm, vcpu, HypercallExit { nr, args })
-            }
+            ArmVmExit::Hypercall { nr, args } => super::handle_hypercall(
+                vm,
+                vcpu,
+                HypercallExit { nr, args },
+                crate::runtime::hvc::HyperCallAbi::AArch64,
+            ),
             ArmVmExit::MmioRead {
                 addr,
                 width,
@@ -147,6 +150,8 @@ impl ArchOps for Aarch64Arch {
                 Ok(BoundVcpuExit::Complete(VcpuRunAction {
                     waits_for_event: true,
                     stop_reason: None,
+                    resets_vm: false,
+                    exits_vcpu: false,
                 }))
             }
             ArmVmExit::CpuUp {
@@ -167,6 +172,8 @@ impl ArchOps for Aarch64Arch {
                 Ok(BoundVcpuExit::Complete(VcpuRunAction {
                     waits_for_event: false,
                     stop_reason: Some(crate::StopReason::SystemDown),
+                    resets_vm: false,
+                    exits_vcpu: false,
                 }))
             }
             ArmVmExit::SendIPI {
@@ -189,6 +196,8 @@ impl ArchOps for Aarch64Arch {
             ArmVmExit::Nothing => Ok(BoundVcpuExit::Complete(VcpuRunAction {
                 waits_for_event: false,
                 stop_reason: None,
+                resets_vm: false,
+                exits_vcpu: false,
             })),
             _ => ax_err!(Unsupported, "unsupported AArch64 VM exit"),
         }
@@ -207,6 +216,8 @@ impl ArchOps for Aarch64Arch {
         Ok(VcpuRunAction {
             waits_for_event: false,
             stop_reason: None,
+            resets_vm: false,
+            exits_vcpu: false,
         })
     }
 }
@@ -298,6 +309,10 @@ impl VmArchVcpuOps for AxvmArmVcpu {
     type CreateConfig = ArmVcpuCreateConfig;
     type SetupConfig = ArmVcpuSetupConfig;
     type Exit = ArmVmExit;
+
+    fn guest_mpidr_from_create_config(config: &Self::CreateConfig) -> Option<u64> {
+        Some(config.mpidr_el1 as u64)
+    }
 
     fn new(vm_id: VMId, vcpu_id: VCpuId, config: Self::CreateConfig) -> BackendResult<Self> {
         arm_result(ArmVcpu::new(vm_id, vcpu_id, config)).map(Self)
@@ -559,5 +574,23 @@ impl ArmVgicHostIf for ArmVgicHostIfImpl {
 
     fn hardware_inject_virtual_interrupt(vector: u8) {
         gic::inject_interrupt(vector as usize);
+    }
+}
+
+#[cfg(all(test, feature = "host-test"))]
+mod guest_mpidr_tests {
+    use super::*;
+
+    #[test]
+    fn guest_mpidr_from_real_arm_create_config() {
+        let config = ArmVcpuCreateConfig {
+            mpidr_el1: 0x100,
+            dtb_addr: 0x4000_0000,
+        };
+
+        assert_eq!(
+            <AxvmArmVcpu as VmArchVcpuOps>::guest_mpidr_from_create_config(&config),
+            Some(0x100),
+        );
     }
 }
