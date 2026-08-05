@@ -36,33 +36,28 @@ impl AxvmManager {
         self.release_host_filesystem_for_guest_passthrough();
     }
 
-    /// Start the default VM set and wait until it exits.
-    pub fn start_default_vms(&self) {
-        self.runtime.start_default_vms();
+    /// Start the default VM set without blocking the management console.
+    pub fn launch_default_vms(&self) -> Vec<VMId> {
+        self.runtime.launch_default_vms()
+    }
+
+    /// Wait until every running VM has stopped.
+    pub fn wait_for_default_vms() {
+        AxvmRuntime::wait_for_all_vms();
     }
 
     /// Create one VM from a TOML config string.
-    #[cfg(feature = "fs")]
     pub fn create_vm_from_toml(raw_cfg: &str) -> Result<VMId> {
         crate::config::init_guest_vm(raw_cfg).context("create VM from TOML configuration")
     }
 
     /// Start a VM by ID.
-    #[cfg(feature = "fs")]
     pub fn start_vm(vm_id: VMId) -> Result<()> {
-        // A stopped VM is re-prepared (new generation) by `AxVM::start`; restart
-        // the virtio-net RX worker for the new device generation so the RX path
-        // is restored instead of left dormant (TAP plan §2.4).
-        AxvmRuntime::start_vm(vm_id).with_context(|| format!("start VM[{vm_id}]"))?;
-        if let Some(vm) = axvm::get_vm_by_id(vm_id) {
-            crate::virtio_net::start_workers_for_vm(&vm);
-        }
-        Ok(())
+        AxvmRuntime::start_vm(vm_id).with_context(|| format!("start VM[{vm_id}]"))
     }
 
     /// Stop a VM by ID.
     pub fn stop_vm(vm_id: VMId) -> Result<()> {
-        crate::virtio_net::stop_workers_for_vm(vm_id);
         AxvmRuntime::stop_vm(vm_id).with_context(|| format!("stop VM[{vm_id}]"))
     }
 
@@ -73,19 +68,16 @@ impl AxvmManager {
 
     /// Reset a VM by ID.
     pub fn reset_vm(vm_id: VMId) -> Result<()> {
-        // Cancel the RX worker before reset drops the current device generation,
-        // then start a fresh worker once reset has re-prepared the glue.
-        crate::virtio_net::stop_workers_for_vm(vm_id);
-        AxvmRuntime::reset_vm(vm_id).with_context(|| format!("reset VM[{vm_id}]"))?;
-        if let Some(vm) = axvm::get_vm_by_id(vm_id) {
-            crate::virtio_net::start_workers_for_vm(&vm);
-        }
-        Ok(())
+        AxvmRuntime::reset_vm(vm_id).with_context(|| format!("reset VM[{vm_id}]"))
+    }
+
+    /// Wake the primary vCPU so it can consume newly queued console input.
+    pub fn notify_vm(vm_id: VMId) -> Result<()> {
+        AxvmRuntime::notify_vm(vm_id).with_context(|| format!("notify VM[{vm_id}]"))
     }
 
     /// Remove a VM by ID.
     pub fn remove_vm(vm_id: VMId) -> Option<AxVMRef> {
-        crate::virtio_net::stop_workers_for_vm(vm_id);
         #[cfg(target_arch = "loongarch64")]
         unregister_loongarch_passthrough_irq_routes(vm_id);
         AxvmRuntime::remove_vm(vm_id)
@@ -123,7 +115,7 @@ impl AxvmManager {
             "Failed to release host filesystem before guest passthrough devices take ownership",
         );
         #[cfg(target_arch = "x86_64")]
-        crate::config::prepare_x86_host_fs_passthrough_devices();
+        axvm::host::x86::prepare_qemu_block_passthrough_device();
         info!("Host filesystem cleanly unmounted before guest passthrough devices start");
     }
 

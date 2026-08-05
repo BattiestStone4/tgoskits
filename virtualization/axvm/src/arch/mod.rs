@@ -51,15 +51,6 @@ pub(crate) use x86_64::fdt;
 pub mod platform {
     #[cfg(target_arch = "aarch64")]
     pub use super::aarch64::{host_fdt_bootarg, host_phys_to_virt};
-
-    /// Adds the AArch64 factories required by an explicitly supplied device
-    /// construction policy.
-    #[cfg(target_arch = "aarch64")]
-    pub fn register_aarch64_device_factories(
-        factories: &mut axdevice::DeviceFactoryRegistry,
-    ) -> axdevice::DeviceManagerResult {
-        super::aarch64::register_device_factories(factories)
-    }
     #[cfg(target_arch = "loongarch64")]
     pub use super::loongarch64::irq::{
         register_guest_irq_route as register_loongarch_guest_irq_route,
@@ -90,12 +81,15 @@ pub(crate) type ArchVCpu = <CurrentArch as ArchOps>::VCpu;
 pub(crate) type ArchPerCpu = <CurrentArch as ArchOps>::PerCpu;
 pub(crate) type ArchNestedPageTable = <CurrentArch as ArchOps>::NestedPageTable;
 
-pub(crate) fn register_timer_callback() {
-    CurrentArch::register_timer_callback();
+pub(crate) fn register_timer_source(
+    deadline_source: alloc::sync::Arc<crate::timer::PublishedTimerDeadline>,
+    notify: alloc::sync::Arc<ax_std::os::arceos::modules::ax_task::IrqNotify>,
+) {
+    CurrentArch::register_timer_source(deadline_source, notify);
 }
 
-pub(crate) fn set_oneshot_timer(deadline_ns: u64) {
-    CurrentArch::set_oneshot_timer(deadline_ns);
+pub(crate) fn request_timer_deadline(deadline_ns: u64) {
+    CurrentArch::request_timer_deadline(deadline_ns);
 }
 
 pub(crate) fn init_guest_boot_resources() {
@@ -104,7 +98,7 @@ pub(crate) fn init_guest_boot_resources() {
 
 pub(crate) fn prepare_guest_boot(
     vm_config: &mut crate::config::AxVMConfig,
-    vm_create_config: &mut axvmconfig::AxVMCrateConfig,
+    vm_create_config: &mut axvmconfig::GuestConfig,
     provider: &dyn crate::boot::BootImageProvider,
 ) -> AxVmResult<Option<crate::boot::fdt::GuestDtbImage>> {
     CurrentArch::prepare_guest_boot(vm_config, vm_create_config, provider)
@@ -125,14 +119,14 @@ pub(crate) fn load_images_from_filesystem(
 }
 
 pub(crate) fn is_x86_linux_image_config(
-    config: &axvmconfig::AxVMCrateConfig,
+    config: &axvmconfig::GuestConfig,
     provider: &dyn crate::boot::BootImageProvider,
 ) -> bool {
     CurrentArch::is_x86_linux_image_config(config, provider)
 }
 
 pub(crate) fn default_boot_firmware_load_gpa(
-    config: &axvmconfig::AxVMCrateConfig,
+    config: &axvmconfig::GuestConfig,
 ) -> Option<axvm_types::GuestPhysAddr> {
     CurrentArch::default_boot_firmware_load_gpa(config)
 }
