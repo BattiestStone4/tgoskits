@@ -33,6 +33,7 @@ mod banner;
 mod config;
 mod guest_console;
 mod manager;
+mod realtime;
 mod shell;
 
 #[cfg(any(feature = "backtrace", feature = "test-panic-no-backtrace"))]
@@ -68,6 +69,8 @@ fn main() {
     panic!("axvisor no-backtrace smoke test: panic without backtrace");
 
     banner::print_logo();
+    #[cfg(feature = "realtime")]
+    realtime::log_cpu_partition();
 
     info!("Starting virtualization...");
     let manager = manager::AxvmManager::new()
