@@ -22,7 +22,7 @@ pub fn sys_clock_gettime(clock_id: __kernel_clockid_t, ts: *mut timespec) -> Sta
             monotonic_time()
         }
         CLOCK_PROCESS_CPUTIME_ID | CLOCK_THREAD_CPUTIME_ID => {
-            let (utime, stime) = current().as_thread().time.borrow().output();
+            let (utime, stime) = current().as_thread().time.lock().output();
             utime + stime
         }
         _ => {
@@ -104,7 +104,7 @@ pub struct Tms {
 }
 
 pub fn sys_times(tms: *mut Tms) -> StarryResult<isize> {
-    let (utime, stime) = current().as_thread().time.borrow().output();
+    let (utime, stime) = current().as_thread().time.lock().output();
     let (cutime, cstime) = current().as_thread().proc_data.children_cpu_time();
     tms.vm_write(Tms {
         tms_utime: utime.as_micros() as usize,
@@ -120,7 +120,9 @@ pub fn sys_getitimer(which: i32, value: *mut itimerval) -> StarryResult<isize> {
     let thread = current();
     let (it_interval, it_value) = match ty {
         ITimerType::Real => thread.as_thread().proc_data.get_real_timer(),
-        ITimerType::Virtual | ITimerType::Prof => thread.as_thread().time.borrow().get_itimer(ty),
+        ITimerType::Virtual | ITimerType::Prof => {
+            thread.as_thread().time.lock().get_itimer(ty)
+        }
     };
 
     value.vm_write(itimerval {
@@ -160,7 +162,7 @@ pub fn sys_setitimer(
         ITimerType::Virtual | ITimerType::Prof => curr
             .as_thread()
             .time
-            .borrow_mut()
+            .lock()
             .set_itimer(ty, interval, remained),
     };
 

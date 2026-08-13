@@ -270,9 +270,18 @@ impl TimeManager {
         // continues to see the full wall-clock delta for itimer accounting.
     }
 
-    /// Polls the time manager to update the timers and emit signals if
-    /// necessary.
-    pub fn poll(&mut self, emitter: impl Fn(Signo)) {
+    /// Polls the time manager to update CPU time and interval timers,
+    /// returning the interval-timer signals that fired (at most 2, in slot
+    /// order Virtual/Prof; `ITIMER_REAL` is process state and is polled
+    /// separately by `poll_process_timer`).
+    ///
+    /// The caller MUST emit the returned signals AFTER releasing the `time`
+    /// lock: signal delivery takes other locks, and the `time` lock is
+    /// IRQ-disabling — running the emitter under it would extend the IRQs-off
+    /// window and risk a lock-ordering deadlock. Returning the signals keeps
+    /// the locked region free of any nested lock.
+    #[must_use = "the returned itimer signals must be emitted after unlocking"]
+    pub fn poll(&mut self) -> [Option<Signo>; 3] {
         let now_ns = monotonic_time_nanos() as usize;
         // itimer_delta: full wall-clock time since the last poll() call.
         // Used for interval-timer accounting so they fire at the right time
@@ -282,23 +291,33 @@ impl TimeManager {
         // in utime_ns / stime_ns.  If tick() was never called, last_tick_ns ==
         // last_wall_ns and remaining == itimer_delta (identical to original).
         let remaining = now_ns.saturating_sub(self.last_tick_ns);
+        // Fixed slots so no `n` counter is needed: 0=Virtual, 1=Prof.
+        let mut fired = [None; 3];
         match self.state {
             TimerState::User => {
                 self.utime_ns += remaining;
-                self.update_itimer(ITimerType::Virtual, itimer_delta, &emitter);
-                self.update_itimer(ITimerType::Prof, itimer_delta, &emitter);
+                if self.itimers[ITimerType::Virtual as usize].update(itimer_delta) {
+                    fired[0] = Some(ITimerType::Virtual.signo());
+                }
+                if self.itimers[ITimerType::Prof as usize].update(itimer_delta) {
+                    fired[1] = Some(ITimerType::Prof.signo());
+                }
             }
             TimerState::Kernel => {
                 self.stime_ns += remaining;
-                self.update_itimer(ITimerType::Prof, itimer_delta, &emitter);
+                if self.itimers[ITimerType::Prof as usize].update(itimer_delta) {
+                    fired[1] = Some(ITimerType::Prof.signo());
+                }
             }
             TimerState::None => {}
         }
-        // `ITIMER_REAL` is process state and is polled separately.
+        // `ITIMER_REAL` is process state and is polled separately, so the
+        // Real slot (2) is never filled here.
         self.last_wall_ns = now_ns;
         // Sync tick baseline with poll baseline so the next tick() starts
         // from a clean slate.
         self.last_tick_ns = now_ns;
+        fired
     }
 
     /// Updates the timer state.
@@ -331,12 +350,6 @@ impl TimeManager {
             time_value_from_nanos(itimer.interval_ns),
             time_value_from_nanos(itimer.remained_ns),
         )
-    }
-
-    fn update_itimer(&mut self, ty: ITimerType, delta: usize, emitter: impl Fn(Signo)) {
-        if self.itimers[ty as usize].update(delta) {
-            emitter(ty.signo());
-        }
     }
 }
 
