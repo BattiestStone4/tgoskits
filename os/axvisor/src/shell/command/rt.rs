@@ -13,8 +13,6 @@
 // limitations under the License.
 
 use std::collections::BTreeMap;
-use std::io::{self, Write};
-use std::{print, println};
 
 use crate::realtime::{
     RtState, RtTaskState, heartbeats, last_heartbeat_nanos, last_watchdog_nanos, mailbox_recv_into,
@@ -142,7 +140,6 @@ fn do_rt_console(_cmd: &ParsedCommand) {
         idle_rounds = 0;
         let text = core::str::from_utf8(&output[..copied]).unwrap_or("<non-utf8 RT output>");
         print!("{text}");
-        io::stdout().flush().ok();
     }
     println!("[RT] console detached");
 }

@@ -9,13 +9,12 @@ use core::{
 };
 
 use ax_cpu::{KernelTlsBase, TaskContext};
-use cpu_local::{CurrentContext, CurrentThreadHeader, PreviousThreadBinding};
+use cpu_local::{ExecutionContextHeader, PreviousContextBinding};
 
 use crate::{MAX_RT_TASKS, executor::rt_task_entry};
 
 const RT_STACK_SIZE: usize = 64 * 1024;
 const RT_STACK_ALIGN: usize = 16;
-const EXECUTOR_CONTEXT_ID: usize = 1;
 
 pub(crate) static RT_RUNTIME: RtRuntime = RtRuntime::new();
 
@@ -41,22 +40,31 @@ unsafe impl Sync for RtTaskStack {}
 
 pub(crate) struct RtContext {
     context: UnsafeCell<MaybeUninit<TaskContext>>,
-    header: CurrentThreadHeader,
+    header: ExecutionContextHeader,
     stack: RtTaskStack,
 }
 
 impl RtContext {
-    const fn new(context_id: usize) -> Self {
+    /// Creates the reserved executor context, whose header continues the boot
+    /// context and is published via `install_bootstrap_context`.
+    const fn new_bootstrap() -> Self {
         Self {
             context: UnsafeCell::new(MaybeUninit::uninit()),
-            header: CurrentThreadHeader::new(
-                CurrentContext::from_raw(context_id).expect("RT context IDs must be non-zero"),
-            ),
+            header: ExecutionContextHeader::new_bootstrap(),
             stack: RtTaskStack::new(),
         }
     }
 
-    fn current_header(&self) -> Pin<&CurrentThreadHeader> {
+    /// Creates a switchable RT task context with an unbound header.
+    const fn new_task() -> Self {
+        Self {
+            context: UnsafeCell::new(MaybeUninit::uninit()),
+            header: ExecutionContextHeader::new(),
+            stack: RtTaskStack::new(),
+        }
+    }
+
+    fn current_header(&self) -> Pin<&ExecutionContextHeader> {
         // SAFETY: RT contexts are stored in a static runtime and never moved.
         unsafe { Pin::new_unchecked(&self.header) }
     }
@@ -84,7 +92,7 @@ pub(crate) struct RtRuntime {
     pub(crate) executor: RtContext,
     pub(crate) tasks: [RtContext; MAX_RT_TASKS],
     current_task: AtomicUsize,
-    previous_binding: UnsafeCell<MaybeUninit<PreviousThreadBinding>>,
+    previous_binding: UnsafeCell<MaybeUninit<PreviousContextBinding>>,
     has_previous_binding: AtomicUsize,
 }
 
@@ -93,20 +101,20 @@ unsafe impl Sync for RtRuntime {}
 impl RtRuntime {
     const fn new() -> Self {
         Self {
-            executor: RtContext::new(EXECUTOR_CONTEXT_ID),
+            executor: RtContext::new_bootstrap(),
             tasks: [
-                RtContext::new(2),
-                RtContext::new(3),
-                RtContext::new(4),
-                RtContext::new(5),
-                RtContext::new(6),
-                RtContext::new(7),
-                RtContext::new(8),
-                RtContext::new(9),
-                RtContext::new(10),
-                RtContext::new(11),
-                RtContext::new(12),
-                RtContext::new(13),
+                RtContext::new_task(),
+                RtContext::new_task(),
+                RtContext::new_task(),
+                RtContext::new_task(),
+                RtContext::new_task(),
+                RtContext::new_task(),
+                RtContext::new_task(),
+                RtContext::new_task(),
+                RtContext::new_task(),
+                RtContext::new_task(),
+                RtContext::new_task(),
+                RtContext::new_task(),
             ],
             current_task: AtomicUsize::new(usize::MAX),
             previous_binding: UnsafeCell::new(MaybeUninit::uninit()),
@@ -118,13 +126,13 @@ impl RtRuntime {
         self.executor.init_context();
         // SAFETY: initialization runs once before any RT task can execute.
         unsafe { &mut *self.executor.context_mut_ptr() }
-            .set_current_header(NonNull::from(&self.executor.header));
+            .set_context_header(NonNull::from(&self.executor.header));
         // SAFETY: the RT entry runs after the OS installed this CPU's CPU-local
         // area and before the CPU enters any ordinary scheduler path.
         unsafe {
             cpu_local::with_cpu_pin(|pin| {
-                cpu_local::install_bootstrap_thread(pin, self.executor.current_header())
-                    .expect("RT executor bootstrap thread install failed")
+                cpu_local::install_bootstrap_context(pin, self.executor.current_header())
+                    .expect("RT executor bootstrap context install failed")
             })
         }
         .expect("RT bootstrap requires an installed CPU-local area");
@@ -140,7 +148,7 @@ impl RtRuntime {
                 ax_memory_addr::VirtAddr::from(context.stack.top()),
                 KernelTlsBase::new(0),
             );
-            task_context.set_current_header(context_pointer);
+            task_context.set_context_header(context_pointer);
         }
     }
 
@@ -183,7 +191,7 @@ impl RtRuntime {
         // migrates, and this path never enters the ordinary host scheduler.
         unsafe {
             cpu_local::with_cpu_pin(|pin| {
-                let (prepared, previous_binding) = cpu_local::prepare_thread_switch(
+                let (prepared, previous_binding) = cpu_local::prepare_context_switch(
                     pin,
                     previous.current_header(),
                     next.current_header(),

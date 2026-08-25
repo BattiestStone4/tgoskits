@@ -472,10 +472,7 @@ impl ax_rt::MailboxDoorbell for RtCoreDoorbell {
             "[RT mailbox] doorbell IPI: host CPU{} -> RT CPU{cpu} (SGI {MAILBOX_DOORBELL_SGI_TO_RT})",
             percpu::this_cpu_id()
         );
-        irq::send_ipi(
-            mailbox_doorbell_irq(),
-            irq::IpiTarget::Other { cpu_id: cpu },
-        );
+        irq::send_ipi(mailbox_doorbell_irq(), irq::IpiTarget::Cpu(irq::CpuId(cpu)));
     }
 }
 
@@ -561,7 +558,7 @@ impl ax_rt::MailboxDoorbell for HostCoreDoorbell {
         // core contending on host-owned logging state.
         irq::send_ipi(
             host_mailbox_doorbell_irq(),
-            irq::IpiTarget::Other { cpu_id: target },
+            irq::IpiTarget::Cpu(irq::CpuId(target)),
         );
     }
 }

@@ -6,7 +6,7 @@
 //! just enough of it as a stable public capability so the OS glue can drive
 //! workers without depending on `axtask`/`arceos_api` directly.
 
-use alloc::string::String;
+use std::string::String;
 
 use crate::host::task::{
     AxTaskRef, TaskInner, WaitQueueHandle, cpu_mask_from_raw_bits, spawn_task,
