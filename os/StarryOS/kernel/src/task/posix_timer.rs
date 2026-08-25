@@ -335,10 +335,72 @@ fn posix_timer_clock_validation_rules_hold_for_test() -> bool {
         && invalid_unknown
 }
 
+/// Regression for the lock-free `maybe_has_timers()` hint (#2012): the hint must
+/// track the exact `timers` map length across create/delete/clear, and in
+/// particular must never drift or underflow. Deriving `count` from `len()` under
+/// the lock (rather than an outside-the-lock fetch_add/sub) is what makes a
+/// `clear` (execve) racing a create/delete safe; a length-based republish also
+/// stays correct when `delete` is called on an absent id. Exercises the public
+/// mutators and asserts the hint agrees with `maybe_has_timers()` at every step.
+#[cfg(all(test, not(axtest)))]
+fn posix_timer_count_hint_tracks_len_for_test() -> bool {
+    use linux_raw_sys::general::CLOCK_MONOTONIC;
+
+    let table = PosixTimerTable::default();
+    // Empty table: fast path must skip the poll.
+    if table.maybe_has_timers() {
+        return false;
+    }
+
+    let make = || {
+        table
+            .create(CLOCK_MONOTONIC, SIGEV_NONE, 0, 0)
+            .expect("SIGEV_NONE monotonic timer is always creatable")
+    };
+
+    let a = make();
+    if !table.maybe_has_timers() {
+        return false;
+    }
+    let b = make();
+
+    // Deleting a real id keeps the hint set while other timers remain.
+    if !table.delete(a) || !table.maybe_has_timers() {
+        return false;
+    }
+    // Deleting an absent id must not change the hint (no underflow, no drift).
+    if table.delete(a) || !table.maybe_has_timers() {
+        return false;
+    }
+    // Removing the last timer clears the hint.
+    if !table.delete(b) || table.maybe_has_timers() {
+        return false;
+    }
+
+    // `clear` (execve path) resets the hint even with several live timers.
+    let _ = make();
+    let _ = make();
+    if !table.maybe_has_timers() {
+        return false;
+    }
+    table.clear();
+    if table.maybe_has_timers() {
+        return false;
+    }
+    // A clear on an already-empty table stays at zero (no underflow).
+    table.clear();
+    !table.maybe_has_timers()
+}
+
 #[cfg(all(test, not(axtest)))]
 mod tests {
     #[test]
     fn posix_timer_clock_validation_rules_hold() {
         assert!(super::posix_timer_clock_validation_rules_hold_for_test());
+    }
+
+    #[test]
+    fn posix_timer_count_hint_tracks_len() {
+        assert!(super::posix_timer_count_hint_tracks_len_for_test());
     }
 }
