@@ -106,7 +106,7 @@ impl ArchOps for Aarch64Arch {
                     data,
                 },
             ),
-            ArmVmExit::SysRegRead { addr, reg } => sysreg::handle_read(
+            ArmVmExit::SysRegRead { addr, reg } => handle_sysreg_read(
                 vm,
                 vcpu,
                 SysRegReadExit {
@@ -284,6 +284,116 @@ fn vgic_runtime(vm: &crate::AxVM) -> AxVmResult<Arc<vgic::Aarch64VgicRuntime>> {
         .services()
         .require::<Aarch64VgicRuntimeKey>()?)
 }
+
+fn handle_sysreg_read(
+    vm: &crate::AxVMRef,
+    vcpu: &crate::vm::AxVCpuRef<AxvmArmVcpu>,
+    exit: SysRegReadExit,
+) -> AxVmResult<BoundVcpuExit<Aarch64DeferredRunWork>> {
+    if let Some(value) = read_virtualized_id_register(exit.addr.addr()) {
+        vcpu.set_gpr(exit.reg, value as usize);
+        return Ok(BoundVcpuExit::Continue);
+    }
+
+    sysreg::handle_read(vm, vcpu, exit)
+}
+
+fn read_virtualized_id_register(addr: usize) -> Option<u64> {
+    let value = match addr {
+        ID_AA64PFR0_EL1_SYSREG => Some(virtualize_id_aa64pfr0_el1(read_id_aa64pfr0_el1())),
+        ID_AA64PFR1_EL1_SYSREG => Some(read_id_aa64pfr1_el1()),
+        ID_AA64DFR0_EL1_SYSREG => Some(virtualize_id_aa64dfr0_el1(read_id_aa64dfr0_el1())),
+        ID_AA64ISAR0_EL1_SYSREG => Some(read_id_aa64isar0_el1()),
+        ID_AA64ISAR1_EL1_SYSREG => Some(read_id_aa64isar1_el1()),
+        ID_AA64MMFR0_EL1_SYSREG => Some(read_id_aa64mmfr0_el1()),
+        ID_AA64MMFR1_EL1_SYSREG => Some(read_id_aa64mmfr1_el1()),
+        ID_AA64MMFR2_EL1_SYSREG => Some(read_id_aa64mmfr2_el1()),
+        _ if is_id_aa64_feature_register(addr) => Some(0),
+        _ => None,
+    }?;
+    Some(value)
+}
+
+const ID_AA64PFR0_EL1_SYSREG: usize = 0x300008;
+const ID_AA64PFR1_EL1_SYSREG: usize = 0x320008;
+const ID_AA64DFR0_EL1_SYSREG: usize = 0x30000a;
+const ID_AA64ISAR0_EL1_SYSREG: usize = 0x30000c;
+const ID_AA64ISAR1_EL1_SYSREG: usize = 0x32000c;
+const ID_AA64MMFR0_EL1_SYSREG: usize = 0x30000e;
+const ID_AA64MMFR1_EL1_SYSREG: usize = 0x32000e;
+const ID_AA64MMFR2_EL1_SYSREG: usize = 0x34000e;
+
+fn is_id_aa64_feature_register(addr: usize) -> bool {
+    const ID_AA64_OP0_OP1_CRN: usize = 0x300000;
+    const OP0_OP1_CRN_MASK: usize = 0x303c00;
+    const CRM_MASK: usize = 0x1e;
+    const CRM_PFR: usize = 0x8;
+    const CRM_DFR: usize = 0xa;
+    const CRM_ISAR: usize = 0xc;
+    const CRM_MMFR: usize = 0xe;
+
+    addr & OP0_OP1_CRN_MASK == ID_AA64_OP0_OP1_CRN
+        && matches!(addr & CRM_MASK, CRM_PFR | CRM_DFR | CRM_ISAR | CRM_MMFR)
+}
+
+fn virtualize_id_aa64pfr0_el1(value: u64) -> u64 {
+    const EL2_SHIFT: u32 = 8;
+    const FEATURE_MASK: u64 = 0xf;
+    const NOT_IMPLEMENTED: u64 = 0xf;
+
+    (value & !(FEATURE_MASK << EL2_SHIFT)) | (NOT_IMPLEMENTED << EL2_SHIFT)
+}
+
+fn virtualize_id_aa64dfr0_el1(value: u64) -> u64 {
+    const PMUVER_SHIFT: u32 = 8;
+    const FEATURE_MASK: u64 = 0xf;
+
+    value & !(FEATURE_MASK << PMUVER_SHIFT)
+}
+
+#[cfg(target_arch = "aarch64")]
+fn read_id_aa64pfr0_el1() -> u64 {
+    let value: u64;
+    // SAFETY: This reads an architectural ID register from the host CPU while
+    // handling a trapped guest read. It has no side effects.
+    unsafe {
+        core::arch::asm!("mrs {value}, ID_AA64PFR0_EL1", value = out(reg) value);
+    }
+    value
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn read_id_aa64pfr0_el1() -> u64 {
+    0
+}
+
+macro_rules! read_id_register {
+    ($name:ident, $register:literal) => {
+        #[cfg(target_arch = "aarch64")]
+        fn $name() -> u64 {
+            let value: u64;
+            // SAFETY: This reads an architectural ID register from the host CPU
+            // while handling a trapped guest read. It has no side effects.
+            unsafe {
+                core::arch::asm!(concat!("mrs {value}, ", $register), value = out(reg) value);
+            }
+            value
+        }
+
+        #[cfg(not(target_arch = "aarch64"))]
+        fn $name() -> u64 {
+            0
+        }
+    };
+}
+
+read_id_register!(read_id_aa64pfr1_el1, "ID_AA64PFR1_EL1");
+read_id_register!(read_id_aa64dfr0_el1, "ID_AA64DFR0_EL1");
+read_id_register!(read_id_aa64isar0_el1, "ID_AA64ISAR0_EL1");
+read_id_register!(read_id_aa64isar1_el1, "ID_AA64ISAR1_EL1");
+read_id_register!(read_id_aa64mmfr0_el1, "ID_AA64MMFR0_EL1");
+read_id_register!(read_id_aa64mmfr1_el1, "ID_AA64MMFR1_EL1");
+read_id_register!(read_id_aa64mmfr2_el1, "ID_AA64MMFR2_EL1");
 
 struct AxvmArmHostOps;
 

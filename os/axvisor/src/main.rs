@@ -40,6 +40,7 @@ mod guest_console;
 #[cfg(feature = "http-axum")]
 mod http;
 mod manager;
+mod realtime;
 mod shell;
 
 #[cfg(any(feature = "backtrace", feature = "test-panic-no-backtrace"))]
@@ -97,6 +98,9 @@ fn main() {
 
     guest_console::submit_host_bytes(banner::STARTUP);
 
+    #[cfg(feature = "realtime")]
+    realtime::log_cpu_partition();
+
     info!("Starting virtualization...");
     let manager = manager::AxvmManager::new()
         .unwrap_or_else(|error| panic!("failed to initialize AxVM manager: {error:#}"));
@@ -137,6 +141,8 @@ fn main() {
 
     #[cfg(not(feature = "no-auto-start"))]
     info!("[OK] Default guest initialized");
+    realtime::setup_host_mailbox_doorbell();
+    realtime::log_priority_test_result();
 
     // The management console runs on the primary CPU (Core 0) while the vCPU
     // tasks are pinned to Core 1 via `phys_cpu_ids`, so it stays responsive

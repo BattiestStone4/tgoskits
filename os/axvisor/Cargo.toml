@@ -49,6 +49,7 @@ default = []
 host-xtask = []
 axtest = []
 fs = ["ax-std/ext4fs", "ax-std/fatfs", "axvm/host-fs"]
+realtime = []
 sstc = ["axvm/sstc"]
 stack-protector = ["ax-std/stack-protector"]
 backtrace = ["ax-std/backtrace", "dep:axbacktrace"]
@@ -104,9 +105,11 @@ ax-std = { workspace = true, default-features = false, features = [
 ] }
 # System dependent modules provided by ArceOS-Hypervisor (bare-metal only)
 # ax-runtime = { version = "=0.3.0-preview.1", features = ["alloc", "irq", "paging", "smp", "multitask"] }
+ax-rt.workspace = true
 axvm = { workspace = true, default-features = false, features = ["tls"] }
 axvmconfig = { workspace = true, default-features = false }
 axvm-types.workspace = true
+ax-memory-addr.workspace = true
 ax-driver = { workspace = true, optional = true }
 axbacktrace = { workspace = true, optional = true }
 

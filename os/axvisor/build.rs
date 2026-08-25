@@ -120,6 +120,17 @@ fn write_tokens(out_file: &mut fs::File, tokens: proc_macro2::TokenStream) -> an
 }
 
 fn resolve_config_path(configs_path: impl AsRef<Path>, path: &str) -> PathBuf {
+    // Paths prefixed with `${workspace}/` are resolved relative to the workspace root.
+    if let Some(workspace_path) = path.strip_prefix("${workspace}/") {
+        let manifest_dir = PathBuf::from(
+            env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR must be set"),
+        );
+        let workspace = manifest_dir
+            .parent()
+            .and_then(Path::parent)
+            .expect("AxVisor manifest must be under the workspace root");
+        return workspace.join(workspace_path);
+    }
     let path = Path::new(path);
     if path.is_absolute() {
         return path.to_path_buf();

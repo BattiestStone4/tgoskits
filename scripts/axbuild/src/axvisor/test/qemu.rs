@@ -8,6 +8,7 @@ use std::{
 use anyhow::Context;
 use ostool::{build::config::Cargo, run::qemu::QemuConfig};
 use serde::Deserialize;
+use tokio::process::Command;
 
 use super::{
     AXVISOR_NORMAL_GROUP, AxvisorQemuCase,
@@ -141,6 +142,11 @@ impl Axvisor {
         // embedded VM configuration, so a later build would otherwise replace
         // the executable belonging to an earlier group.
         for (index, build_group) in build_groups.iter_mut().enumerate() {
+            run_prebuild_commands(
+                self.app.workspace_root(),
+                build_group.group.build_config_path,
+            )
+            .await?;
             rootfs::ensure_qemu_rootfs_ready(&build_group.request, self.app.workspace_root(), None)
                 .await?;
             build_group.cargo = build::load_cargo_config(&build_group.request)?;
@@ -487,6 +493,34 @@ fn load_axvisor_http_probe_config(
         .host_http_probe)
 }
 
+async fn run_prebuild_commands(workspace_root: &Path, config_path: &Path) -> anyhow::Result<()> {
+    for command in build::load_prebuild_commands(config_path)? {
+        let (program, args) = command
+            .split_first()
+            .expect("empty prebuild commands are rejected while loading the config");
+        let status = Command::new(program)
+            .args(args)
+            .current_dir(workspace_root)
+            .status()
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to execute Axvisor prebuild command `{}` from {}",
+                    command.join(" "),
+                    config_path.display()
+                )
+            })?;
+        if !status.success() {
+            anyhow::bail!(
+                "Axvisor prebuild command `{}` from {} exited with {status}",
+                command.join(" "),
+                config_path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
 fn axvisor_qemu_test_build_args(arch: &str, config: Option<PathBuf>) -> AxvisorCliArgs {
     AxvisorCliArgs {
         config,
@@ -645,5 +679,30 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn prebuild_command_failure_is_reported() {
+        use tempfile::tempdir;
+
+        let root = tempdir().unwrap();
+        let config_path = root.path().join("build.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+target = "aarch64-unknown-none-softfloat"
+features = []
+log = "Info"
+prebuild_commands = [["sh", "-c", "exit 7"]]
+"#,
+        )
+        .unwrap();
+
+        let error = super::run_prebuild_commands(root.path(), &config_path)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("exited with"));
     }
 }

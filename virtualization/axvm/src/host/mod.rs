@@ -8,6 +8,8 @@ pub(crate) mod percpu_irq;
 pub(crate) mod shared_mmio;
 pub(crate) mod task;
 pub(crate) mod traits;
+#[cfg(not(test))]
+pub mod worker;
 
 pub(crate) fn default_host() -> &'static arceos::ArceOsHost {
     arceos::arceos_host()

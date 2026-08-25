@@ -10,6 +10,8 @@ repository.workspace = true
 version = "0.9.1"
 
 [features]
+axtest = []
+el1-phys-timer = ["someboot/el1-phys-timer"]
 efi = ["someboot/efi"]
 hv = ["mmu", "someboot/hv", "dep:ax-cpu"]
 mmu = ["someboot/mmu"]
