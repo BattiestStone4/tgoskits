@@ -427,10 +427,246 @@ fn itimer_type_signo_and_time_conversion_rules_hold_for_test() -> bool {
     true
 }
 
+/// The `ITimer::update` accounting contract that `TimeManager::poll()` relies
+/// on to decide the fired set: `remained == 0` never fires, a not-yet-elapsed
+/// timer decrements without firing, an elapsed one-shot fires and disarms
+/// (`remained` becomes 0), and an elapsed periodic one re-arms from its
+/// `interval`. Pure logic, so it is deterministic under the frozen host
+/// clock (`DummyTime::current_ticks` returns 0 under host tests).
+#[cfg(all(test, not(axtest)))]
+fn itimer_update_rules_for_test() -> bool {
+    use crate::task::timer::ITimer;
+
+    // remained == 0: never fires, unchanged.
+    let mut t = ITimer {
+        interval_ns: 0,
+        remained_ns: 0,
+    };
+    if t.update(usize::MAX) || t.remained_ns != 0 {
+        return false;
+    }
+
+    // Not yet elapsed: decrements, no fire.
+    let mut t = ITimer {
+        interval_ns: 0,
+        remained_ns: 10,
+    };
+    if t.update(4) || t.remained_ns != 6 {
+        return false;
+    }
+
+    // Elapsed one-shot: fires, disarms (interval=0 keeps remained at 0, so
+    // the fire path's `renew_timer` has no alarm to register and stays host
+    // testable).
+    let mut t = ITimer {
+        interval_ns: 0,
+        remained_ns: 1,
+    };
+    if !t.update(1) || t.remained_ns != 0 {
+        return false;
+    }
+    // Disarmed timers stay silent forever.
+    if t.update(usize::MAX) || t.remained_ns != 0 {
+        return false;
+    }
+    // Elapsed with a large delta: fires and disarms as well (interval=0).
+    let mut t = ITimer {
+        interval_ns: 0,
+        remained_ns: 1,
+    };
+    if !t.update(usize::MAX / 2) || t.remained_ns != 0 {
+        return false;
+    }
+    // NOTE: the periodic re-arm branch (interval > 0) calls `renew_timer`,
+    // which registers an alarm on `current()` — unavailable in the host test
+    // harness — so the interval-rewrite half of that branch is not exercised
+    // here; it runs on target in the qemu timer-family tests.
+
+    true
+}
+
+/// Regression for #2010's `TimeManager::poll()` contract: it returns the
+/// interval-timer signals that fired (fixed slots: 0=Virtual/SIGVTALRM,
+/// 1=Prof/SIGPROF) instead of emitting them via a closure, so the caller can
+/// deliver them after releasing the IRQ-disabling `time` lock. Also pins the
+/// merged upstream semantics that `ITIMER_REAL` is process state and is polled
+/// separately by `poll_process_timer` — the Real slot (2) must never be filled
+/// here. Runs under the host clock, which is frozen at zero (`DummyTime`), so
+/// every poll sees `delta == 0` and no timer can fire: what this test asserts
+/// is that `poll()` never fabricates signals, keeps CPU time unchanged at zero
+/// delta, resyncs its baselines, and leaves the armed timers intact for a real
+/// clock to fire. The fire/expiry semantics themselves are covered by
+/// [`itimer_update_rules_for_test`].
+///
+/// Timers are armed by writing the `ITimer` fields directly instead of going
+/// through `set_itimer`: that path also registers an alarm (`current()`), which
+/// is unavailable in the host unit-test harness.
+#[cfg(all(test, not(axtest)))]
+fn time_manager_poll_fired_slots_for_test() -> bool {
+    use crate::task::timer::{ITimer, ITimerType, TimeManager, TimerState};
+
+    // Arms an itimer slot without the alarm registration in `set_itimer`.
+    fn arm(tm: &mut TimeManager, ty: ITimerType, interval_ns: usize, remained_ns: usize) {
+        tm.itimers[ty as usize] = ITimer {
+            interval_ns,
+            remained_ns,
+        };
+    }
+
+    // (1) Empty table: nothing fires, and the poll baselines are synced.
+    {
+        let mut tm = TimeManager::new();
+        if tm.poll() != [None, None, None] {
+            return false;
+        }
+        // The end of poll() syncs the tick baseline to the poll baseline.
+        if tm.last_wall_ns != tm.last_tick_ns {
+            return false;
+        }
+    }
+
+    // (2) Armed Virtual + Prof timers under a zero delta: no fabricated
+    // signals, and CPU time stays untouched (User state would normally add the
+    // elapsed delta — with delta == 0 nothing is added).
+    {
+        let mut tm = TimeManager::new();
+        tm.set_state(TimerState::User);
+        let _ = tm.poll(); // baseline
+        arm(&mut tm, ITimerType::Virtual, 0, 1);
+        arm(&mut tm, ITimerType::Prof, 0, 1);
+        let (u0, s0) = tm.output();
+        if tm.poll() != [None, None, None] {
+            return false;
+        }
+        let (u1, s1) = tm.output();
+        if u1.as_nanos() != u0.as_nanos() || s1.as_nanos() != s0.as_nanos() {
+            return false;
+        }
+        // The armed timers survive the poll for a real clock to fire later.
+        if tm.itimers[ITimerType::Virtual as usize].remained_ns != 1
+            || tm.itimers[ITimerType::Prof as usize].remained_ns != 1
+        {
+            return false;
+        }
+    }
+
+    // (3) The Real slot is never filled: ITIMER_REAL is process state, polled
+    // separately by poll_process_timer, so even an armed Real timer must not
+    // produce a signal through TimeManager::poll.
+    {
+        let mut tm = TimeManager::new();
+        tm.set_state(TimerState::User);
+        let _ = tm.poll();
+        arm(&mut tm, ITimerType::Real, 0, 1);
+        if tm.poll() != [None, None, None] {
+            return false;
+        }
+        if tm.itimers[ITimerType::Real as usize].remained_ns != 1 {
+            return false;
+        }
+    }
+
+    // (4) Kernel state never touches the Virtual slot.
+    {
+        let mut tm = TimeManager::new();
+        tm.set_state(TimerState::Kernel);
+        let _ = tm.poll();
+        arm(&mut tm, ITimerType::Virtual, 0, 1);
+        arm(&mut tm, ITimerType::Prof, 0, 1);
+        if tm.poll() != [None, None, None] {
+            return false;
+        }
+        if tm.itimers[ITimerType::Virtual as usize].remained_ns != 1 {
+            return false;
+        }
+    }
+
+    true
+}
+
+/// #2010: `Thread.time` is `IrqMutex<TimeManager>`, not a fake-Sync `RefCell`.
+/// Hammer the same `TimeManager` from several host threads through the two
+/// access patterns the kernel uses — blocking `lock()` at syscall boundaries
+/// and `try_lock()` from the IRQ tick path — and require every observed
+/// utime+stime total to be monotonically non-decreasing. Under a data race the
+/// accounting would tear or the borrow bookkeeping would panic; under the
+/// mutex the total is never observed to shrink.
+#[cfg(all(test, not(axtest)))]
+extern crate std; // host tests: real multi-threaded access needs std::thread
+
+#[cfg(all(test, not(axtest)))]
+fn time_manager_concurrent_access_under_irq_mutex_for_test() -> bool {
+    use alloc::{sync::Arc, vec::Vec};
+    use std::thread;
+
+    use crate::{
+        sync::IrqMutex,
+        task::timer::{ITimer, ITimerType, TimeManager, TimerState},
+    };
+
+    const THREADS: usize = 4;
+    const ITERS: usize = 500;
+
+    let tm = Arc::new(IrqMutex::new(TimeManager::new()));
+    let mut handles = Vec::new();
+    for t in 0..THREADS {
+        let tm = tm.clone();
+        handles.push(thread::spawn(move || {
+            let mut local_max: usize = 0;
+            for _ in 0..ITERS {
+                {
+                    let mut guard = tm.lock();
+                    guard.set_state(TimerState::User);
+                    let _ = guard.poll();
+                }
+                // Alternate the two non-blocking accessors: the poll path
+                // (alarm task style) and the tick path (timer IRQ style).
+                if t % 2 == 0 {
+                    if let Some(mut guard) = tm.try_lock() {
+                        guard.itimers[ITimerType::Virtual as usize] = ITimer {
+                            interval_ns: 0,
+                            remained_ns: 1,
+                        };
+                        let _ = guard.poll();
+                    }
+                } else if let Some(mut guard) = tm.try_lock() {
+                    guard.tick();
+                }
+                let total = {
+                    let guard = tm.lock();
+                    let (u, s) = guard.output();
+                    u.as_micros() as usize + s.as_micros() as usize
+                };
+                if total < local_max {
+                    return false; // a torn/racing read of the accounting
+                }
+                local_max = total;
+            }
+            true
+        }));
+    }
+    handles.into_iter().all(|h| h.join().unwrap())
+}
+
 #[cfg(all(test, not(axtest)))]
 mod tests {
     #[test]
     fn itimer_type_signo_and_time_conversion_rules_hold() {
         assert!(super::itimer_type_signo_and_time_conversion_rules_hold_for_test());
+    }
+
+    #[test]
+    fn itimer_update_rules() {
+        assert!(super::itimer_update_rules_for_test());
+    }
+
+    #[test]
+    fn time_manager_poll_fired_slots() {
+        assert!(super::time_manager_poll_fired_slots_for_test());
+    }
+
+    #[test]
+    fn time_manager_concurrent_access_under_irq_mutex() {
+        assert!(super::time_manager_concurrent_access_under_irq_mutex_for_test());
     }
 }
