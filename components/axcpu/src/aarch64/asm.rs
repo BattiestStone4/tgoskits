@@ -29,7 +29,19 @@ pub fn disable_irqs() {
 /// In AArch64, it checks the I bit in the `DAIF` register.
 #[inline]
 pub fn irqs_enabled() -> bool {
-    !DAIF.matches_all(DAIF::I::Masked)
+    #[cfg(not(feature = "host-test"))]
+    {
+        !DAIF.matches_all(DAIF::I::Masked)
+    }
+    // Host-side scheduler tests run unprivileged (EL0), where reading `DAIF`
+    // is trapped as an illegal instruction. Treat interrupts as enabled so
+    // `might_sleep`'s atomic-context detection keys on the signals the
+    // host-test layer does model (preemption depth, IRQ context) rather than
+    // on a register the host process cannot read.
+    #[cfg(feature = "host-test")]
+    {
+        true
+    }
 }
 
 /// Relaxes the current CPU and waits for interrupts.

@@ -4,6 +4,10 @@
 # PyBuilder
 /target/
 
+# Container cargo target dirs (host-mounted CARGO_TARGET_DIR)
+/target-host/
+/target-container/
+
 # Jupyter Notebook
 /.ipynb_checkpoints
 
