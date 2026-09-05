@@ -1,13 +1,14 @@
 use alloc::{string::String, vec::Vec};
-pub use axio::{BufRead, BufReader, Read, Write};
-use axsync::{Mutex, MutexGuard};
 
-pub type CmdResult<T> = axio::Result<T>;
+pub use ax_io::{BufRead, BufReader, Read, Write};
+use ax_sync::{Mutex, MutexGuard};
+
+pub type CmdResult<T> = ax_io::Result<T>;
 
 struct StdinRaw;
 
 fn ax_console_read_bytes(buf: &mut [u8]) -> CmdResult<usize> {
-    let len = axhal::console::read_bytes(buf);
+    let len = ax_hal::console::read_bytes(buf);
     for c in &mut buf[..len] {
         if *c == b'\r' {
             *c = b'\n';
@@ -17,7 +18,7 @@ fn ax_console_read_bytes(buf: &mut [u8]) -> CmdResult<usize> {
 }
 
 fn ax_console_write_bytes(buf: &[u8]) -> CmdResult<usize> {
-    axhal::console::write_bytes(buf);
+    ax_hal::console::write_bytes(buf);
     Ok(buf.len())
 }
 
@@ -71,7 +72,7 @@ impl Stdin {
         if buf.is_empty() || read_len > 0 {
             return Ok(read_len);
         }
-        return Ok(0);
+        Ok(0)
     }
 }
 
@@ -171,8 +172,12 @@ impl Write for StdoutLock<'_> {
 
 /// Constructs a new handle to the standard input of the current process.
 pub fn stdin() -> Stdin {
-    static INSTANCE: Mutex<BufReader<StdinRaw>> = Mutex::new(BufReader::new(StdinRaw));
-    Stdin { inner: &INSTANCE }
+    static INSTANCE: ax_lazyinit::LazyInit<Mutex<BufReader<StdinRaw>>> =
+        ax_lazyinit::LazyInit::new();
+    // `BufReader::new` is not `const`, so the static needs lazy initialization.
+    let inner: &'static Mutex<BufReader<StdinRaw>> =
+        INSTANCE.init_once(Mutex::new(BufReader::new(StdinRaw)));
+    Stdin { inner }
 }
 
 /// Constructs a new handle to the standard output of the current process.

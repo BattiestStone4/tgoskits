@@ -1,11 +1,11 @@
-use axsync::Mutex;
-use lazyinit::LazyInit;
+use alloc::boxed::Box;
+
+use ax_lazyinit::LazyInit;
+use ax_sync::Mutex;
 use uefi_raw::{
     Status,
     protocol::file_system::{FileProtocolV1, SimpleFileSystemProtocol},
 };
-
-use alloc::boxed::Box;
 
 use crate::runtime::protocol::fs::file_protocol_v1::open_root;
 

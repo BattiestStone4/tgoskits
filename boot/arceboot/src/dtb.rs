@@ -1,9 +1,5 @@
-use alloc::string::String;
-use alloc::vec;
-use alloc::vec::Vec;
-use core::mem;
-use core::ptr;
-use core::str;
+use alloc::{string::String, vec, vec::Vec};
+use core::{mem, ptr, str};
 
 const FDT_BEGIN_NODE: u32 = 0x00000001;
 const FDT_END_NODE: u32 = 0x00000002;
@@ -26,13 +22,14 @@ impl<'a> DtbMemory<'a> {
     fn check_bounds(&self, offset: usize, len: usize) -> bool {
         offset
             .checked_add(len)
-            .map_or(false, |end| end <= self.data.len())
+            .is_none_or(|end| end <= self.data.len())
     }
 
     fn read_u32(&self, offset: usize) -> Option<u32> {
         if !self.check_bounds(offset, 4) {
             error!(
-                "read_u32 out of bounds: offset={}, len=4, size={} (It won't panic. Try adjusting and then retry)",
+                "read_u32 out of bounds: offset={}, len=4, size={} (It won't panic. Try adjusting \
+                 and then retry)",
                 offset,
                 self.data.len()
             );
@@ -45,7 +42,8 @@ impl<'a> DtbMemory<'a> {
     fn write_u32(&mut self, offset: usize, value: u32) -> bool {
         if !self.check_bounds(offset, 4) {
             error!(
-                "write_u32 out of bounds: offset={}, len=4, size={} (It won't panic. Try adjusting and then retry)",
+                "write_u32 out of bounds: offset={}, len=4, size={} (It won't panic. Try \
+                 adjusting and then retry)",
                 offset,
                 self.data.len()
             );
@@ -58,7 +56,8 @@ impl<'a> DtbMemory<'a> {
     fn read_bytes(&self, offset: usize, len: usize) -> Option<&[u8]> {
         if !self.check_bounds(offset, len) {
             error!(
-                "read_bytes out of bounds: offset={}, len={}, size={} (It won't panic. Try adjusting and then retry)",
+                "read_bytes out of bounds: offset={}, len={}, size={} (It won't panic. Try \
+                 adjusting and then retry)",
                 offset,
                 len,
                 self.data.len()
@@ -71,7 +70,8 @@ impl<'a> DtbMemory<'a> {
     fn write_bytes(&mut self, offset: usize, data: &[u8]) -> bool {
         if !self.check_bounds(offset, data.len()) {
             error!(
-                "write_bytes out of bounds: offset={}, len={}, size={} (It won't panic. Try adjusting and then retry)",
+                "write_bytes out of bounds: offset={}, len={}, size={} (It won't panic. Try \
+                 adjusting and then retry)",
                 offset,
                 data.len(),
                 self.data.len()
@@ -87,7 +87,8 @@ impl<'a> DtbMemory<'a> {
         while len < 256 {
             if !self.check_bounds(offset + len, 1) {
                 error!(
-                    "read_str out of bounds while searching for null terminator: offset={}, len=1, size={} (It won't panic. Try adjusting and then retry)",
+                    "read_str out of bounds while searching for null terminator: offset={}, \
+                     len=1, size={} (It won't panic. Try adjusting and then retry)",
                     offset + len,
                     self.data.len()
                 );
@@ -259,8 +260,8 @@ impl DtbParser {
     /// Returns `addr(usize)` to indicate the memory address saved to.
     pub fn save_to_mem(&self) -> usize {
         let size = self.dtb_data.len();
-        let start_addr = axalloc::global_allocator()
-            .alloc_pages(size / 4096 + 1, 4096)
+        let start_addr = ax_alloc::global_allocator()
+            .alloc_pages(size / 4096 + 1, 4096, ax_alloc::UsageKind::RustHeap)
             .unwrap();
         unsafe {
             ptr::copy_nonoverlapping(self.dtb_data.as_ptr(), start_addr as *mut u8, size);
@@ -274,10 +275,7 @@ impl DtbParser {
         let offset_in_bytes = self.header.off_dt_struct() as usize + self.current_offset * 4;
         self.get_memory_view_read_only()
             .read_u32(offset_in_bytes)
-            .map(|val| {
-                self.current_offset += 1;
-                val
-            })
+            .inspect(|_| self.current_offset += 1)
     }
 
     /// Reads a null-terminated node name from the structure block and advances `current_offset`.
@@ -338,7 +336,7 @@ impl DtbParser {
                 Some(FDT_PROP) => {
                     let len = unsafe { self.next_token().unwrap_or(0) } as usize;
                     let _ = unsafe { self.next_token() }; // nameoff
-                    self.current_offset += (len + 3) / 4;
+                    self.current_offset += len.div_ceil(4);
                 }
                 Some(FDT_NOP) => {}
                 Some(FDT_END) => {
@@ -415,10 +413,11 @@ impl DtbParser {
                 FDT_PROP => {
                     if let Some(len) = unsafe { self.next_token() } {
                         if let Some(_nameoff) = unsafe { self.next_token() } {
-                            self.current_offset += (len as usize + 3) / 4;
+                            self.current_offset += (len as usize).div_ceil(4);
                         } else {
                             error!(
-                                "find_node: Malformed DTB, missing nameoff for property at offset {:#x}",
+                                "find_node: Malformed DTB, missing nameoff for property at offset \
+                                 {:#x}",
                                 self.current_offset * 4
                             );
                             self.current_offset = saved_offset;
@@ -775,25 +774,26 @@ impl DtbParser {
                                 let mem_view_ro = self.get_memory_view_read_only();
                                 if let Some(name) = mem_view_ro.read_str(
                                     self.header.off_dt_strings() as usize + nameoff as usize,
-                                ) {
-                                    if name == prop_name {
-                                        prop_len_words = (len as usize + 3) / 4;
-                                        prop_nameoff_word = nameoff;
-                                        found = true;
-                                        break;
-                                    }
+                                ) && name == prop_name
+                                {
+                                    prop_len_words = (len as usize).div_ceil(4);
+                                    prop_nameoff_word = nameoff;
+                                    found = true;
+                                    break;
                                 }
-                                self.current_offset += (len as usize + 3) / 4;
+                                self.current_offset += (len as usize).div_ceil(4);
                             } else {
                                 error!(
-                                    "modify_property: Malformed DTB, missing nameoff for property at offset {:#x}",
+                                    "modify_property: Malformed DTB, missing nameoff for property \
+                                     at offset {:#x}",
                                     self.current_offset * 4
                                 );
                                 break;
                             }
                         } else {
                             error!(
-                                "modify_property: Malformed DTB, missing length for property at offset {:#x}",
+                                "modify_property: Malformed DTB, missing length for property at \
+                                 offset {:#x}",
                                 self.current_offset * 4
                             );
                             break;
@@ -807,7 +807,8 @@ impl DtbParser {
                     FDT_NOP => {}
                     _ => {
                         error!(
-                            "modify_property: Unknown token {:#x} in node while searching for property at offset {:#x}",
+                            "modify_property: Unknown token {:#x} in node while searching for \
+                             property at offset {:#x}",
                             token,
                             self.current_offset * 4
                         );
@@ -816,7 +817,8 @@ impl DtbParser {
                 }
             } else {
                 error!(
-                    "modify_property: Unexpected end of DTB structure while searching for property."
+                    "modify_property: Unexpected end of DTB structure while searching for \
+                     property."
                 );
                 break;
             }
@@ -857,7 +859,7 @@ impl DtbParser {
             mem_view.write_u32(prop_len_offset, new_prop_len_bytes as u32);
 
             self.current_offset = saved_offset;
-            return success;
+            success
         } else {
             // Case 2: New value is longer (reallocate and rebuild DTB)
             debug!("modify_property: New value is longer. Reallocating and rebuilding DTB.");
@@ -930,7 +932,7 @@ impl DtbParser {
                 self.dtb_data.len()
             );
             self.current_offset = saved_offset;
-            return true;
+            true
         }
     }
 
@@ -940,18 +942,18 @@ impl DtbParser {
         let mut path_stack: Vec<String> = Vec::new();
         let mut depth = 0;
 
-        axlog::ax_println!("\n--- DTB Parsing Output ---");
+        ax_log::ax_println!("\n--- DTB Parsing Output ---");
 
         while let Some(token) = unsafe { self.next_token() } {
             match token {
                 FDT_BEGIN_NODE => {
                     if let Some(name) = unsafe { self.read_node_name() } {
                         if depth == 0 && name.is_empty() {
-                            axlog::ax_println!("/ (root)");
+                            ax_log::ax_println!("/ (root)");
                         } else {
                             path_stack.push(name.clone());
                             let current_path = alloc::format!("/{}", path_stack.join("/"));
-                            axlog::ax_println!(
+                            ax_log::ax_println!(
                                 "{}{} (path: {})",
                                 "  ".repeat(depth),
                                 name,
@@ -992,14 +994,15 @@ impl DtbParser {
                                 indent.push_str("  ");
                             }
 
-                            axlog::ax_print!("{}{} = ", indent, name);
+                            ax_log::ax_print!("{}{} = ", indent, name);
                             self.print_property_value(data);
-                            axlog::ax_println!("");
+                            ax_log::ax_println!("");
 
-                            self.current_offset += (len as usize + 3) / 4;
+                            self.current_offset += (len as usize).div_ceil(4);
                         } else {
                             error!(
-                                "dump_all: Malformed DTB, missing nameoff for property at offset {:#x}",
+                                "dump_all: Malformed DTB, missing nameoff for property at offset \
+                                 {:#x}",
                                 self.current_offset * 4
                             );
                             break;
@@ -1013,7 +1016,7 @@ impl DtbParser {
                     }
                 }
                 FDT_END => {
-                    axlog::ax_println!("--- End of DTB Structure ---");
+                    ax_log::ax_println!("--- End of DTB Structure ---");
                     break;
                 }
                 FDT_NOP => {}
@@ -1032,35 +1035,36 @@ impl DtbParser {
     /// Helper function to print property values.
     fn print_property_value(&self, data: &[u8]) {
         if data.is_empty() {
-            axlog::ax_print!("[]");
+            ax_log::ax_print!("[]");
             return;
         }
 
-        if let Ok(s) = core::str::from_utf8(data) {
-            if s.chars()
+        if let Ok(s) = core::str::from_utf8(data)
+            && s.chars()
                 .all(|c| c.is_ascii() && (c.is_ascii_graphic() || c == ' ' || c == '\0'))
-            {
-                axlog::ax_print!("\"{}\"", s.trim_end_matches('\0'));
-                return;
-            }
+        {
+            ax_log::ax_print!("\"{}\"", s.trim_end_matches('\0'));
+            return;
         }
 
-        axlog::ax_print!("[");
+        ax_log::ax_print!("[");
         for (i, &byte) in data.iter().enumerate() {
             if i > 0 {
-                axlog::ax_print!(" ");
+                ax_log::ax_print!(" ");
             }
-            axlog::ax_print!("{:02x}", byte);
+            ax_log::ax_print!("{:02x}", byte);
         }
-        axlog::ax_print!("]");
+        ax_log::ax_print!("]");
 
-        if data.len() % 4 == 0 {
-            axlog::ax_print!(" (u32: [");
-            for chunk in data.chunks_exact(4) {
-                let val = u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-                axlog::ax_print!("{:#x} ", val);
+        if data.len().is_multiple_of(4) {
+            ax_log::ax_print!(" (u32: [");
+            // `as_chunks` drops the trailing partial chunk, matching the
+            // `is_multiple_of` check above.
+            for chunk in data.as_chunks::<4>().0 {
+                let val = u32::from_be_bytes(*chunk);
+                ax_log::ax_print!("{:#x} ", val);
             }
-            axlog::ax_print!("])");
+            ax_log::ax_print!("])");
         }
     }
 
@@ -1096,32 +1100,33 @@ impl DtbParser {
                                 let mem_view_ro = self.get_memory_view_read_only();
                                 if let Some(name) = mem_view_ro.read_str(
                                     self.header.off_dt_strings() as usize + nameoff as usize,
-                                ) {
-                                    if name == prop_name {
-                                        let offset_in_bytes = self.header.off_dt_struct() as usize
-                                            + self.current_offset * 4;
-                                        let data = mem_view_ro
-                                            .read_bytes(offset_in_bytes, len as usize)
-                                            .unwrap_or(&[]);
+                                ) && name == prop_name
+                                {
+                                    let offset_in_bytes = self.header.off_dt_struct() as usize
+                                        + self.current_offset * 4;
+                                    let data = mem_view_ro
+                                        .read_bytes(offset_in_bytes, len as usize)
+                                        .unwrap_or(&[]);
 
-                                        axlog::ax_print!("Value of {}:{} = ", node_path, prop_name);
-                                        self.print_property_value(data);
-                                        axlog::ax_println!("");
-                                        found = true;
-                                        break;
-                                    }
+                                    ax_log::ax_print!("Value of {}:{} = ", node_path, prop_name);
+                                    self.print_property_value(data);
+                                    ax_log::ax_println!("");
+                                    found = true;
+                                    break;
                                 }
-                                self.current_offset += (len as usize + 3) / 4;
+                                self.current_offset += (len as usize).div_ceil(4);
                             } else {
                                 error!(
-                                    "read_property_value: Malformed DTB, missing nameoff for property at offset {:#x}",
+                                    "read_property_value: Malformed DTB, missing nameoff for \
+                                     property at offset {:#x}",
                                     self.current_offset * 4
                                 );
                                 break;
                             }
                         } else {
                             error!(
-                                "read_property_value: Malformed DTB, missing length for property at offset {:#x}",
+                                "read_property_value: Malformed DTB, missing length for property \
+                                 at offset {:#x}",
                                 self.current_offset * 4
                             );
                             break;
@@ -1135,7 +1140,8 @@ impl DtbParser {
                     FDT_NOP => {}
                     _ => {
                         error!(
-                            "read_property_value: Unknown token {:#x} in node while searching for property at offset {:#x}",
+                            "read_property_value: Unknown token {:#x} in node while searching for \
+                             property at offset {:#x}",
                             token,
                             self.current_offset * 4
                         );
@@ -1144,7 +1150,8 @@ impl DtbParser {
                 }
             } else {
                 error!(
-                    "read_property_value: Unexpected end of DTB structure while searching for property."
+                    "read_property_value: Unexpected end of DTB structure while searching for \
+                     property."
                 );
                 break;
             }

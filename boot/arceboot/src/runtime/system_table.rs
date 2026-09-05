@@ -1,7 +1,8 @@
+use alloc::boxed::Box;
 use core::ptr::null_mut;
 
-use axsync::Mutex;
-use lazyinit::LazyInit;
+use ax_lazyinit::LazyInit;
+use ax_sync::Mutex;
 use uefi_raw::table::{Header, configuration::ConfigurationTable, system::SystemTable};
 
 use crate::runtime::{
@@ -16,8 +17,6 @@ use crate::runtime::{
     },
     service::{get_boot_service, get_runtime_service},
 };
-
-use alloc::boxed::Box;
 
 #[derive(Debug)]
 pub struct Table {
@@ -106,7 +105,7 @@ pub fn init_system_table() {
     let system_table = unsafe { &mut *system_table_raw };
 
     SYSTEM_TABLE.init_once(Mutex::new(Table {
-        system_table: system_table,
+        system_table,
         system_table_raw,
     }));
 }

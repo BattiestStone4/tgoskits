@@ -17,6 +17,8 @@ members = [
 
     "bootloader/axloader",
 
+    "boot/arceboot",
+
     "components/aic8800",
     "components/axtest/axtest",
     "components/axtest/axtest_macros",

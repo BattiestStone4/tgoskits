@@ -1,18 +1,15 @@
+use alloc::boxed::Box;
 use core::{ffi::c_void, ptr};
 
-use axhal::mem::PhysAddr;
+use ax_hal::mem::PhysAddr;
 use uefi_raw::{
     Boolean, Char16, Event, Guid, Handle, PhysicalAddress, Status,
     protocol::device_path::DevicePathProtocol,
     table::boot::{
-        EventNotifyFn, EventType, InterfaceType, MemoryDescriptor, MemoryType,
+        AllocateType, EventNotifyFn, EventType, InterfaceType, MemoryDescriptor, MemoryType,
         OpenProtocolInformationEntry, TimerDelay, Tpl,
     },
 };
-
-use alloc::boxed::Box;
-
-use crate::runtime::service::memory::AllocateType;
 
 #[derive(Debug)]
 pub struct Boot {
@@ -101,16 +98,11 @@ pub unsafe extern "efiapi" fn restore_tpl(_old_tpl: Tpl) {}
 
 // Memory allocation functions
 pub unsafe extern "efiapi" fn allocate_pages(
-    alloc_ty: u32,
+    alloc_ty: AllocateType,
     mem_ty: MemoryType,
     count: usize,
     addr: *mut PhysicalAddress,
 ) -> Status {
-    let alloc_ty = match AllocateType::try_from(alloc_ty) {
-        Ok(t) => t,
-        Err(_) => return Status::INVALID_PARAMETER,
-    };
-
     let ptr = crate::runtime::service::memory::alloc_pages(alloc_ty, mem_ty, count);
     if ptr.is_null() {
         return Status::OUT_OF_RESOURCES;
@@ -121,7 +113,7 @@ pub unsafe extern "efiapi" fn allocate_pages(
 }
 pub unsafe extern "efiapi" fn free_pages(addr: PhysicalAddress, pages: usize) -> Status {
     let phys_addr = PhysAddr::from_usize(addr.try_into().unwrap());
-    let _ = crate::runtime::service::memory::free_pages(phys_addr, pages);
+    crate::runtime::service::memory::free_pages(phys_addr, pages);
 
     Status::SUCCESS
 }
@@ -274,7 +266,7 @@ pub unsafe extern "efiapi" fn exit(
     _exit_data_size: usize,
     _exit_data: *mut Char16,
 ) -> ! {
-    loop {}
+    panic!("UEFI exit() called: boot services are no longer available");
 }
 pub unsafe extern "efiapi" fn unload_image(_image_handle: Handle) -> Status {
     Status::UNSUPPORTED

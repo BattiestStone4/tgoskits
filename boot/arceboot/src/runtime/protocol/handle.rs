@@ -1,9 +1,8 @@
-use axsync::Mutex;
-use lazyinit::LazyInit;
-use uefi_raw::{Guid, Handle};
+use alloc::{collections::BTreeMap, vec::Vec};
 
-use alloc::collections::BTreeMap;
-use alloc::vec::Vec;
+use ax_lazyinit::LazyInit;
+use ax_sync::Mutex;
+use uefi_raw::{Guid, Handle};
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 #[repr(transparent)]
@@ -22,7 +21,7 @@ pub fn register_handle(handle: Handle, protocols: Vec<Guid>) {
     let mut handles = HANDLES.lock();
     handles
         .entry(HandleWrapper(handle))
-        .or_insert_with(Vec::new)
+        .or_default()
         .extend(protocols);
 }
 

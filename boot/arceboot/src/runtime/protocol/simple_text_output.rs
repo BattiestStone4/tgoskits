@@ -1,11 +1,11 @@
-use axsync::Mutex;
-use lazyinit::LazyInit;
+use alloc::boxed::Box;
+
+use ax_lazyinit::LazyInit;
+use ax_sync::Mutex;
 use uefi_raw::{
     Boolean, Char16, Status,
     protocol::console::{SimpleTextOutputMode, SimpleTextOutputProtocol},
 };
-
-use alloc::boxed::Box;
 
 static TEXT_OUTPUT: LazyInit<Mutex<Output>> = LazyInit::new();
 
@@ -40,8 +40,10 @@ impl Output {
     }
 
     pub fn get_protocol(&self) -> *mut SimpleTextOutputProtocol {
-        let guard = TEXT_OUTPUT.lock();
-        guard.protocol_raw
+        // The caller must hold the `TEXT_OUTPUT` lock (see
+        // `system_table::init_system_table`); taking it again would deadlock
+        // on ArceBoot's non-reentrant single-core mutex.
+        self.protocol_raw
     }
 }
 
@@ -80,7 +82,7 @@ pub extern "efiapi" fn output_string(
         while *string.add(len) != 0 {
             len += 1;
         }
-        let message = core::slice::from_raw_parts(string, len as usize).iter();
+        let message = core::slice::from_raw_parts(string, len).iter();
         let utf16_message = core::char::decode_utf16(message.cloned());
         let decoded_message: alloc::string::String =
             utf16_message.map(|r| r.unwrap_or('\u{FFFD}')).collect();

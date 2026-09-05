@@ -1,4 +1,4 @@
-use axio::{Read, Write};
+use ax_io::{Read, Write};
 
 mod cmd;
 mod stdio;
@@ -12,10 +12,12 @@ const SPACE: u8 = b' ';
 const MAX_CMD_LEN: usize = 256;
 
 fn print_prompt() {
-    axlog::ax_print!(
-        "[Arceboot]: {}$ ",
-        &crate::medium::virtio_disk::current_dir().unwrap()
-    );
+    // Without the `fs` feature the shell only sees the ramdisk root.
+    #[cfg(feature = "fs")]
+    let dir = crate::medium::virtio_disk::current_dir().unwrap();
+    #[cfg(not(feature = "fs"))]
+    let dir: alloc::string::String = "/".into();
+    ax_log::ax_print!("[Arceboot]: {}$ ", dir);
 }
 
 pub fn shell_main() {
@@ -37,7 +39,7 @@ pub fn shell_main() {
         let num_char = b'0' + i;
         stdout.write_all(&[num_char, b' ']).unwrap();
 
-        axhal::time::busy_wait(core::time::Duration::new(1, 0));
+        ax_hal::time::busy_wait(core::time::Duration::new(1, 0));
 
         if i > 0 {
             stdout.write_all(&[CR]).unwrap();
@@ -49,7 +51,7 @@ pub fn shell_main() {
             return;
         }
     }
-    axlog::ax_println!();
+    ax_log::ax_println!();
 
     // Cannot autoboot or cancel autoboot
     self::cmd::run_cmd("help".as_bytes());
@@ -64,7 +66,7 @@ pub fn shell_main() {
         }
         match buf[cursor] {
             CR | LF => {
-                axlog::ax_println!();
+                ax_log::ax_println!();
                 if cursor > 0 {
                     cmd::run_cmd(&buf[..cursor]);
                     cursor = 0;

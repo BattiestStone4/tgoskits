@@ -1,7 +1,7 @@
 use alloc::boxed::Box;
-use axsync::Mutex;
-use lazyinit::LazyInit;
 
+use ax_lazyinit::LazyInit;
+use ax_sync::Mutex;
 use uefi_raw::{
     Status,
     protocol::console::{
@@ -109,14 +109,14 @@ where
 {
     GRAPHICS_OUTPUT.get().map(|guard| {
         let lock = guard.lock();
-        f(&*lock)
+        f(&lock)
     })
 }
 
 pub fn init_graphics_output() {
     #[cfg(feature = "display")]
     {
-        let display_info = axdisplay::framebuffer_info();
+        let display_info = ax_display::framebuffer_info();
         info!("Graphics Output Protocol initialized: {:?}", display_info);
 
         let frame_buffer_base_virtual_address = display_info.fb_base_vaddr;
@@ -130,7 +130,7 @@ pub fn init_graphics_output() {
                 frame_buffer_size_bytes,
             );
         }
-        axdisplay::framebuffer_flush();
+        ax_display::framebuffer_flush();
 
         GRAPHICS_OUTPUT.init_once(Mutex::new(GraphicsOutput::new(
             display_info.width,
@@ -258,7 +258,7 @@ pub unsafe extern "efiapi" fn blt(
                         *p.add(3) = color[3];
                     }
                 }
-                axdisplay::framebuffer_flush();
+                ax_display::framebuffer_flush();
                 Status::SUCCESS
             }
 
@@ -308,7 +308,7 @@ pub unsafe extern "efiapi" fn blt(
                         .add((source_y + row) * source_pitch_bytes + source_x * BYTES_PER_PIXEL);
                     core::ptr::copy_nonoverlapping(src, dst, width_pixels * BYTES_PER_PIXEL);
                 }
-                axdisplay::framebuffer_flush();
+                ax_display::framebuffer_flush();
                 Status::SUCCESS
             }
 
@@ -334,7 +334,7 @@ pub unsafe extern "efiapi" fn blt(
                     );
                     core::ptr::copy(src, dst, width_pixels * BYTES_PER_PIXEL);
                 }
-                axdisplay::framebuffer_flush();
+                ax_display::framebuffer_flush();
                 Status::SUCCESS
             }
 

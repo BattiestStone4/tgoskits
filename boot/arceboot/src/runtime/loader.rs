@@ -1,7 +1,9 @@
-use object::FileKind;
-use object::endian::LittleEndian;
-use object::read::pe::ImageOptionalHeader;
-use object::{File, Object, ObjectSection, pe, read::pe::ImageNtHeaders};
+use object::{
+    File, FileKind, Object, ObjectSection,
+    endian::LittleEndian,
+    pe,
+    read::pe::{ImageNtHeaders, ImageOptionalHeader},
+};
 
 #[derive(Debug, Clone, Copy)]
 pub struct PeMeta {
@@ -13,7 +15,7 @@ pub struct PeMeta {
 }
 
 pub fn load_efi_file(path: &str) -> alloc::vec::Vec<u8> {
-    axfs::api::read(path).expect("Failed to read EFI file from ramdisk")
+    crate::medium::ramdisk_cpio::read(path).expect("Failed to read EFI file from ramdisk")
 }
 
 pub fn parse_efi_file(data: &[u8]) -> File<'_> {
@@ -71,7 +73,7 @@ pub fn load_image(data: &[u8], file: &File, mapping: *mut u8, meta: PeMeta) {
                 offset,
                 data.len()
             );
-            if offset.checked_add(data.len()).unwrap_or(usize::MAX) > meta.size_of_image as usize {
+            if offset.saturating_add(data.len()) > meta.size_of_image as usize {
                 warn!(
                     "Section {} out of bounds: offset=0x{:x} size=0x{:x} size_of_image=0x{:x}",
                     section.name().unwrap_or("<unnamed>"),

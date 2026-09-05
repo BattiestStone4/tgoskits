@@ -1,7 +1,13 @@
-use alloc::{string::String, string::ToString, vec::Vec};
-use axhal::mem::{PhysAddr, VirtAddr, phys_to_virt, virt_to_phys};
-use axio::{self as io};
+use alloc::{
+    string::{String, ToString},
+    vec::Vec,
+};
 use core::str;
+
+use ax_hal::mem::phys_to_virt;
+#[cfg(feature = "fs")]
+use ax_hal::mem::{PhysAddr, VirtAddr, virt_to_phys};
+use ax_io::{self as io};
 
 const CPIO_MAGIC: &[u8; 6] = b"070701";
 pub static mut CPIO_BASE: usize = 0x0;
@@ -150,19 +156,27 @@ fn set_ramdisk_addr(addr: usize) {
 }
 
 fn ramdisk_enabled() -> bool {
-    axconfig::boot::USE_RAMDISK
+    crate::config::boot::use_ramdisk()
 }
 
 fn ramdisk_load_enabled() -> bool {
-    axconfig::boot::LOAD_RAMDISK
+    #[cfg(feature = "fs")]
+    {
+        crate::config::boot::load_ramdisk()
+    }
+    #[cfg(not(feature = "fs"))]
+    {
+        false
+    }
 }
 
+#[cfg(feature = "fs")]
 fn do_load_ramdisk() -> Option<(usize, usize)> {
-    let file_data = crate::medium::virtio_disk::read(axconfig::boot::RAMDISK_FILE).unwrap();
+    let file_data = crate::medium::virtio_disk::read(crate::config::boot::ramdisk_file()).unwrap();
     let file_size = file_data.len();
 
-    let start_addr = axalloc::global_allocator()
-        .alloc_pages(file_size / 4096 + 1, 4096)
+    let start_addr = ax_alloc::global_allocator()
+        .alloc_pages(file_size / 4096 + 1, 4096, ax_alloc::UsageKind::RustHeap)
         .unwrap();
     unsafe {
         core::ptr::copy_nonoverlapping(file_data.as_ptr(), start_addr as *mut u8, file_size);
@@ -199,35 +213,36 @@ pub fn check_ramdisk() {
     info!("Checking ramdisk.....");
     // Check the detailed annotations and explanations in configs/platforms/riscv64-qemu-virt.toml
     if crate::medium::ramdisk_cpio::ramdisk_enabled() {
-        let mut start_addr_phys: usize = 0;
-        let mut _start_addr_virt: usize = 0;
-        let mut size: usize = 0;
-        if crate::medium::ramdisk_cpio::ramdisk_load_enabled() {
-            if let Some((addr, si)) = crate::medium::ramdisk_cpio::do_load_ramdisk() {
-                _start_addr_virt = addr;
-                start_addr_phys = virt_to_phys(VirtAddr::from_usize(addr)).as_usize();
-                size = si;
-            } else {
-                error!("Load ramdisk failed!");
+        let (start_addr_phys, size) = if crate::medium::ramdisk_cpio::ramdisk_load_enabled() {
+            #[cfg(feature = "fs")]
+            {
+                match crate::medium::ramdisk_cpio::do_load_ramdisk() {
+                    Some((addr, si)) => (virt_to_phys(VirtAddr::from_usize(addr)).as_usize(), si),
+                    None => {
+                        error!("Load ramdisk failed!");
+                        return;
+                    }
+                }
             }
-            crate::medium::ramdisk_cpio::set_ramdisk_addr(start_addr_phys);
-            crate::medium::ramdisk_cpio::enable_dtb_ramdisk(start_addr_phys, size);
-            info!(
-                "read test file context: {}",
-                crate::medium::ramdisk_cpio::read_to_string("/test/arceboot.txt").unwrap()
-            );
+            #[cfg(not(feature = "fs"))]
+            {
+                // Unreachable: `ramdisk_load_enabled()` is always false
+                // without the `fs` feature.
+                (0, 0)
+            }
         } else {
-            start_addr_phys = axconfig::boot::RAMDISK_START;
-            _start_addr_virt = phys_to_virt(PhysAddr::from_usize(start_addr_phys)).as_usize();
-            size = axconfig::boot::RAMDISK_SIZE;
+            (
+                crate::config::boot::ramdisk_start(),
+                crate::config::boot::ramdisk_size(),
+            )
+        };
 
-            crate::medium::ramdisk_cpio::set_ramdisk_addr(start_addr_phys);
-            crate::medium::ramdisk_cpio::enable_dtb_ramdisk(start_addr_phys, size);
-            info!(
-                "read test file context: {}",
-                crate::medium::ramdisk_cpio::read_to_string("/test/arceboot.txt").unwrap()
-            );
-        }
+        crate::medium::ramdisk_cpio::set_ramdisk_addr(start_addr_phys);
+        crate::medium::ramdisk_cpio::enable_dtb_ramdisk(start_addr_phys, size);
+        info!(
+            "read test file context: {}",
+            crate::medium::ramdisk_cpio::read_to_string("/test/arceboot.txt").unwrap()
+        );
     }
     info!("Checking for ramdisk is done!");
 }

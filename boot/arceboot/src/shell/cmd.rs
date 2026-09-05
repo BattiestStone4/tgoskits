@@ -17,7 +17,7 @@ pub fn run_cmd(line: &[u8]) {
                 return;
             }
         }
-        axlog::ax_println!("{}: command not found", cmd);
+        ax_log::ax_println!("{}: command not found", cmd);
     }
 }
 
@@ -28,20 +28,20 @@ fn split_whitespace(str: &str) -> (&str, &str) {
 }
 
 fn do_help(_args: &str) {
-    axlog::ax_println!("Available commands:");
+    ax_log::ax_println!("Available commands:");
     for (name, desc, _) in CMD_TABLE {
-        axlog::ax_print!("  {}", name);
-        axlog::ax_println!("  {}", desc);
+        ax_log::ax_print!("  {}", name);
+        ax_log::ax_println!("  {}", desc);
     }
 }
 
 fn do_exit(_args: &str) {
-    axlog::ax_println!("======== ArceBoot will exit and shut down ========");
-    axhal::power::system_off();
+    ax_log::ax_println!("======== ArceBoot will exit and shut down ========");
+    ax_hal::power::system_off();
 }
 
 fn do_env(_args: &str) {
-    axlog::ax_println!("======== ArceBoot env arguments ========");
+    ax_log::ax_println!("======== ArceBoot env arguments ========");
     unsafe {
         let mut parser = crate::dtb::DtbParser::new(crate::dtb::GLOBAL_NOW_DTB_ADDRESS).unwrap();
 
@@ -50,7 +50,7 @@ fn do_env(_args: &str) {
             error!("Read bootargs failed!");
         }
     }
-    axlog::ax_println!("======== ArceBoot env arguments ========");
+    ax_log::ax_println!("======== ArceBoot env arguments ========");
 }
 
 fn do_set_env(_args: &str) {

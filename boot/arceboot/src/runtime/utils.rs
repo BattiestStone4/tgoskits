@@ -1,5 +1,8 @@
-use alloc::format;
-use alloc::{string::String, string::ToString, vec::Vec};
+use alloc::{
+    format,
+    string::{String, ToString},
+    vec::Vec,
+};
 
 /// Convert a UEFI CHAR16* (NUL-terminated) to a Rust UTF-8 String.
 /// Returns None if the pointer is NULL or decoding fails.
@@ -16,7 +19,7 @@ pub unsafe fn utf16_cstr_to_string(p: *const uefi_raw::Char16) -> Option<String>
         }
         len += 1;
     }
-    let slice = unsafe { core::slice::from_raw_parts(p as *const u16, len) };
+    let slice = unsafe { core::slice::from_raw_parts(p, len) };
     String::from_utf16(slice).ok()
 }
 

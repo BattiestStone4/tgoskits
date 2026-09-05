@@ -1,4 +1,6 @@
+use alloc::boxed::Box;
 use core::ffi::c_void;
+
 use uefi_raw::{
     Char16, Guid, PhysicalAddress, Status,
     capsule::CapsuleHeader,
@@ -8,8 +10,6 @@ use uefi_raw::{
     },
     time::Time,
 };
-
-use alloc::boxed::Box;
 
 #[derive(Debug)]
 pub struct Runtime {
@@ -141,7 +141,7 @@ pub unsafe extern "efiapi" fn reset_system(
     _data_size: usize,
     _data: *const u8,
 ) -> ! {
-    loop {}
+    panic!("UEFI runtime reset_system() called: not supported by ArceBoot");
 }
 
 // Capsule services

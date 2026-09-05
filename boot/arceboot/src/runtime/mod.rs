@@ -1,7 +1,5 @@
 use object::Object;
-use uefi_raw::table::boot::MemoryType;
-
-use crate::runtime::service::memory::AllocateType;
+use uefi_raw::table::boot::{AllocateType, MemoryType};
 
 mod entry;
 mod loader;
@@ -26,7 +24,7 @@ pub fn efi_runtime_init() {
 
     // let mapping = crate::runtime::service::memory::alloc_and_map_memory(mem_size, &load_bootloader);
     let mapping = crate::runtime::service::memory::alloc_pages(
-        AllocateType::AnyPages,
+        AllocateType::ANY_PAGES,
         MemoryType::LOADER_CODE,
         mem_size / 4096 + 1,
     );
@@ -57,7 +55,8 @@ pub fn efi_runtime_init() {
     }
 
     info!(
-        "Loaded EFI file: machine=0x{:04x}, preferred_image_base=0x{:x}, loaded_image_base=0x{:x}, size_of_image=0x{:x}, entry_rva=0x{:x}, mapping {:?}",
+        "Loaded EFI file: machine=0x{:04x}, preferred_image_base=0x{:x}, \
+         loaded_image_base=0x{:x}, size_of_image=0x{:x}, entry_rva=0x{:x}, mapping {:?}",
         meta.machine, meta.image_base, mapping as u64, meta.size_of_image, meta.entry_rva, mapping,
     );
 

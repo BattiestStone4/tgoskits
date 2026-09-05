@@ -1,17 +1,18 @@
+use alloc::{boxed::Box, vec, vec::Vec};
 use core::{
     mem,
     ptr::{self},
     slice,
 };
 
-use axsync::Mutex;
-use lazyinit::LazyInit;
-use uefi_raw::protocol::device_path::{
-    DevicePathProtocol, DevicePathUtilitiesProtocol, DeviceSubType, DeviceType,
+use ax_lazyinit::LazyInit;
+use ax_sync::Mutex;
+use uefi_raw::{
+    Boolean,
+    protocol::device_path::{
+        DevicePathProtocol, DevicePathUtilitiesProtocol, DeviceSubType, DeviceType,
+    },
 };
-
-use alloc::boxed::Box;
-use alloc::vec::Vec;
 
 // Device Path node type: 0x7F = End of Hardware Device Path
 const END_DEVICE_PATH_TYPE: u8 = 0x7F;
@@ -131,8 +132,9 @@ impl DevicePathUtilities {
     }
 
     pub fn get_protocol(&self) -> *mut DevicePathUtilitiesProtocol {
-        let guard = DEVICE_PATH_UTILITIES.lock();
-        guard.protocol_raw
+        // The caller must hold the `DEVICE_PATH_UTILITIES` lock; taking it
+        // again would deadlock on ArceBoot's non-reentrant single-core mutex.
+        self.protocol_raw
     }
 }
 
@@ -144,12 +146,7 @@ pub fn init_device_path_uttilities() {
 }
 
 pub extern "efiapi" fn get_device_path_size(device_path: *const DevicePathProtocol) -> usize {
-    unsafe {
-        match compute_total_device_path_size(device_path) {
-            Some(total_size) => total_size,
-            None => 0,
-        }
-    }
+    unsafe { compute_total_device_path_size(device_path).unwrap_or_default() }
 }
 
 pub extern "efiapi" fn duplicate_device_path(
@@ -180,11 +177,10 @@ pub extern "efiapi" fn append_device_path(
             None => return ptr::null_mut(),
         };
 
-        let first_without_end_length = if first_total_size >= DEVICE_PATH_HEADER_LENGTH {
-            first_total_size - DEVICE_PATH_HEADER_LENGTH
-        } else {
-            0
-        };
+        let first_without_end_length = first_total_size.saturating_sub(DEVICE_PATH_HEADER_LENGTH);
+        // Overflow must yield 0 (not `usize::MAX`) so the null check below
+        // rejects the path; `saturating_add` would change that semantics.
+        #[allow(clippy::manual_saturating_arithmetic)]
         let output_total_size = first_without_end_length
             .checked_add(second_total_size)
             .unwrap_or(0);
@@ -328,8 +324,9 @@ pub extern "efiapi" fn append_device_path_instance(
             instance_total_length,
         ));
         // Remove the last 4 bytes of the copied instance (its End node), then add End Entire
-        if let Some(_) =
-            output_bytes.get(output_bytes.len().saturating_sub(DEVICE_PATH_HEADER_LENGTH)..)
+        if output_bytes
+            .get(output_bytes.len().saturating_sub(DEVICE_PATH_HEADER_LENGTH)..)
+            .is_some()
         {
             output_bytes.truncate(output_bytes.len().saturating_sub(DEVICE_PATH_HEADER_LENGTH));
         }
@@ -402,24 +399,24 @@ pub extern "efiapi" fn get_next_device_path_instance(
     }
 }
 
-pub extern "efiapi" fn is_device_path_multi_instance(
+pub unsafe extern "efiapi" fn is_device_path_multi_instance(
     device_path: *const DevicePathProtocol,
-) -> bool {
+) -> Boolean {
     unsafe {
         if device_path.is_null() {
-            return false;
+            return Boolean(0);
         }
         let mut cursor_ptr = device_path;
         loop {
             if is_end_instance_node(cursor_ptr) {
-                return true;
+                return Boolean(1);
             }
             if is_end_entire_node(cursor_ptr) {
-                return false;
+                return Boolean(0);
             }
             let node_length = get_node_length(cursor_ptr);
             if node_length < DEVICE_PATH_HEADER_LENGTH {
-                return false;
+                return Boolean(0);
             }
             cursor_ptr = (cursor_ptr as *const u8).add(node_length) as *const DevicePathProtocol;
         }
@@ -435,8 +432,7 @@ pub extern "efiapi" fn create_device_node(
         if usize::from(node_length) < DEVICE_PATH_HEADER_LENGTH {
             return ptr::null_mut();
         }
-        let mut buffer = Vec::<u8>::with_capacity(node_length as usize);
-        buffer.resize(node_length as usize, 0u8);
+        let mut buffer = vec![0u8; node_length as usize];
 
         buffer[0] = mem::transmute::<DeviceType, u8>(node_type);
         buffer[1] = mem::transmute::<DeviceSubType, u8>(node_sub_type);

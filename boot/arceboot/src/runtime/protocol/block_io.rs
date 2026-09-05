@@ -1,13 +1,12 @@
+use alloc::boxed::Box;
 use core::ffi::c_void;
 
-use axsync::Mutex;
-use lazyinit::LazyInit;
+use ax_lazyinit::LazyInit;
+use ax_sync::Mutex;
 use uefi_raw::{
     Boolean, Status,
     protocol::block::{BlockIoMedia, BlockIoProtocol, Lba},
 };
-
-use alloc::boxed::Box;
 
 static BLOCK_IO: LazyInit<Mutex<BlockIo>> = LazyInit::new();
 

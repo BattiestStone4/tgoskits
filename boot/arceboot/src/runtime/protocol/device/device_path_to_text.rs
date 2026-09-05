@@ -1,11 +1,11 @@
-use axsync::Mutex;
-use lazyinit::LazyInit;
+use alloc::boxed::Box;
+
+use ax_lazyinit::LazyInit;
+use ax_sync::Mutex;
 use uefi_raw::{
     Boolean, Char16,
     protocol::device_path::{DevicePathProtocol, DevicePathToTextProtocol},
 };
-
-use alloc::boxed::Box;
 
 static DEVICE_PATH_TO_TEXT: LazyInit<Mutex<DevicePathToText>> = LazyInit::new();
 

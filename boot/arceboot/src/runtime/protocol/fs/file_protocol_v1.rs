@@ -1,17 +1,17 @@
+use alloc::{
+    boxed::Box,
+    collections::BTreeMap,
+    string::{String, ToString},
+    vec::Vec,
+};
 use core::ffi::c_void;
 
-use axsync::Mutex;
-use lazyinit::LazyInit;
+use ax_lazyinit::LazyInit;
+use ax_sync::Mutex;
 use uefi_raw::{
     Char16, Guid, Status,
     protocol::file_system::{FileAttribute, FileMode, FileProtocolRevision, FileProtocolV1},
 };
-
-use alloc::boxed::Box;
-use alloc::collections::BTreeMap;
-use alloc::string::String;
-use alloc::string::ToString;
-use alloc::vec::Vec;
 
 use crate::runtime::{
     protocol::fs::HandleKind,
@@ -108,7 +108,7 @@ pub fn open_root() -> *mut FileProtocolV1 {
         FileProtocolV1Impl::new("/", FileMode::READ | FileMode::WRITE, HandleKind::Dir);
     let counter = FileHandlerCounter {
         path: "/".to_string(),
-        file_handle: file_handle,
+        file_handle,
         count: 1,
     };
 

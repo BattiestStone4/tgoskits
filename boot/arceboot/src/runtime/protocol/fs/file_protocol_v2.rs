@@ -1,11 +1,11 @@
+use alloc::boxed::Box;
+
 use uefi_raw::{
     Char16, Status,
     protocol::file_system::{FileAttribute, FileIoToken, FileMode, FileProtocolV2},
 };
 
 use crate::runtime::protocol::fs::{HandleKind, file_protocol_v1::FileProtocolV1Impl};
-
-use alloc::boxed::Box;
 
 #[repr(C)]
 #[derive(Debug)]

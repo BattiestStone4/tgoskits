@@ -2,6 +2,10 @@ OUTPUT_ARCH(riscv)
 
 BASE_ADDRESS = 0xffffffc080200000;
 
+/* Stack size expected by the someboot/axplat-dyn runtime (see
+   `platforms/someboot/src/ld/defaults.ld`). */
+PROVIDE(STACK_SIZE = 0x40000);
+
 ENTRY(_start)
 SECTIONS
 {

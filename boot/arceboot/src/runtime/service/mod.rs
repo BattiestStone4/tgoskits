@@ -1,5 +1,5 @@
-use axsync::Mutex;
-use lazyinit::LazyInit;
+use ax_lazyinit::LazyInit;
+use ax_sync::Mutex;
 use uefi_raw::table::{boot::BootServices, runtime::RuntimeServices};
 
 use crate::runtime::service::{boot_service::Boot, runtime_service::Runtime};
