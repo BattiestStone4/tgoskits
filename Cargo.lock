@@ -308,6 +308,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "arceboot"
+version = "0.0.1"
+dependencies = [
+ "ax-alloc",
+ "ax-crate-interface",
+ "ax-ctor-bare",
+ "ax-display",
+ "ax-driver",
+ "ax-hal",
+ "ax-io",
+ "ax-lazyinit",
+ "ax-log",
+ "ax-memory-addr",
+ "ax-mm",
+ "ax-net",
+ "ax-plat",
+ "ax-sync",
+ "axklib",
+ "cfg-if",
+ "chrono",
+ "object 0.38.1",
+ "rdrive",
+ "sbi-rt",
+ "uefi-raw",
+]
+
+[[package]]
 name = "arceos-arce_agent"
 version = "0.2.0"
 dependencies = [
