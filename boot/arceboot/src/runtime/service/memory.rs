@@ -4,7 +4,7 @@ use ax_hal::{
     mem::{PhysAddr, VirtAddr},
     paging::MappingFlags,
 };
-use ax_memory_addr::{MemoryAddr, VirtAddrRange};
+use ax_memory_addr::VirtAddrRange;
 use ax_sync::Mutex;
 use uefi_raw::table::boot::{AllocateType, MemoryType};
 

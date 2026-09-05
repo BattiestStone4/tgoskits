@@ -8,17 +8,26 @@ pub type CmdResult<T> = ax_io::Result<T>;
 struct StdinRaw;
 
 fn ax_console_read_bytes(buf: &mut [u8]) -> CmdResult<usize> {
-    let len = ax_hal::console::read_bytes(buf);
-    for c in &mut buf[..len] {
-        if *c == b'\r' {
-            *c = b'\n';
-        }
+    // See the note in `log.rs`: the shell uses the SBI console so ArceBoot
+    // stays usable under firmware whose PMP denies UART MMIO access.
+    #[allow(deprecated)]
+    let ch = sbi_rt::legacy::console_getchar();
+    if ch == usize::MAX {
+        return Ok(0);
     }
-    Ok(len)
+    buf[0] = if ch == b'\r' as usize {
+        b'\n'
+    } else {
+        ch as u8
+    };
+    Ok(1)
 }
 
 fn ax_console_write_bytes(buf: &[u8]) -> CmdResult<usize> {
-    ax_hal::console::write_bytes(buf);
+    #[allow(deprecated)]
+    for &byte in buf {
+        sbi_rt::legacy::console_putchar(byte as usize);
+    }
     Ok(buf.len())
 }
 

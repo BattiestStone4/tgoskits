@@ -23,7 +23,6 @@ mod medium;
 mod panic;
 mod runtime;
 mod shell;
-mod sync;
 
 #[cfg_attr(not(test), ax_plat::main)]
 pub fn rust_main(cpu_id: usize, dtb: usize) -> ! {

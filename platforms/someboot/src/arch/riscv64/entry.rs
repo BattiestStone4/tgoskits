@@ -15,6 +15,14 @@ pub unsafe extern "C" fn _head() -> ! {
     naked_asm!(
         ".option push",
         ".option norvc",
+        // Some SBI firmware (e.g. RustSBI Prototyper) leaves the FPU
+        // state off for S-mode, while someboot's own early code (memory
+        // map formatting) uses FP. OpenSBI sets FS itself, so this is a
+        // no-op there but fixes the first FP trap on such firmware.
+        "csrr t0, sstatus",
+        "li t1, 0x6000",
+        "or t0, t0, t1",
+        "csrw sstatus, t0",
         // code0/code1: use lla+jr instead of j to avoid R_RISCV_JAL
         // range limit (±1MB); lla expands to auipc+addi with ±2GB reach
         "lla t0, {kernel_entry}",
