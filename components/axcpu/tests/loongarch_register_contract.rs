@@ -110,6 +110,21 @@ fn kernel_trap_initializes_the_complete_typed_register_frame() {
 }
 
 #[test]
+fn missing_page_table_level_installs_an_invalid_entry_pair() {
+    let invalid_entry = section(TRAP_ENTRY, ".Ltlb_invalid:", ".Ltlb_refill:");
+
+    assert!(
+        invalid_entry.contains("csrwr   $r0, LA_CSR_TLBRELO0")
+            && invalid_entry.contains("csrwr   $r0, LA_CSR_TLBRELO1"),
+        "a missing page-table level must install two zero, invalid EntryLo values"
+    );
+    assert!(
+        !invalid_entry.contains("LA_CSR_TLBREHI") && !invalid_entry.contains("rotri.d"),
+        "TLBREHI contains a virtual page number and must not be reused as an EntryLo value"
+    );
+}
+
+#[test]
 fn task_switch_owns_tls_but_never_percpu() {
     let task_context_definition = section(
         TASK_CONTEXT,
@@ -162,11 +177,10 @@ fn current_scheduler_installs_address_space_before_the_raw_switch() {
         "pub unsafe fn switch_to_prepared",
     );
     assert!(
-        TASK_CONTEXT.contains("page_table_root: usize")
-            && TASK_CONTEXT.contains("pub fn set_page_table_root")
-            && prepare.contains("write_user_page_table")
-            && prepare.contains("flush_tlb"),
-        "the existing axtask model must retain task-owned address-space selection"
+        TASK_CONTEXT.contains("address_space: InstalledAddressSpace")
+            && TASK_CONTEXT.contains("pub fn set_address_space")
+            && prepare.contains("install_user_address_space"),
+        "the scheduler must retain the complete installed address-space identity"
     );
 
     let raw_switch = section(
@@ -175,7 +189,9 @@ fn current_scheduler_installs_address_space_before_the_raw_switch() {
         "ret\",",
     );
     assert!(
-        !raw_switch.contains("write_user_page_table") && !raw_switch.contains("flush_tlb"),
+        !raw_switch.contains("install_user_address_space")
+            && !raw_switch.contains("write_user_page_table")
+            && !raw_switch.contains("flush_tlb"),
         "fallible or policy-bearing address-space work must precede current-register publication"
     );
 }

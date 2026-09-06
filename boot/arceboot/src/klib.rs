@@ -5,20 +5,31 @@
 //! service reports `Unsupported`. This mirrors the `axruntime` glue
 //! (`axruntime/src/klib.rs`) minus the task/IRQ plumbing.
 
-use core::time::Duration;
+use core::{ptr::NonNull, time::Duration};
 
 use axklib::{
-    AxError, AxResult, BoxedIrqHandler, ConcurrentBoxedIrqHandler, DmaCoherentMappingOutcome,
-    IrqCpuId, IrqCpuMask, IrqError, IrqHandle, IrqId, Klib, PhysAddr, VirtAddr, impl_trait,
+    BoxedIrqHandler, ConcurrentBoxedIrqHandler, DmaCoherentMappingOutcome, IrqCpuId, IrqCpuMask,
+    IrqError, IrqHandle, IrqId, Klib, KlibError, KlibResult, PhysAddr, VirtAddr, impl_trait,
 };
 
 struct KlibImpl;
 
+fn map_mm_error(err: ax_mm::MmError) -> KlibError {
+    match err {
+        ax_mm::MmError::InvalidInput(_) => KlibError::InvalidInput,
+        ax_mm::MmError::NoMemory => KlibError::NoMemory,
+        ax_mm::MmError::AlreadyExists => KlibError::AlreadyExists,
+        ax_mm::MmError::BadAddress => KlibError::BadAddress,
+        ax_mm::MmError::BadState(_) => KlibError::BadState,
+        ax_mm::MmError::Unsupported => KlibError::Unsupported,
+    }
+}
+
 impl_trait! {
     impl Klib for KlibImpl {
         /// Map a physical region by delegating to the memory manager (`axmm`).
-        fn mem_iomap(addr: PhysAddr, size: usize) -> AxResult<VirtAddr> {
-            ax_mm::iomap(addr, size)
+        fn mem_iomap(addr: PhysAddr, size: usize) -> KlibResult<VirtAddr> {
+            ax_mm::iomap(addr, size).map_err(map_mm_error)
         }
 
         fn mem_virt_to_phys(addr: VirtAddr) -> PhysAddr {
@@ -37,22 +48,26 @@ impl_trait! {
             ax_hal::mem::dcache_range(ax_hal::mem::DCacheOp::CleanInvalidate, addr, size);
         }
 
-        fn mem_make_dma_coherent_uncached(
-            addr: VirtAddr,
+        fn mem_map_dma_coherent_uncached(
+            addr: NonNull<u8>,
             size: usize,
         ) -> DmaCoherentMappingOutcome {
             let _ = (addr, size);
-            DmaCoherentMappingOutcome::NotStarted(AxError::Unsupported)
+            DmaCoherentMappingOutcome::NotStarted(KlibError::Unsupported)
         }
 
-        fn mem_restore_dma_cached(addr: VirtAddr, size: usize) -> AxResult {
+        fn mem_unmap_dma_coherent(addr: NonNull<u8>, size: usize) -> KlibResult {
             let _ = (addr, size);
-            Err(AxError::Unsupported)
+            Err(KlibError::Unsupported)
         }
 
-        fn dma_alloc_pages(dma_mask: u64, num_pages: usize, align: usize) -> AxResult<VirtAddr> {
+        fn dma_alloc_pages(
+            dma_mask: u64,
+            num_pages: usize,
+            align: usize,
+        ) -> KlibResult<NonNull<u8>> {
             if num_pages == 0 {
-                return Ok(VirtAddr::from_usize(0));
+                return Ok(NonNull::dangling());
             }
             let addr = if dma_mask <= u32::MAX as u64 {
                 ax_alloc::global_allocator().alloc_dma32_pages(
@@ -67,16 +82,16 @@ impl_trait! {
                     ax_alloc::UsageKind::Dma,
                 )
             }
-            .map_err(|_| AxError::NoMemory)?;
-            Ok(VirtAddr::from_usize(addr))
+            .map_err(|_| KlibError::NoMemory)?;
+            NonNull::new(addr as *mut u8).ok_or(KlibError::BadState)
         }
 
-        fn dma_dealloc_pages(addr: VirtAddr, num_pages: usize) {
+        fn dma_dealloc_pages(addr: NonNull<u8>, num_pages: usize) {
             if num_pages == 0 {
                 return;
             }
             ax_alloc::global_allocator().dealloc_pages(
-                addr.as_usize(),
+                addr.as_ptr() as usize,
                 num_pages,
                 ax_alloc::UsageKind::Dma,
             );
@@ -94,42 +109,42 @@ impl_trait! {
             ax_hal::time::try_init_epoch_offset(epoch_time_nanos)
         }
 
-        fn irq_set_enable(_irq: IrqId, _enabled: bool) -> AxResult {
-            Err(AxError::Unsupported)
+        fn irq_set_enable(_irq: IrqId, _enabled: bool) -> KlibResult {
+            Err(KlibError::Unsupported)
         }
 
         fn irq_request_shared(
             _irq: IrqId,
             _handler: BoxedIrqHandler,
-        ) -> AxResult<IrqHandle> {
-            Err(AxError::Unsupported)
+        ) -> KlibResult<IrqHandle> {
+            Err(KlibError::Unsupported)
         }
 
         fn irq_request_shared_disabled(
             _irq: IrqId,
             _handler: BoxedIrqHandler,
-        ) -> AxResult<IrqHandle> {
-            Err(AxError::Unsupported)
+        ) -> KlibResult<IrqHandle> {
+            Err(KlibError::Unsupported)
         }
 
         fn irq_request_percpu(
             _irq: IrqId,
             _cpus: IrqCpuMask,
             _handler: ConcurrentBoxedIrqHandler,
-        ) -> AxResult<IrqHandle> {
-            Err(AxError::Unsupported)
+        ) -> KlibResult<IrqHandle> {
+            Err(KlibError::Unsupported)
         }
 
-        fn irq_free(_handle: IrqHandle) -> AxResult {
-            Err(AxError::Unsupported)
+        fn irq_free(_handle: IrqHandle) -> KlibResult {
+            Err(KlibError::Unsupported)
         }
 
-        fn irq_enable(_handle: IrqHandle) -> AxResult {
-            Err(AxError::Unsupported)
+        fn irq_enable(_handle: IrqHandle) -> KlibResult {
+            Err(KlibError::Unsupported)
         }
 
-        fn irq_disable(_handle: IrqHandle) -> AxResult {
-            Err(AxError::Unsupported)
+        fn irq_disable(_handle: IrqHandle) -> KlibResult {
+            Err(KlibError::Unsupported)
         }
 
         unsafe fn irq_run_on_cpu_sync(

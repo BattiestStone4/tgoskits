@@ -26,7 +26,6 @@ mod consts;
 mod detect;
 mod guest_mem;
 pub mod host;
-mod legacy_ipi;
 mod percpu;
 mod registers;
 mod regs;
@@ -37,15 +36,12 @@ pub mod types;
 mod vcpu;
 mod vpmu;
 
-#[cfg(test)]
-mod world_switch_tests;
-
 pub use detect::{detect_h_extension as has_hardware_support, max_guest_page_table_levels};
 pub use regs::GprIndex;
 pub use types::{
     RiscvAccessFlags, RiscvAccessWidth, RiscvGuestPhysAddr, RiscvGuestVirtAddr, RiscvHostPhysAddr,
-    RiscvHostVirtAddr, RiscvNestedPagingConfig, RiscvVcpuError, RiscvVcpuId, RiscvVcpuResult,
-    RiscvVmExit, RiscvVmId,
+    RiscvHostVirtAddr, RiscvIpiAbi, RiscvIpiCompletion, RiscvIpiRequest, RiscvNestedPagingConfig,
+    RiscvVcpuError, RiscvVcpuId, RiscvVcpuResult, RiscvVmExit, RiscvVmId,
 };
 
 pub use self::{
@@ -81,3 +77,6 @@ impl Default for RiscvVcpuCreateConfig {
 
 /// Backward-compatible creation config alias.
 pub type RISCVVCpuCreateConfig = RiscvVcpuCreateConfig;
+
+#[cfg(test)]
+mod world_switch_tests;

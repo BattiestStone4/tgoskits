@@ -963,7 +963,8 @@ static void test_memfd_seal_syscall_ordering_regressions(void)
 
     void *bad_addr = unmapped_user_addr();
 
-    /* writev: bad iovec buffer on sealed memfd -> EFAULT (access_ok before seal denial). */
+    /* The iovec itself and its address geometry are valid. Linux shmem checks
+     * the write seal before attempting the payload copy and its page fault. */
     errno = 0;
     int sealed = memfd_create("seal_order_writev", MFD_ALLOW_SEALING);
     CHECK(sealed >= 0, "memfd_create(seal_order_writev)");
@@ -975,11 +976,12 @@ static void test_memfd_seal_syscall_ordering_regressions(void)
         bad_iov.iov_len = 1;
         errno = 0;
         ssize_t w = writev(sealed, &bad_iov, 1);
-        CHECK(w == -1 && errno == EFAULT, "sealed memfd + 坏 iov -> EFAULT");
+        CHECK(w == -1 && errno == EPERM,
+              "sealed memfd + inaccessible iovec payload -> EPERM");
         CHECK_RET(close(sealed), 0, "close sealed memfd (writev case)");
     }
 
-    /* write: bad user buffer on sealed memfd -> EFAULT. */
+    /* The same write_begin ordering applies to a scalar write. */
     errno = 0;
     sealed = memfd_create("seal_order_write", MFD_ALLOW_SEALING);
     CHECK(sealed >= 0, "memfd_create(seal_order_write)");
@@ -988,7 +990,8 @@ static void test_memfd_seal_syscall_ordering_regressions(void)
         CHECK_RET(fcntl(sealed, F_ADD_SEALS, F_SEAL_WRITE), 0, "ADD_SEALS(F_SEAL_WRITE)");
         errno = 0;
         ssize_t ww = write(sealed, bad_addr, 1);
-        CHECK(ww == -1 && errno == EFAULT, "sealed memfd + 坏 buf -> EFAULT");
+        CHECK(ww == -1 && errno == EPERM,
+              "sealed memfd + inaccessible payload -> EPERM");
         CHECK_RET(close(sealed), 0, "close sealed memfd (write case)");
     }
 
@@ -1148,6 +1151,86 @@ static void test_pidfd_send_signal_paths(void)
     CHECK_RET(close(pfd), 0, "close pidfd");
 }
 
+static void test_pidfd_identity_survives_reap_and_new_process(void)
+{
+    printf("--- pidfd identity survives reap and a later process ---\n");
+
+    int first_release[2];
+    int rc = pipe(first_release);
+    CHECK_RET(rc, 0, "first child release pipe");
+    if (rc != 0)
+        return;
+    pid_t first = fork();
+    CHECK(first >= 0, "fork first PID generation");
+    if (first < 0) {
+        close(first_release[0]);
+        close(first_release[1]);
+        return;
+    }
+    if (first == 0) {
+        close(first_release[1]);
+        char release;
+        if (read(first_release[0], &release, 1) != 1)
+            _exit(41);
+        _exit(0);
+    }
+    close(first_release[0]);
+
+    int stale_pidfd = x_pidfd_open(first, 0);
+    CHECK(stale_pidfd >= 0, "open pidfd for first generation");
+    char release = 'R';
+    CHECK_RET(write(first_release[1], &release, 1), 1, "release first generation");
+    close(first_release[1]);
+    int first_status = 0;
+    CHECK_RET(waitpid(first, &first_status, 0), first, "reap first generation");
+    CHECK(WIFEXITED(first_status) && WEXITSTATUS(first_status) == 0,
+          "first generation exited normally");
+
+    int second_release[2];
+    rc = pipe(second_release);
+    CHECK_RET(rc, 0, "second child release pipe");
+    if (rc != 0) {
+        if (stale_pidfd >= 0)
+            close(stale_pidfd);
+        return;
+    }
+    pid_t second = fork();
+    CHECK(second >= 0, "fork replacement PID generation");
+    if (second < 0) {
+        close(second_release[0]);
+        close(second_release[1]);
+        if (stale_pidfd >= 0)
+            close(stale_pidfd);
+        return;
+    }
+    if (second == 0) {
+        close(second_release[1]);
+        char second_go;
+        if (read(second_release[0], &second_go, 1) != 1)
+            _exit(42);
+        _exit(0);
+    }
+    close(second_release[0]);
+
+    CHECK(second != first, "cyclic PID allocation avoids immediate numeric reuse");
+    if (stale_pidfd >= 0) {
+        CHECK_ERR(x_pidfd_send_signal(stale_pidfd, 0, NULL, 0), ESRCH,
+                  "old pidfd does not retarget a later process");
+    }
+    CHECK_RET(kill(second, 0), 0, "replacement generation remains alive");
+
+    CHECK_RET(write(second_release[1], &release, 1), 1,
+              "release replacement generation");
+    close(second_release[1]);
+    int second_status = 0;
+    CHECK_RET(waitpid(second, &second_status, 0), second,
+              "reap replacement generation");
+    CHECK(WIFEXITED(second_status) && WEXITSTATUS(second_status) == 0,
+          "replacement generation exited normally");
+    if (stale_pidfd >= 0)
+        CHECK_RET(close(stale_pidfd), 0, "close stale pidfd");
+}
+
 /* ---- pidfd_getfd ---- */
 
 static void test_pidfd_getfd_flags(void)
@@ -1286,6 +1369,7 @@ int main(void)
     test_pidfd_open_pid_zero_linux();
 
     test_pidfd_send_signal_paths();
+    test_pidfd_identity_survives_reap_and_new_process();
 
     test_pidfd_getfd_flags();
     test_pidfd_getfd_cross_process();

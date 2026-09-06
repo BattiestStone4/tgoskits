@@ -12,15 +12,16 @@ use ax_driver::rknpu::{
     self, GemCachePolicy, RknpuAction, RknpuMemCreate, RknpuMemDestroy, RknpuMemMap, RknpuMemSync,
     RknpuSubmit,
 };
-use ax_errno::{AxError, AxResult};
 use ax_memory_addr::{PhysAddr, PhysAddrRange};
-use ax_runtime::hal::{cpu::asm::user_copy, time::monotonic_time_nanos};
+use ax_runtime::hal::time::monotonic_time_nanos;
 use axfs_ng_vfs::{DeviceId, NodeFlags, VfsError, VfsResult};
 use axpoll::{IoEvents, Pollable};
 use linux_raw_sys::general::O_CLOEXEC;
+use starry_vm::{vm_load, vm_write_slice};
 
 use super::drm::{DrmUnique, DrmVersion};
 use crate::{
+    StarryError, StarryResult,
     file::{
         FileLike,
         dmabuf::{ContiguousDmaBuf, resolve_contiguous_dmabuf},
@@ -278,7 +279,7 @@ impl FileLike for ExportedGemBuffer {
         "anon_inode:[rknpu-gem]".into()
     }
 
-    fn device_mmap(&self, _offset: u64, _length: u64) -> AxResult<DeviceMmap> {
+    fn device_mmap(&self, _offset: u64, _length: u64) -> StarryResult<DeviceMmap> {
         Ok(self.device_mmap_kind())
     }
 }
@@ -303,10 +304,10 @@ fn map_handle_from_offset(offset: u64) -> Option<u32> {
     (handle != 0).then_some(handle)
 }
 
-fn exported_gem_buffer(handle: u32) -> AxResult<ExportedGemBuffer> {
+fn exported_gem_buffer(handle: u32) -> StarryResult<ExportedGemBuffer> {
     let info = rknpu::buffer_info(handle)
         .map_err(map_rknpu_err)
-        .map_err(|_| AxError::NotFound)?;
+        .map_err(|_| StarryError::NotFound)?;
     // The NPU runs IOMMU-bypassed, so the GEM buffer's `dma_addr` is its physical
     // base. Use it directly instead of `virt_to_phys(obj_addr)` so imported
     // buffers (whose CPU va is not necessarily in the linear map) map correctly;
@@ -316,7 +317,7 @@ fn exported_gem_buffer(handle: u32) -> AxResult<ExportedGemBuffer> {
     // survives a concurrent MemDestroy / source-fd close without dangling.
     let retainer = rknpu::buffer_retainer(handle)
         .map_err(map_rknpu_err)
-        .map_err(|_| AxError::NotFound)?;
+        .map_err(|_| StarryError::NotFound)?;
     let paddr = PhysAddr::from(info.dma_addr as usize);
     Ok(ExportedGemBuffer::new(
         PhysAddrRange::from_start_size(paddr, info.size),
@@ -339,24 +340,25 @@ fn elapsed_us(start_ns: u64, end_ns: u64) -> u64 {
 
 /// Copies data from user space to kernel space
 pub fn copy_from_user(dst: *mut u8, src: *const u8, size: usize) -> Result<(), VfsError> {
-    let ret = unsafe { user_copy(dst, src, size) };
-
-    if ret != 0 {
-        warn!("[rknpu]: copy_from_user failed, ret={}", ret);
-        return Err(VfsError::InvalidData);
-    }
+    let bytes = vm_load(src, size).map_err(|err| {
+        warn!("[rknpu]: copy_from_user failed: {err:?}");
+        VfsError::InvalidData
+    })?;
+    // SAFETY: ioctl dispatch supplies a live kernel destination at least
+    // `size` bytes long. The user source is now an owned kernel buffer.
+    unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, size) };
     Ok(())
 }
 
 /// Copies data from kernel space to user space
 pub fn copy_to_user(dst: *mut u8, src: *const u8, size: usize) -> Result<(), VfsError> {
-    let ret = unsafe { user_copy(dst, src, size) };
-
-    if ret != 0 {
-        warn!("[rknpu]: copy_to_user failed, ret={}", ret);
-        return Err(VfsError::InvalidData);
-    }
-    Ok(())
+    // SAFETY: ioctl dispatch supplies a live initialized kernel source at
+    // least `size` bytes long for this synchronous copy.
+    let bytes = unsafe { core::slice::from_raw_parts(src, size) };
+    vm_write_slice(dst, bytes).map_err(|err| {
+        warn!("[rknpu]: copy_to_user failed: {err:?}");
+        VfsError::InvalidData
+    })
 }
 
 /// Handles RKNPU action ioctl commands
@@ -754,57 +756,6 @@ unsafe fn drm_copy_field(
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use ax_memory_addr::PhysAddrRange;
-
-    use super::*;
-
-    #[test]
-    fn prime_export_honors_cloexec_flag() {
-        assert!(prime_fd_cloexec(linux_raw_sys::general::O_CLOEXEC as u32));
-        assert!(!prime_fd_cloexec(0));
-    }
-
-    #[test]
-    fn mem_map_offset_decodes_to_handle() {
-        assert_eq!(map_handle_from_offset(0x1000), Some(1));
-        assert_eq!(map_handle_from_offset(0x2000), Some(2));
-        assert_eq!(map_handle_from_offset(0), None);
-        assert_eq!(map_handle_from_offset(0x1001), None);
-    }
-
-    #[test]
-    fn exported_buffer_reports_physical_device_mmap() {
-        let range = PhysAddrRange::from_start_size(0x1234_5000.into(), 0x4000);
-        let exported = ExportedGemBuffer::new(range, GemCachePolicy::Cacheable, Arc::new(()));
-
-        assert!(
-            matches!(exported.device_mmap(0, 0).unwrap(), DeviceMmap::PhysicalCached(actual, Some(_)) if actual == range)
-        );
-    }
-
-    #[test]
-    fn exported_buffer_defaults_to_uncached_device_mmap() {
-        let range = PhysAddrRange::from_start_size(0x1234_5000.into(), 0x4000);
-        let exported = ExportedGemBuffer::new(range, GemCachePolicy::NonCacheable, Arc::new(()));
-
-        assert!(
-            matches!(exported.device_mmap(0, 0).unwrap(), DeviceMmap::Physical(actual, Some(_)) if actual == range)
-        );
-    }
-
-    #[test]
-    fn exported_buffer_maps_write_combine_as_uncached_without_wc_pte_support() {
-        let range = PhysAddrRange::from_start_size(0x1234_5000.into(), 0x4000);
-        let exported = ExportedGemBuffer::new(range, GemCachePolicy::WriteCombine, Arc::new(()));
-
-        assert!(
-            matches!(exported.device_mmap(0, 0).unwrap(), DeviceMmap::Physical(actual, Some(_)) if actual == range)
-        );
-    }
-}
-
 /// Sets the DRM version information for the device
 pub fn drm_version(data: &mut [u8]) -> VfsResult<()> {
     let data = unsafe { &mut *(data.as_mut_ptr() as *mut DrmVersion) };
@@ -870,4 +821,55 @@ pub fn drm_get_unique(data: &mut [u8]) -> VfsResult<()> {
     unique_data.unique_len = 0;
 
     Ok(())
+}
+
+#[cfg(all(test, not(axtest)))]
+mod tests {
+    use ax_memory_addr::PhysAddrRange;
+
+    use super::*;
+
+    #[test]
+    fn prime_export_honors_cloexec_flag() {
+        assert!(prime_fd_cloexec(linux_raw_sys::general::O_CLOEXEC as u32));
+        assert!(!prime_fd_cloexec(0));
+    }
+
+    #[test]
+    fn mem_map_offset_decodes_to_handle() {
+        assert_eq!(map_handle_from_offset(0x1000), Some(1));
+        assert_eq!(map_handle_from_offset(0x2000), Some(2));
+        assert_eq!(map_handle_from_offset(0), None);
+        assert_eq!(map_handle_from_offset(0x1001), None);
+    }
+
+    #[test]
+    fn exported_buffer_reports_physical_device_mmap() {
+        let range = PhysAddrRange::from_start_size(0x1234_5000.into(), 0x4000);
+        let exported = ExportedGemBuffer::new(range, GemCachePolicy::Cacheable, Arc::new(()));
+
+        assert!(
+            matches!(exported.device_mmap(0, 0).unwrap(), DeviceMmap::PhysicalCached(actual, Some(_)) if actual == range)
+        );
+    }
+
+    #[test]
+    fn exported_buffer_defaults_to_uncached_device_mmap() {
+        let range = PhysAddrRange::from_start_size(0x1234_5000.into(), 0x4000);
+        let exported = ExportedGemBuffer::new(range, GemCachePolicy::NonCacheable, Arc::new(()));
+
+        assert!(
+            matches!(exported.device_mmap(0, 0).unwrap(), DeviceMmap::Physical(actual, Some(_)) if actual == range)
+        );
+    }
+
+    #[test]
+    fn exported_buffer_maps_write_combine_as_uncached_without_wc_pte_support() {
+        let range = PhysAddrRange::from_start_size(0x1234_5000.into(), 0x4000);
+        let exported = ExportedGemBuffer::new(range, GemCachePolicy::WriteCombine, Arc::new(()));
+
+        assert!(
+            matches!(exported.device_mmap(0, 0).unwrap(), DeviceMmap::Physical(actual, Some(_)) if actual == range)
+        );
+    }
 }

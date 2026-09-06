@@ -17,6 +17,7 @@ pub(crate) mod apk;
 pub mod app;
 mod args;
 pub mod board;
+mod boot_entropy;
 pub mod build;
 pub mod config;
 pub mod kmod;
@@ -65,6 +66,7 @@ impl Starry {
     }
 
     async fn qemu(&mut self, args: ArgsQemu) -> anyhow::Result<()> {
+        let write_policy = args.resolved_rootfs_write_policy();
         let request = self.prepare_request(
             (&args.build).into(),
             args.qemu_config,
@@ -73,9 +75,9 @@ impl Starry {
         )?;
         self.ensure_default_build_config_for_request(&request, "qemu")?;
         if let Some(rootfs) = args.rootfs {
-            rootfs::qemu_with_explicit_rootfs(self, request, rootfs).await
+            rootfs::qemu_with_explicit_rootfs(self, request, rootfs, write_policy).await
         } else {
-            self.run_qemu_request(request).await
+            self.run_qemu_request(request, write_policy).await
         }
     }
 
@@ -240,7 +242,13 @@ impl Starry {
         )?;
 
         let Some(test_case) = app::app_qemu_test_case(&case, app.case_dir.clone()) else {
-            return rootfs::qemu_with_explicit_rootfs(self, request, case.rootfs_path).await;
+            return rootfs::qemu_with_explicit_rootfs(
+                self,
+                request,
+                case.rootfs_path,
+                case.rootfs_write_policy,
+            )
+            .await;
         };
         if app.prebuild_path.is_some()
             && test_case.test_commands.is_empty()
@@ -266,14 +274,11 @@ impl Starry {
             rootfs::patch_rootfs(
                 &mut qemu,
                 &rootfs_path,
-                rootfs::RootfsPatchMode::EnsureDiskBootNet,
-            );
-            if case.snapshot && !qemu.args.iter().any(|arg| arg == "-snapshot") {
-                qemu.args.push("-snapshot".to_string());
-            }
-            if qemu.uefi {
-                qemu::apply_drive_snapshot_without_global_snapshot(&mut qemu);
-            }
+                rootfs::RootfsPatchOptions {
+                    mode: rootfs::RootfsPatchMode::EnsureDiskBootNet,
+                    write_policy: case.rootfs_write_policy,
+                },
+            )?;
             qemu::apply_timeout_scale(&mut qemu);
             println!("  prepare assets: 0ns (pipeline=plain, cache=miss)");
             println!(
@@ -322,14 +327,11 @@ impl Starry {
         rootfs::patch_rootfs(
             &mut qemu,
             &prepared_assets.rootfs_path,
-            rootfs::RootfsPatchMode::EnsureDiskBootNet,
-        );
-        qemu.args.extend(prepared_assets.extra_qemu_args.clone());
-        // Global snapshot mode makes the UEFI VVFAT ESP read-only. Preserve
-        // isolation on the ordinary disks while leaving the ESP writable.
-        if qemu.uefi {
-            qemu::apply_drive_snapshot_without_global_snapshot(&mut qemu);
-        }
+            rootfs::RootfsPatchOptions {
+                mode: rootfs::RootfsPatchMode::EnsureDiskBootNet,
+                write_policy: case.rootfs_write_policy,
+            },
+        )?;
         qemu::apply_timeout_scale(&mut qemu);
         println!(
             "  prepare assets: {:.2?} (pipeline={}, cache={})",
@@ -540,11 +542,12 @@ impl Starry {
         &mut self,
         request: &ResolvedStarryRequest,
         cargo: Cargo,
-        board_config: BoardRunConfig,
+        mut board_config: BoardRunConfig,
         board_config_path: PathBuf,
         session_assets: Option<test::PreparedBoardSessionAssets>,
         options: RunBoardOptions,
     ) -> anyhow::Result<()> {
+        let _boot_entropy = boot_entropy::prepare_for_secure_wifi(&mut board_config)?;
         let output = self.build_artifact(request, cargo.clone()).await?;
         let board_request = match session_assets {
             Some(assets) => {
@@ -567,8 +570,12 @@ impl Starry {
             .await
     }
 
-    async fn run_qemu_request(&mut self, request: ResolvedStarryRequest) -> anyhow::Result<()> {
-        rootfs::qemu(self, request).await
+    async fn run_qemu_request(
+        &mut self,
+        request: ResolvedStarryRequest,
+        write_policy: rootfs::RootfsWritePolicy,
+    ) -> anyhow::Result<()> {
+        rootfs::qemu(self, request, write_policy).await
     }
 
     async fn run_build_request(&mut self, request: ResolvedStarryRequest) -> anyhow::Result<()> {
@@ -623,7 +630,8 @@ impl Starry {
                     None,
                     SnapshotPersistence::Store,
                 )?;
-                self.run_qemu_request(request).await
+                self.run_qemu_request(request, rootfs::RootfsWritePolicy::Discard)
+                    .await
             }
         }
     }

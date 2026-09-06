@@ -15,19 +15,10 @@ pub unsafe extern "C" fn _head() -> ! {
     naked_asm!(
         ".option push",
         ".option norvc",
-        // Some SBI firmware (e.g. RustSBI Prototyper) leaves the FPU
-        // state off for S-mode, while someboot's own early code (memory
-        // map formatting) uses FP. OpenSBI sets FS itself, so this is a
-        // no-op there but fixes the first FP trap on such firmware.
-        "csrr t0, sstatus",
-        "li t1, 0x6000",
-        "or t0, t0, t1",
-        "csrw sstatus, t0",
-        // code0/code1: use lla+jr instead of j to avoid R_RISCV_JAL
-        // range limit (±1MB); lla expands to auipc+addi with ±2GB reach
-        "lla t0, {kernel_entry}",
-        "jr t0",
-        "nop",
+        ".option norelax",
+        // The RISC-V Image header reserves exactly 8 bytes for code0/code1.
+        "2: auipc t0, %pcrel_hi({kernel_entry})",
+        "jalr zero, %pcrel_lo(2b)(t0)",
         ".option pop",
         // text_offset
         ".quad {text_offset}",
@@ -58,6 +49,16 @@ pub unsafe extern "C" fn kernel_entry(_hart_id: usize, _fdt_addr: usize) -> ! {
     naked_asm!(
         ".option push",
         ".option norelax",
+        // Some SBI firmware (e.g. RustSBI Prototyper) leaves the FPU
+        // state off for S-mode, while someboot's own early code (memory
+        // map formatting) uses FP. OpenSBI sets FS itself, so this is a
+        // no-op there but fixes the first FP trap on such firmware. This
+        // runs in `kernel_entry` rather than `_head` because the RISC-V
+        // Image header reserves the first 8 bytes of `_head`.
+        "csrr t0, sstatus",
+        "li t1, 0x6000",
+        "or t0, t0, t1",
+        "csrw sstatus, t0",
         "lla gp, __global_pointer$",
         ".option pop",
         "mv t2, a1",

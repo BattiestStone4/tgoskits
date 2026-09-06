@@ -5,8 +5,10 @@ use core::{
 };
 
 use ax_memory_addr::VirtAddr;
-use cpu_local::{CurrentThreadHeader, PreparedThreadSwitch};
+use cpu_local::{ExecutionContextHeader, PreparedContextSwitch};
 
+#[cfg(feature = "uspace")]
+use crate::InstalledAddressSpace;
 use crate::{KernelTlsBase, TaskLocalState};
 
 /// General registers of Loongarch64.
@@ -270,9 +272,9 @@ pub struct TaskContext {
     pub s: [usize; 10],
     /// Architecture-neutral current-header and kernel-TLS switch state.
     task_local: TaskLocalState,
-    /// The `PGDL` value restored for this task's userspace address space.
+    /// Complete identity projected to `PGDL` at the architecture boundary.
     #[cfg(feature = "uspace")]
-    page_table_root: usize,
+    address_space: InstalledAddressSpace,
     #[cfg(feature = "fp-simd")]
     /// Floating Point Unit states
     pub fpu: FpuState,
@@ -300,7 +302,7 @@ impl Default for TaskContext {
             s: [0; 10],
             task_local: TaskLocalState::new(),
             #[cfg(feature = "uspace")]
-            page_table_root: 0,
+            address_space: InstalledAddressSpace::default(),
             #[cfg(feature = "fp-simd")]
             fpu: FpuState::default(),
         }
@@ -312,7 +314,7 @@ impl TaskContext {
     pub fn new() -> Self {
         Self {
             #[cfg(feature = "uspace")]
-            page_table_root: crate::asm::read_user_page_table().as_usize(),
+            address_space: InstalledAddressSpace::default(),
             ..Self::default()
         }
     }
@@ -325,23 +327,35 @@ impl TaskContext {
         self.task_local.set_kernel_tls(kernel_tls);
     }
 
-    /// Sets the pinned task-owned current-thread header.
-    pub fn set_current_header(&mut self, header: NonNull<CurrentThreadHeader>) {
-        self.task_local.set_current_header(header);
+    /// Sets the pinned task-owned execution-context header.
+    pub fn set_context_header(&mut self, header: NonNull<ExecutionContextHeader>) {
+        self.task_local.set_context_header(header);
     }
 
-    /// Returns the configured task-owned current-thread header.
-    pub const fn current_header(&self) -> Option<NonNull<CurrentThreadHeader>> {
-        self.task_local.current_header()
+    /// Returns the configured task-owned execution-context header.
+    pub const fn context_header(&self) -> Option<NonNull<ExecutionContextHeader>> {
+        self.task_local.context_header()
     }
 
-    /// Changes the page table root restored for this task.
+    /// Changes the complete address space restored for this task.
     #[cfg(feature = "uspace")]
-    pub fn set_page_table_root(&mut self, page_table_root: ax_memory_addr::PhysAddr) {
-        self.page_table_root = page_table_root.as_usize();
+    pub fn set_address_space(&mut self, address_space: InstalledAddressSpace) {
+        self.address_space = address_space;
     }
 
-    /// Completes FPU work before current-thread publication.
+    /// Writes this context's materialized userspace root immediately.
+    ///
+    /// # Safety
+    ///
+    /// The caller must own the current CPU context and prevent a concurrent
+    /// scheduler switch while the hardware root is being replaced.
+    #[cfg(feature = "uspace")]
+    pub unsafe fn activate_address_space(&self) {
+        self.address_space.validate_architecture_support();
+        unsafe { crate::asm::install_user_address_space(self.address_space) };
+    }
+
+    /// Completes FPU work before current-context publication.
     pub fn prepare_switch_to(&mut self, _next_ctx: &Self) {
         #[cfg(feature = "fp-simd")]
         {
@@ -349,14 +363,10 @@ impl TaskContext {
             _next_ctx.fpu.restore();
         }
         #[cfg(feature = "uspace")]
-        if self.page_table_root != _next_ctx.page_table_root {
+        if self.address_space != _next_ctx.address_space {
+            _next_ctx.address_space.validate_architecture_support();
             // SAFETY: the scheduler owns both contexts with IRQs disabled.
-            unsafe {
-                crate::asm::write_user_page_table(ax_memory_addr::PhysAddr::from(
-                    _next_ctx.page_table_root,
-                ))
-            };
-            crate::asm::flush_tlb(None);
+            unsafe { crate::asm::install_user_address_space(_next_ctx.address_space) };
         }
     }
 
@@ -370,10 +380,10 @@ impl TaskContext {
     pub unsafe fn switch_to_prepared(
         &mut self,
         next_ctx: &Self,
-        prepared: PreparedThreadSwitch<'_>,
+        prepared: PreparedContextSwitch<'_>,
     ) {
         assert_eq!(
-            next_ctx.current_header(),
+            next_ctx.context_header(),
             Some(prepared.next_header()),
             "prepared switch token must belong to the next task context",
         );
@@ -535,7 +545,7 @@ unsafe extern "C" fn context_switch_raw(_current_task: &mut TaskContext, _next_t
         ld.d    $s0, $a1, {s0_offset}
         ld.d    $sp, $a1, {sp_offset}
         ld.d    $ra, $a1, {ra_offset}
-        ld.d    $tp, $a1, {current_header_offset}
+        ld.d    $tp, $a1, {context_header_offset}
         ret",
         ra_offset = const offset_of!(TaskContext, ra),
         sp_offset = const offset_of!(TaskContext, sp),
@@ -549,7 +559,7 @@ unsafe extern "C" fn context_switch_raw(_current_task: &mut TaskContext, _next_t
         s7_offset = const offset_of!(TaskContext, s) + size_of::<[usize; 7]>(),
         s8_offset = const offset_of!(TaskContext, s) + size_of::<[usize; 8]>(),
         frame_pointer_offset = const offset_of!(TaskContext, s) + size_of::<[usize; 9]>(),
-        current_header_offset = const offset_of!(TaskContext, task_local)
-            + offset_of!(TaskLocalState, current_header),
+        context_header_offset = const offset_of!(TaskContext, task_local)
+            + offset_of!(TaskLocalState, context_header),
     )
 }

@@ -15,24 +15,24 @@
 use core::{any::Any, ffi::c_int, mem::size_of};
 
 use ax_driver::jpeg::{self, mpp, registers};
-use ax_runtime::hal::cpu::asm::user_copy;
-use ax_sync::Mutex;
 use axfs_ng_vfs::{DeviceId, VfsError, VfsResult};
+use starry_vm::{vm_load, vm_write_slice};
 
-use crate::{file::dmabuf::resolve_contiguous_dmabuf, pseudofs::DeviceOps};
+use crate::{file::dmabuf::resolve_contiguous_dmabuf, pseudofs::DeviceOps, sync::Mutex};
 
 fn copy_from_user(dst: *mut u8, src: *const u8, size: usize) -> VfsResult<()> {
-    if unsafe { user_copy(dst, src, size) } != 0 {
-        return Err(VfsError::InvalidData);
-    }
+    let bytes = vm_load(src, size).map_err(|_| VfsError::InvalidData)?;
+    // SAFETY: each caller supplies a live kernel destination of at least
+    // `size` bytes. The source has already been copied out of user memory.
+    unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, size) };
     Ok(())
 }
 
 fn copy_to_user(dst: *mut u8, src: *const u8, size: usize) -> VfsResult<()> {
-    if unsafe { user_copy(dst, src, size) } != 0 {
-        return Err(VfsError::InvalidData);
-    }
-    Ok(())
+    // SAFETY: each caller supplies a live initialized kernel source of at
+    // least `size` bytes for the duration of this copy.
+    let bytes = unsafe { core::slice::from_raw_parts(src, size) };
+    vm_write_slice(dst, bytes).map_err(|_| VfsError::InvalidData)
 }
 
 /// Char-device id for `/dev/mpp_service` (opened by path; id is informational).
@@ -219,7 +219,7 @@ fn resolve_fd(fd: u32) -> Option<u32> {
         warn!("mpp_service: register fd {fd} is not a resolvable dma-buf");
         return None;
     };
-    // The decoder is 32-bit (device_with_mask(u32::MAX)); reject buffers above
+    // The decoder is limited to 32-bit device addresses; reject buffers above
     // 4 GiB rather than silently truncating the address. /dev/dma_heap buffers
     // are allocated below 4 GiB (dma32), so this should not trigger.
     let phys = buf.phys_base();

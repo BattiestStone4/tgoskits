@@ -1,7 +1,6 @@
 use alloc::{borrow::Cow, string::String, sync::Arc, vec::Vec};
 use core::{any::Any, cmp::Ordering, task::Context};
 
-use ax_sync::Mutex;
 use axfs_ng_vfs::{
     FileNodeOps, FilesystemOps, FsIoEvents, FsPollable, Metadata, MetadataUpdate, NodeFlags,
     NodeOps, NodePermission, NodeType, VfsError, VfsResult,
@@ -10,6 +9,7 @@ use axpoll::{IoEvents, Pollable};
 use inherit_methods_macro::inherit_methods;
 
 use super::fs::{SimpleFs, SimpleFsNode};
+use crate::sync::Mutex;
 
 fn fs_events_to_io(events: FsIoEvents) -> IoEvents {
     IoEvents::from_bits_truncate(events.bits())
@@ -234,10 +234,6 @@ impl FileNodeOps for SimpleFile {
             _ => Ok(()),
         }
     }
-
-    fn set_symlink(&self, target: &str) -> VfsResult<()> {
-        self.ops.write_all(target.as_bytes())
-    }
 }
 
 impl FsPollable for SimpleFile {
@@ -364,10 +360,6 @@ impl<T: DirectRwFsFileOps> FileNodeOps for SpecialFsFile<T> {
             // Shell redirection usually opens these files with O_TRUNC.
             return Ok(());
         }
-        Err(VfsError::InvalidInput)
-    }
-
-    fn set_symlink(&self, _target: &str) -> VfsResult<()> {
         Err(VfsError::InvalidInput)
     }
 }

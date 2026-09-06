@@ -3,8 +3,7 @@ use ax_runtime::hal::cpu::{
     trap::PageFaultFlags,
     uspace::{ExceptionKind, ReturnReason, UserContext},
 };
-use ax_task::TaskInner;
-use starry_process::Pid;
+use ax_task::{TaskCreateError, TaskInner};
 use starry_signal::{FPE_INTDIV, SEGV_ACCERR, SEGV_MAPERR, SignalInfo, Signo};
 use starry_vm::{VmMutPtr, VmPtr};
 use syscalls::Sysno;
@@ -17,6 +16,7 @@ use super::{
     set_timer_state, unblock_next_signal, wait_existing_ptrace_stop_current,
 };
 use crate::syscall::{handle_syscall, syscall_allows_signal_restart};
+use crate::{StarryError, StarryResult, mm::FaultResult};
 
 fn handle_user_page_fault(
     thread: &Thread,
@@ -29,59 +29,68 @@ fn handle_user_page_fault(
     // addresses are counted separately in the mm page-fault handler.
     crate::mm::PAGE_FAULT_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 
-    // Classify si_code while holding the aspace lock: an existing mapping
-    // that rejected the access is a permission violation (SEGV_ACCERR),
-    // otherwise the address is unmapped (SEGV_MAPERR), matching Linux's
-    // do_user_addr_fault().
-    let si_code = {
-        let aspace = thread.proc_data.aspace();
-        let mut aspace = aspace.lock();
-        if aspace.handle_page_fault(address, flags) {
-            None
-        } else if aspace.find_area(address).is_some() {
-            Some(SEGV_ACCERR)
-        } else {
-            Some(SEGV_MAPERR)
+    // Classify the result while holding the aspace lock.  File faults past EOF
+    // are SIGBUS/BUS_ADRERR on Linux; collapsing them into SIGSEGV makes mmap'd
+    // databases and runtimes mis-handle truncation.  A transient eviction
+    // conflict is left retryable and does not publish a signal.
+    let signal = {
+        let Ok(aspace) = thread.proc_data.pin_aspace() else {
+            return;
+        };
+        match aspace.handle_page_fault_result(address, flags) {
+            FaultResult::Handled | FaultResult::Retry => None,
+            FaultResult::PermissionDenied => Some((Signo::SIGSEGV, SEGV_ACCERR)),
+            FaultResult::Unmapped => Some((Signo::SIGSEGV, SEGV_MAPERR)),
+            FaultResult::Sigbus(code) => Some((Signo::SIGBUS, code as i32)),
         }
     };
-    if let Some(si_code) = si_code {
+    if let Some((signo, si_code)) = signal {
         warn!(
-            "{:?}: segmentation fault at {:#x} {:?}",
+            "{:?}: synchronous {signo:?} memory fault at {:#x} {:?}",
             thread.proc_data.proc, address, flags
         );
         raise_signal_fatal(
-            SignalInfo::new_fault(Signo::SIGSEGV, si_code, address.as_usize()),
+            SignalInfo::new_fault(signo, si_code, address.as_usize()),
             context,
         )
-        .expect("Failed to send SIGSEGV");
+        .expect("Failed to send synchronous memory-fault signal");
     }
 }
 
 /// Create a new user task.
-pub fn new_user_task(name: &str, mut uctx: UserContext, set_child_tid: usize) -> TaskInner {
-    TaskInner::new(
+pub fn new_user_task(
+    name: &str,
+    mut uctx: UserContext,
+    set_child_tid: usize,
+) -> StarryResult<TaskInner> {
+    TaskInner::try_new(
         move || {
             let curr = ax_task::current();
 
-            if let Some(tid) = (set_child_tid as *mut Pid).nullable() {
-                tid.vm_write(curr.as_thread().tid() as Pid).ok();
+            if let Some(tid) = (set_child_tid as *mut u32).nullable() {
+                // CLONE_CHILD_SETTID is observed by the child in its active
+                // PID namespace, matching gettid() and the clone return ABI.
+                tid.vm_write(curr.as_thread().user_tid().get()).ok();
             }
 
             info!("Enter user space: ip={:#x}, sp={:#x}", uctx.ip(), uctx.sp());
 
             let thr = curr.as_thread();
-            let resumed_from_initial_ptrace_stop =
-                if thr.proc_data.ptrace_stop_signo_for(thr.tid()).is_some() {
-                    wait_existing_ptrace_stop_current(thr, &mut uctx);
-                    true
-                } else if thr.tid() == thr.proc_data.proc.pid()
-                    && thr.proc_data.ptrace_stop_signo().is_some()
-                {
-                    let _ = ptrace_stop_current(thr, Signo::SIGSTOP, &mut uctx);
-                    true
-                } else {
-                    false
-                };
+            let resumed_from_initial_ptrace_stop = if thr
+                .proc_data
+                .ptrace_stop_signo_for(thr.tid_number())
+                .is_some()
+            {
+                wait_existing_ptrace_stop_current(thr, &mut uctx);
+                true
+            } else if thr.tid().pid_number() == thr.proc_data.proc.pid().pid_number()
+                && thr.proc_data.ptrace_stop_signo().is_some()
+            {
+                let _ = ptrace_stop_current(thr, Signo::SIGSTOP, &mut uctx);
+                true
+            } else {
+                false
+            };
             if resumed_from_initial_ptrace_stop {
                 // `block_on_user` consumes the interruption that aborted the
                 // stop. Re-scan pending signals before the first user
@@ -90,7 +99,7 @@ pub fn new_user_task(name: &str, mut uctx: UserContext, set_child_tid: usize) ->
                 while check_signals(thr, &mut uctx, None, None) {}
             }
             while !thr.pending_exit() {
-                let tid = thr.tid();
+                let tid = thr.tid_number();
                 let is_ptraced =
                     thr.proc_data.is_ptrace_traceme() || thr.proc_data.is_ptrace_attached();
                 if thr.proc_data.is_ptrace_singlestep_for(tid) && is_ptraced {
@@ -146,10 +155,7 @@ pub fn new_user_task(name: &str, mut uctx: UserContext, set_child_tid: usize) ->
                         let syscall_no = uctx.sysno();
                         let syscall_arg0 = uctx.arg0();
                         if let Some(exit_code) = ptrace_exit_event_code(syscall_no, syscall_arg0)
-                            && crate::syscall::ptrace_notify_exit(
-                                thr.proc_data.proc.pid(),
-                                exit_code,
-                            )
+                            && crate::syscall::ptrace_notify_exit(tid, exit_code)
                         {
                             let _ = ptrace_stop_current(thr, Signo::SIGTRAP, &mut uctx);
                         }
@@ -158,9 +164,8 @@ pub fn new_user_task(name: &str, mut uctx: UserContext, set_child_tid: usize) ->
                         if stop_for_pending_ptrace_event(thr, &mut uctx) {
                             continue;
                         }
-                        if thr.proc_data.take_ptrace_exec_stop_pending() {
-                            let _is_event =
-                                crate::syscall::ptrace_notify_exec(thr.proc_data.proc.pid());
+                        if let Some(former_tid) = thr.proc_data.take_ptrace_exec_stop_pending() {
+                            let _is_event = crate::syscall::ptrace_notify_exec(tid, former_tid);
                             if let Some(_resume_sig) =
                                 ptrace_stop_current(thr, Signo::SIGTRAP, &mut uctx)
                             {
@@ -250,7 +255,8 @@ pub fn new_user_task(name: &str, mut uctx: UserContext, set_child_tid: usize) ->
                             // not always honour this.  Clearing explicitly
                             // prevents an unwanted extra single-step on resume.
                             let _ = uctx.clear_single_step_after_debug();
-                            thr.proc_data.set_ptrace_singlestep_for(thr.tid(), false);
+                            thr.proc_data
+                                .set_ptrace_singlestep_for(thr.tid_number(), false);
                             if let Some(_resume_sig) =
                                 ptrace_stop_current(thr, Signo::SIGTRAP, &mut uctx)
                             {
@@ -335,7 +341,7 @@ pub fn new_user_task(name: &str, mut uctx: UserContext, set_child_tid: usize) ->
                 }
 
                 if !unblock_next_signal() {
-                    let eintr_code = -(ax_errno::LinuxError::EINTR.code() as isize);
+                    let eintr_code = -(crate::Errno::EINTR.into_raw() as isize);
                     let restart = if is_syscall
                         && (uctx.retval() as isize) == eintr_code
                         && syscall_allows_signal_restart(saved_sysno)
@@ -362,7 +368,7 @@ pub fn new_user_task(name: &str, mut uctx: UserContext, set_child_tid: usize) ->
                             // POSIX timers are also driven by the alarm task, but polling
                             // here closes the window where an expired timer is only noticed
                             // after the current syscall returns to userspace.
-                            poll_process_timer(thr.proc_data.proc.pid());
+                            poll_process_timer(&thr.proc_data.identity());
                             poll_timer = false;
                         }
                         while check_signals(thr, &mut uctx, None, pending_restart) {
@@ -381,6 +387,11 @@ pub fn new_user_task(name: &str, mut uctx: UserContext, set_child_tid: usize) ->
         name.into(),
         crate::config::KERNEL_STACK_SIZE,
     )
+    .map_err(|error| match error {
+        TaskCreateError::InvalidStackSize => StarryError::InvalidInput,
+        TaskCreateError::StackAllocation(error) => StarryError::Alloc(error),
+        TaskCreateError::StackMapping(_) => StarryError::NoMemory,
+    })
 }
 
 fn ptrace_exit_event_code(sysno: usize, arg0: usize) -> Option<i32> {
@@ -391,7 +402,7 @@ fn ptrace_exit_event_code(sysno: usize, arg0: usize) -> Option<i32> {
 }
 
 fn stop_for_pending_ptrace_event(thr: &super::Thread, uctx: &mut UserContext) -> bool {
-    thr.proc_data.has_ptrace_pending_event_for(thr.tid())
+    thr.proc_data.has_ptrace_pending_event_for(thr.tid_number())
         && ptrace_stop_current(thr, Signo::SIGTRAP, uctx).is_some()
 }
 

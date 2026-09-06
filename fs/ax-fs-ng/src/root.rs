@@ -5,8 +5,8 @@ use alloc::{
     vec::Vec,
 };
 
+use ax_lazyinit::OnceLock;
 use axfs_ng_vfs::{Location, NodePermission, NodeType, VfsError};
-use spin::Once;
 
 use crate::{
     BlockDeviceHandle, BlockRegion, FilesystemKind,
@@ -22,7 +22,7 @@ use crate::{
 };
 
 const VOLUME_METADATA_READ_RETRIES: usize = 3;
-static ROOT_BLOCK_IDENTITY: Once<RootBlockIdentity> = Once::new();
+static ROOT_BLOCK_IDENTITY: OnceLock<RootBlockIdentity> = OnceLock::new();
 
 /// Linux-facing identity of the selected physical root block device.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -190,7 +190,8 @@ pub fn init_root(
     bootargs: Option<&str>,
 ) {
     let root_spec = RootSpec::parse_bootargs(bootargs);
-    let mut disks = collect_disks(block_devs);
+    let mut disks = collect_disks(block_devs)
+        .unwrap_or_else(|error| panic!("failed to initialize block cache: {error:?}"));
     let candidates = collect_root_candidates(&disks);
     let (selected_disk_index, selected_partition) = select_root_candidate(&candidates, &root_spec)
         .unwrap_or_else(|| panic!("failed to determine root device from available block devices"));
@@ -297,12 +298,12 @@ pub fn init_root_from_rdif_sources(
 
 fn collect_disks(
     block_devs: impl IntoIterator<Item = Arc<BlockDeviceHandle>>,
-) -> Vec<DiscoveredDisk> {
+) -> crate::BlockResult<Vec<DiscoveredDisk>> {
     let mut disks = Vec::new();
 
     for (disk_index, dev) in block_devs.into_iter().enumerate() {
         let handle = dev.clone();
-        let mut dev = boxed_native_handle_block_device(dev);
+        let mut dev = boxed_native_handle_block_device(dev)?;
         let device_name = dev.name().to_string();
         let mut reader = VolumeReader::new(&mut *dev);
         match scan_volumes(&mut reader, DiskId(disk_index as u64)) {
@@ -325,7 +326,7 @@ fn collect_disks(
         }
     }
 
-    disks
+    Ok(disks)
 }
 
 fn collect_partitions(
@@ -655,16 +656,14 @@ fn ensure_mountpoint_dir_result(root: &Location, path: &str) -> axfs_ng_vfs::Vfs
         Ok(location) if location.node_type() == NodeType::Directory => return Ok(location),
         Ok(_) if !root.is_readonly() => return Err(VfsError::AlreadyExists),
         Ok(_) => return create_transient_mountpoint_dir(root, path, name),
-        Err(err) if err.canonicalize() == VfsError::NotFound => {}
+        Err(VfsError::NotFound) => {}
         Err(err) => return Err(err),
     }
 
     match root.create(name, NodeType::Directory, NodePermission::default(), 0, 0) {
         Ok(location) => Ok(location),
-        Err(err) if err.canonicalize() == VfsError::ReadOnlyFilesystem => {
-            create_transient_mountpoint_dir(root, path, name)
-        }
-        Err(err) if err.canonicalize() == VfsError::AlreadyExists => root.lookup_no_follow(name),
+        Err(VfsError::ReadOnlyFilesystem) => create_transient_mountpoint_dir(root, path, name),
+        Err(VfsError::AlreadyExists) => root.lookup_no_follow(name),
         Err(err) => Err(err),
     }
 }
@@ -808,11 +807,10 @@ pub(crate) fn split_root_candidates<'a>(root: &'a str, out: &mut Vec<&'a str>) {
 mod tests {
     use core::{any::Any, time::Duration};
 
-    use ax_errno::{AxError, AxResult};
     use axfs_ng_vfs::{
-        DeviceId, DirEntry, DirEntrySink, DirNode, DirNodeOps, FileNode, FileNodeOps, Filesystem,
-        FilesystemOps, FsIoEvents, FsPollable, Metadata, MetadataUpdate, NodeFlags, NodeOps,
-        Reference, StatFs, VfsResult, WeakDirEntry,
+        DeviceId, DirEntry, DirEntrySink, DirNode, DirNodeOps, DirectoryCursor, FileNode,
+        FileNodeOps, Filesystem, FilesystemOps, FsIoEvents, FsPollable, Metadata, MetadataUpdate,
+        NodeFlags, NodeOps, Reference, RenameOptions, StatFs, VfsResult, WeakDirEntry,
     };
     use rdif_block::{
         BatchSubmitResult, BlkError, BlockController, CompletionSink, ControllerEvent,
@@ -821,7 +819,10 @@ mod tests {
     };
 
     use super::*;
-    use crate::block::runtime::{BlockRuntime, RdifBlockDevice};
+    use crate::{
+        BlockError, BlockResult,
+        block::runtime::{BlockRuntime, RdifBlockDevice},
+    };
 
     struct TestQueue;
     struct FlakyMetadataDevice {
@@ -967,7 +968,11 @@ mod tests {
     }
 
     impl DirNodeOps for ReadonlyDir {
-        fn read_dir(&self, _offset: u64, _sink: &mut dyn DirEntrySink) -> VfsResult<usize> {
+        fn read_dir(
+            &self,
+            _cursor: DirectoryCursor,
+            _sink: &mut dyn DirEntrySink,
+        ) -> VfsResult<usize> {
             Ok(0)
         }
 
@@ -1017,6 +1022,17 @@ mod tests {
             Err(VfsError::ReadOnlyFilesystem)
         }
 
+        fn create_symlink(
+            &self,
+            _name: &str,
+            _target: &str,
+            _permission: NodePermission,
+            _uid: u32,
+            _gid: u32,
+        ) -> VfsResult<DirEntry> {
+            Err(VfsError::ReadOnlyFilesystem)
+        }
+
         fn link(&self, _name: &str, _node: &DirEntry) -> VfsResult<DirEntry> {
             Err(VfsError::ReadOnlyFilesystem)
         }
@@ -1025,7 +1041,13 @@ mod tests {
             Err(VfsError::ReadOnlyFilesystem)
         }
 
-        fn rename(&self, _src_name: &str, _dst_dir: &DirNode, _dst_name: &str) -> VfsResult<()> {
+        fn rename(
+            &self,
+            _src_name: &str,
+            _dst_dir: &DirNode,
+            _dst_name: &str,
+            _options: RenameOptions,
+        ) -> VfsResult<()> {
             Err(VfsError::ReadOnlyFilesystem)
         }
     }
@@ -1095,10 +1117,6 @@ mod tests {
         fn set_len(&self, _len: u64) -> VfsResult<()> {
             Err(VfsError::ReadOnlyFilesystem)
         }
-
-        fn set_symlink(&self, _target: &str) -> VfsResult<()> {
-            Err(VfsError::ReadOnlyFilesystem)
-        }
     }
 
     impl HardwareQueue for TestQueue {
@@ -1110,7 +1128,14 @@ mod tests {
             QueueInfo {
                 id: 0,
                 device: DeviceInfo::new(16, 512),
-                limits: QueueLimits::simple(512, u64::MAX),
+                limits: QueueLimits::simple(
+                    512,
+                    dma_api::DmaDeviceInfo::new(
+                        dma_api::DmaDomainId::Direct,
+                        dma_api::DmaCoherency::NonCoherent,
+                        dma_api::DmaConstraints::new(u64::MAX),
+                    ),
+                ),
             }
         }
 
@@ -1201,33 +1226,66 @@ mod tests {
             512
         }
 
-        fn read_block(&mut self, block_id: u64, buf: &mut [u8]) -> AxResult {
+        #[cfg(feature = "ext4")]
+        fn physical_block_size(&self) -> usize {
+            512
+        }
+
+        #[cfg(feature = "ext4")]
+        fn is_read_only(&self) -> bool {
+            false
+        }
+
+        #[cfg(feature = "ext4")]
+        fn supports_flush(&self) -> bool {
+            true
+        }
+
+        #[cfg(feature = "ext4")]
+        fn supports_fua(&self) -> bool {
+            false
+        }
+
+        fn read_block(&mut self, block_id: u64, buf: &mut [u8]) -> BlockResult {
             if self.remaining_failures > 0 {
                 self.remaining_failures -= 1;
-                return Err(AxError::Io);
+                return Err(BlockError::Io);
             }
 
             let start = block_id as usize * self.block_size();
             let end = start + self.block_size();
-            let block = self.data.get(start..end).ok_or(AxError::InvalidInput)?;
+            let block = self
+                .data
+                .get(start..end)
+                .ok_or(BlockError::InvalidRequest)?;
             buf.copy_from_slice(block);
             Ok(())
         }
 
         #[cfg(any(feature = "ext4", feature = "fat"))]
-        fn write_block(&mut self, block_id: u64, buf: &[u8]) -> AxResult {
+        fn write_block(&mut self, block_id: u64, buf: &[u8]) -> BlockResult {
             let start = usize::try_from(block_id)
                 .ok()
                 .and_then(|block| block.checked_mul(self.block_size()))
-                .ok_or(AxError::InvalidInput)?;
-            let end = start.checked_add(buf.len()).ok_or(AxError::InvalidInput)?;
-            let target = self.data.get_mut(start..end).ok_or(AxError::InvalidInput)?;
+                .ok_or(BlockError::InvalidRequest)?;
+            let end = start
+                .checked_add(buf.len())
+                .ok_or(BlockError::InvalidRequest)?;
+            let target = self
+                .data
+                .get_mut(start..end)
+                .ok_or(BlockError::InvalidRequest)?;
             target.copy_from_slice(buf);
             Ok(())
         }
 
+        #[cfg(feature = "ext4")]
+        fn write_block_fua(&mut self, _block_id: u64, _buf: &[u8]) -> BlockResult {
+            Err(BlockError::Unsupported)
+        }
+
         #[cfg(any(feature = "ext4", feature = "fat"))]
-        fn flush(&mut self) -> AxResult {
+        fn flush(&mut self) -> BlockResult {
             Ok(())
         }
     }
@@ -1327,8 +1385,7 @@ mod tests {
                 0,
                 0
             )
-            .unwrap_err()
-            .canonicalize(),
+            .unwrap_err(),
             VfsError::ReadOnlyFilesystem
         );
 

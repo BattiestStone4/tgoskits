@@ -1,11 +1,7 @@
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU16, Ordering};
 
-#[cfg(not(test))]
-use ax_kspin::SpinNoIrq as IrqRouteMutex;
-use ax_kspin::SpinRaw as Mutex;
-#[cfg(test)]
-use ax_kspin::SpinRaw as IrqRouteMutex;
+use ax_sync::{RawSpinLockGuard, SpinLock, SpinLockIrqSaveGuard};
 pub use rdif_intc;
 use rdif_intc::Intc;
 pub type ControllerIrqId = irq_framework::IrqId;
@@ -68,13 +64,36 @@ struct IrqRoute {
     leaf: IrqId,
 }
 
-static IRQ_DOMAINS: Mutex<Vec<IrqDomain>> = Mutex::new(Vec::new());
-static IRQ_ROUTES: IrqRouteMutex<Vec<IrqRoute>> = IrqRouteMutex::new(Vec::new());
+static IRQ_DOMAINS: SpinLock<Vec<IrqDomain>> = SpinLock::new(Vec::new());
 
-#[cfg(not(test))]
-const _: fn(&IrqRouteMutex<Vec<IrqRoute>>) = |lock| {
-    let _: &ax_kspin::SpinNoIrq<Vec<IrqRoute>> = lock;
-};
+/// Global IRQ routes are resolved from hard-IRQ context.
+///
+/// Keep the IRQ-save policy at the field boundary so a future read-side call
+/// cannot accidentally reintroduce local interrupt re-entry while the route
+/// registry is locked.
+struct IrqRouteLock(SpinLock<Vec<IrqRoute>>);
+
+impl IrqRouteLock {
+    const fn new() -> Self {
+        Self(SpinLock::new(Vec::new()))
+    }
+
+    fn lock(&self) -> SpinLockIrqSaveGuard<'_, Vec<IrqRoute>> {
+        self.0.lock_irqsave()
+    }
+}
+
+static IRQ_ROUTES: IrqRouteLock = IrqRouteLock::new();
+
+fn irq_domains() -> RawSpinLockGuard<'static, Vec<IrqDomain>> {
+    // SAFETY: callers preserve the legacy raw-lock contract and exclude local
+    // re-entry while mutating the global domain registry.
+    unsafe { IRQ_DOMAINS.lock_raw() }
+}
+
+fn irq_routes() -> SpinLockIrqSaveGuard<'static, Vec<IrqRoute>> {
+    IRQ_ROUTES.lock()
+}
 static X86_IOAPIC_DOMAIN_SLOT: AtomicU16 = AtomicU16::new(INVALID_IRQ_DOMAIN);
 static X86_MSI_DOMAIN_SLOT: AtomicU16 = AtomicU16::new(INVALID_IRQ_DOMAIN);
 static AARCH64_GIC_DOMAIN_SLOT: AtomicU16 = AtomicU16::new(INVALID_IRQ_DOMAIN);
@@ -118,7 +137,7 @@ fn register_domain(
     parent: Option<IrqDomainId>,
     kind: IrqDomainKind,
 ) -> Result<IrqDomainId, IrqError> {
-    let mut domains = IRQ_DOMAINS.lock();
+    let mut domains = irq_domains();
 
     match parent {
         Some(parent) => {
@@ -220,7 +239,7 @@ pub fn domain_by_id(id: IrqDomainId) -> Option<IrqDomain> {
 }
 
 pub fn domain_by_owner(owner: DeviceId) -> Option<IrqDomain> {
-    let domains = IRQ_DOMAINS.lock();
+    let domains = irq_domains();
     domains
         .iter()
         .find(|domain| domain.owner == owner && domain.parent.is_none())
@@ -317,7 +336,7 @@ pub fn map_irq_route(parent: IrqId, leaf: IrqId) -> Result<(), IrqError> {
         return Err(IrqError::InvalidIrq);
     }
 
-    let domains = IRQ_DOMAINS.lock();
+    let domains = irq_domains();
     if !domains.iter().any(|domain| domain.id == parent.domain)
         || !domain_has_strict_ancestor(&domains, leaf.domain, parent.domain)
     {
@@ -325,7 +344,7 @@ pub fn map_irq_route(parent: IrqId, leaf: IrqId) -> Result<(), IrqError> {
     }
     drop(domains);
 
-    let mut routes = IRQ_ROUTES.lock();
+    let mut routes = irq_routes();
     if let Some(route) = routes.iter().find(|route| route.parent == parent) {
         return if route.leaf == leaf {
             Ok(())
@@ -365,7 +384,7 @@ fn domain_has_strict_ancestor(
 }
 
 pub fn unmap_irq_route(parent: IrqId, leaf: IrqId) -> Result<(), IrqError> {
-    let mut routes = IRQ_ROUTES.lock();
+    let mut routes = irq_routes();
     let Some(index) = routes
         .iter()
         .position(|route| route.parent == parent && route.leaf == leaf)
@@ -550,13 +569,15 @@ pub fn send_ipi_to_cpu(cpu_id: usize) -> Result<(), IrqError> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::*;
 
     static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn reset_domains() {
-        IRQ_DOMAINS.lock().clear();
-        IRQ_ROUTES.lock().clear();
+        irq_domains().clear();
+        irq_routes().clear();
         for kind in [
             IrqDomainKind::X86IoApic,
             IrqDomainKind::X86Msi,
@@ -739,6 +760,17 @@ mod tests {
             unmap_irq_route(parent_irq, leaf_irq),
             Err(IrqError::InvalidIrq)
         );
+    }
+
+    #[test]
+    fn irq_route_access_requires_irq_save_guard() {
+        let guard = IRQ_ROUTES.lock();
+        let irq_state = ax_sync::irq_save_and_disable();
+        // SAFETY: `irq_state` is restored exactly once on the same test thread.
+        unsafe { ax_sync::irq_restore(irq_state) };
+        drop(guard);
+
+        assert_eq!(irq_state, 0, "IRQ route access left IRQs enabled");
     }
 
     #[test]

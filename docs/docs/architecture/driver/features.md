@@ -5,7 +5,7 @@ sidebar_label: "构建配置"
 
 # 构建配置
 
-Feature 的职责从“选择 `ax-driver` 子模块和单个 Ax*Device 类型”调整为“选择要链接的 rdrive probe module、driver core、rdif 能力和 runtime wrapper”。构建配置通过 [axbuild](../../components/crates/axbuild.md) 把上层 app/system 的需求映射到具体的 `ax-driver` feature。
+Feature 的职责从“选择 `ax-driver` 子模块和单个 Ax*Device 类型”调整为“选择要链接的 rdrive probe module、driver core、rdif 能力和 runtime wrapper”。构建配置通过 `axbuild` 把上层 app/system 的需求映射到具体的 `ax-driver` feature。
 
 ## Feature 映射
 
@@ -36,8 +36,9 @@ MMIO 与 PCI feature 要分开表达，例如 `virtio-gpu-mmio` 与 `virtio-gpu-
 | `vsock` | `rdif-vsock`、vsock OS glue |
 | `pci` | PCIe controller、PCI endpoint 枚举 |
 | `pinctrl` | `rdif-pinctrl` |
-| `irq` | IRQ binding resolver |
 | `serial` | `rdif-serial`、`some-serial` |
+
+IRQ binding resolver 是 driver/runtime 基础能力，不再由 `ax-driver/irq` 选择。
 
 VirtIO feature 组合能力边界和 PCI transport：
 
@@ -58,7 +59,7 @@ VirtIO feature 组合能力边界和 PCI transport：
 | `fxmac` | `fxmac_rs` |
 | `intel-net` | `eth-intel` |
 | `realtek-rtl8125` | `realtek-rtl8125` |
-| `aic8800-wifi` | `aic8800` + `sdhci-cv1800` + `sdio-host` |
+| `aic8800-wifi` | `aic8800/rdif` + `cv181x-sdhci` + `sdmmc-host` + `sdmmc-protocol` |
 | `rknpu` | `rockchip-npu` |
 | `rga` | `rockchip-rga` |
 | `jpeg` | `rockchip-jpeg` |

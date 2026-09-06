@@ -1,5 +1,5 @@
 use loongArch64::register::{
-    badv,
+    badi, badv,
     estat::{self, Exception, Trap},
 };
 
@@ -96,6 +96,10 @@ fn handle_breakpoint(tf: &mut KernelTrapFrame<'_>) {
 
 fn handle_page_fault(tf: &mut KernelTrapFrame<'_>, access_flags: PageFaultFlags) {
     let vaddr = va!(badv::read().vaddr());
+    #[cfg(feature = "exception-table")]
+    if tf.raw.0.fixup_nofault_exception() {
+        return;
+    }
     if crate::trap::call_page_fault_handler_with_parent_irqs(
         vaddr,
         access_flags,
@@ -155,9 +159,11 @@ unsafe extern "C" fn loongarch64_trap_handler(raw: *mut RawTrapFrame) {
             let snapshot = tf.snapshot();
             let bt = snapshot.backtrace();
             panic!(
-                "Unhandled trap {:?} @ {:#x}:\n{:#x?}\n{}",
+                "Unhandled trap {:?} @ {:#x} (BADV={:#x}, BADI={:#010x}):\n{:#x?}\n{}",
                 trap,
                 tf.raw.0.era,
+                badv::read().vaddr(),
+                badi::read().inst(),
                 snapshot,
                 bt.kind("trap")
             );

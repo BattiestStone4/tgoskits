@@ -70,10 +70,10 @@ fn task_context_switches_tp_inside_the_naked_handoff() {
     let linux_switch = section(
         CONTEXT,
         "#[cfg(not(feature = \"tls\"))]\n#[unsafe(naked)]",
-        "+ offset_of!(TaskLocalState, current_header)) / size_of::<usize>(),",
+        "+ offset_of!(TaskLocalState, context_header)) / size_of::<usize>(),",
     );
     assert!(!linux_switch.contains("STR     tp"));
-    assert!(linux_switch.contains("LDR     tp, a1, {current_header_index}"));
+    assert!(linux_switch.contains("LDR     tp, a1, {context_header_index}"));
     assert_in_order(linux_switch, "LDR     sp", "LDR     tp");
     assert_in_order(linux_switch, "LDR     tp", "\n        ret\"");
 }
@@ -114,10 +114,10 @@ fn task_context_owns_kernel_tls_and_preserves_current_address_space_model() {
         CONTEXT.contains("kernel_tls_index = const (offset_of!(TaskContext, task_local)")
             && CONTEXT.contains("offset_of!(TaskLocalState, kernel_tls)")
             && CONTEXT
-                .contains("current_header_index = const (offset_of!(TaskContext, task_local)")
-            && CONTEXT.contains("offset_of!(TaskLocalState, current_header)")
+                .contains("context_header_index = const (offset_of!(TaskContext, task_local)")
+            && CONTEXT.contains("offset_of!(TaskLocalState, context_header)")
             && TASK_LOCAL.contains("kernel_tls: KernelTlsBase")
-            && TASK_LOCAL.contains("current_header: usize"),
+            && TASK_LOCAL.contains("context_header: usize"),
         "both image-mode assembly offsets must derive from TaskContext"
     );
 
@@ -133,11 +133,10 @@ fn task_context_owns_kernel_tls_and_preserves_current_address_space_model() {
         "pub unsafe fn switch_to_prepared",
     );
     assert!(
-        task_fields.contains("page_table_root: ax_memory_addr::PhysAddr")
-            && CONTEXT.contains("pub fn set_page_table_root")
-            && prepare.contains("write_user_page_table")
-            && prepare.contains("flush_tlb"),
-        "the existing axtask model must retain task-owned address-space selection"
+        task_fields.contains("address_space: InstalledAddressSpace")
+            && CONTEXT.contains("pub fn set_address_space")
+            && prepare.contains("install_user_address_space"),
+        "the scheduler must retain the complete installed address-space identity"
     );
 
     let raw_switches = CONTEXT
@@ -145,7 +144,9 @@ fn task_context_owns_kernel_tls_and_preserves_current_address_space_model() {
         .expect("raw context switch")
         .1;
     assert!(
-        !raw_switches.contains("write_user_page_table") && !raw_switches.contains("flush_tlb"),
+        !raw_switches.contains("install_user_address_space")
+            && !raw_switches.contains("write_user_page_table")
+            && !raw_switches.contains("flush_tlb"),
         "address-space work must complete before current-register publication and raw transfer"
     );
 }
@@ -189,7 +190,7 @@ fn trap_entry_uses_privilege_origin_and_restores_cpu_anchor_before_rust() {
         "LinuxCurrent must not treat sscratch as the permanent CPU prefix"
     );
 
-    assert!(TRAP_GLUE.contains("CURRENT_THREAD_CPU_BASE_OFFSET"));
+    assert!(TRAP_GLUE.contains("EXECUTION_CONTEXT_CPU_BASE_OFFSET"));
     for field in [
         "CPU_KERNEL_STACK_POINTER_OFFSET",
         "CPU_USER_TRAP_FRAME_OFFSET",
@@ -205,7 +206,7 @@ fn trap_entry_uses_privilege_origin_and_restores_cpu_anchor_before_rust() {
         "struct CpuTrapState",
         "struct ThreadTrapState",
         "CPU_AREA_ARCH_STATE_OFFSET",
-        "CURRENT_THREAD_ARCH_STATE_OFFSET",
+        "EXECUTION_CONTEXT_ARCH_STATE_OFFSET",
     ] {
         assert!(
             LOCAL_STATE.contains(field),

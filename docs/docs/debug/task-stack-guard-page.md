@@ -5,10 +5,7 @@ sidebar_label: "Task Stack Guard Page"
 
 # Task Stack Guard Page
 
-本文档记录 ArceOS task stack guard page 的设计讨论、第一阶段实现方向，
-以及后续向 Linux `VMAP_STACK` 风格演进时需要补齐的能力。
-
-它是现有 task stack canary 的增强机制，而不是替代机制。
+ArceOS task stack guard page 在越界访问时触发页故障，用于补充现有 task stack canary 的事后检查。当前实现尚未提供 Linux `VMAP_STACK` 风格的独立虚拟地址分配器。
 
 ## 背景
 
@@ -59,12 +56,13 @@ vmalloc/vmap 虚拟区间，在栈边界保留未映射页面。guard page 只�
 换句话说，`axmm` 已经有 vmap 的底层映射能力，但还缺 vmap-style 虚拟
 地址区间管理。
 
-## 第一阶段方案
+## 当前实现
 
 第一阶段采用最小实现：只增强动态分配的普通任务栈。
 
-当前 `TaskStack::alloc()` 使用普通 byte allocator 分配栈空间，只要求
-`TASK_STACK_ALIGN`，并不保证栈底是独占页。第一阶段应改为页粒度分配：
+当前 bare-metal `TaskStack` 无论是否启用 guard feature，都使用可失败的页粒度
+owner；host test 才使用宿主 byte allocator。guard feature 在相同 owner 契约上
+增加一页并撤销其 direct-map 映射：
 
 1. 对外仍接受逻辑栈大小 `stack_size`。
 2. 实际申请 `stack_size + PAGE_SIZE_4K`。
@@ -74,8 +72,8 @@ vmalloc/vmap 虚拟区间，在栈边界保留未映射页面。guard page 只�
 6. 释放栈时必须恢复或正确处理 guard page 生命周期，避免把仍不可访问的
    direct-map 页面还给普通 allocator。
 
-这个方案通过独立 feature `stack-guard-page` 控制。它依赖 `multitask`、
-paging 和内存管理能力，而不是无条件进入所有 multitask 构建。
+这个方案通过独立 feature `stack-guard-page` 控制。多任务调度是基础能力；该
+feature 额外依赖 paging 和内存管理能力，而不是无条件进入所有构建。
 
 `stack-guard-page` 当前是 opt-in hardening feature，默认不启用。常规
 ArceOS / StarryOS 构建和普通回归测试默认仍只覆盖未启用 guard page 的行为；
@@ -136,12 +134,12 @@ borrowed stack，仍需要 canary 兜底。因此第一阶段不应移除 `stack
 
 ## 当前覆盖边界
 
-当前 guard page 机制覆盖的是 `TaskStack::alloc()` 创建并由 `ax-task`
+当前 guard page 机制覆盖的是 `TaskStack::try_alloc()` 创建并由 `ax-task`
 拥有生命周期的动态任务栈。典型路径是：
 
 ```text
-TaskInner::new()
-  -> TaskStack::alloc()
+TaskInner::try_new()
+  -> TaskStack::try_alloc()
   -> TaskStack::alloc_guarded()
   -> unmap_guard_page()
 ```
@@ -150,7 +148,7 @@ TaskInner::new()
 CPU 上通过 `TaskInner::new()` 创建的独立 idle task，都会在启用
 `stack-guard-page` 后获得 guard page。
 
-这个覆盖边界与动态平台无直接绑定。只要栈来自 `TaskStack::alloc()`，
+这个覆盖边界与动态平台无直接绑定。只要栈来自 `TaskStack::try_alloc()`，
 就会走 guarded allocation；只要栈来自
 `TaskStack::borrowed()`，当前就不会做 guard page。
 
@@ -179,13 +177,13 @@ guarded stack，就会间接受 guard page 保护。
 
 但如果后续引入独立的 per-CPU IRQ stack、exception stack、overflow
 stack、NMI/double-fault stack 或其他架构专用栈，这些栈不会自动继承
-`TaskStack::alloc()` 的 guard page 机制，需要单独建模。
+`TaskStack::try_alloc()` 的 guard page 机制，需要单独建模。
 
 综上，当前覆盖矩阵为：
 
 | 栈类型 | 来源 | 当前 guard page 覆盖 |
 | --- | --- | --- |
-| 动态任务栈，`TaskStack::alloc()` | `ax-task` 拥有并分配 | 是 |
+| 动态任务栈，`TaskStack::try_alloc()` | `ax-task` 拥有并分配 | 是 |
 | 主 CPU boot/main borrowed 栈 | 平台入口或 somehal metadata | 否 |
 | secondary CPU borrowed boot/idle 栈 | somehal metadata 或平台 bring-up | 否 |
 | 独立 IRQ / exception / overflow stack | 若引入需单独处理 | 否 |
@@ -294,11 +292,11 @@ nightly、发布前或高风险内存管理改动后的手动验证：
 FEATURES=starry-kernel/stack-guard-page cargo xtask starry test qemu --arch riscv64
 ```
 
-## 后续演进计划
+## 尚未覆盖的能力
 
 第一阶段完成后，可以继续向更接近 Linux `VMAP_STACK` 的方向演进。
 
-### 1. 稳定当前动态任务栈方案
+### 1. 动态任务栈
 
 当前优先级最高的是把已接入的动态任务栈方案做稳：
 
@@ -336,7 +334,9 @@ vmap-style 栈的目标不是替换第一阶段的检查语义，而是降低物
   物理页回收问题。
 
 这一步需要先解决 kernel vmap 虚拟地址空间管理，再把 `TaskStack`
-从 direct-map contiguous allocation 迁移到 vmap allocation。
+从 direct-map contiguous allocation 迁移到 vmap allocation。当前 plain 与
+guarded backing 已共享 `TaskCreateError`、`UsageKind::TaskStack` 和页级 RAII
+释放契约，因此迁移只替换 backing provider，不改变调用方的 fallible 创建接口。
 
 ### 3. Stack area metadata
 
@@ -374,7 +374,7 @@ x86_64 NMI/double-fault 类栈，应为它们建立独立的 guard page 方案�
 - 专用栈通常是 per-CPU 生命周期，TLB flush 和 metadata 可以按 per-CPU
   资源管理，而不是按 task 管理。
 
-### 6. 扩展测试覆盖
+### 6. 测试覆盖
 
 需要增加能稳定触发 guard page 的测试：
 
@@ -386,7 +386,7 @@ x86_64 NMI/double-fault 类栈，应为它们建立独立的 guard page 方案�
 测试用例应和 canary 测试区分：guard page 测试关注 page fault 即时触发，
 canary 测试关注调度切换或显式检查点发现破坏。
 
-## 当前结论
+## 实现取舍
 
 当前阶段采用简单方案是合理的：
 
@@ -395,5 +395,4 @@ canary 测试关注调度切换或显式检查点发现破坏。
 - 代价清晰：每个动态任务栈额外占用一个 4 KiB 物理页。
 - 它不会阻塞后续向真正 vmap-style 栈演进。
 
-后续如果任务数量较多、物理内存开销明显，或希望更接近 Linux 的长期设计，
-再补 kernel vmap allocator，把 guard page 从“额外物理页”改成“仅虚拟空洞”。
+当前方案用额外物理页换取较低的实现复杂度。kernel vmap allocator 尚未实现，因此 guard page 还不能表示为只占虚拟地址的空洞。

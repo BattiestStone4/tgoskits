@@ -7,26 +7,31 @@ use alloc::{
 };
 use core::fmt;
 
-#[cfg(feature = "lockdep")]
-use ax_kernel_guard::IrqSave;
-use ax_kernel_guard::NoPreemptIrqSave;
 use ax_memory_addr::VirtAddr;
 
 #[cfg(feature = "lockdep")]
 pub use crate::lockdep::{HeldLock, HeldLockStack};
 pub(crate) use crate::run_queue::{current_run_queue, select_run_queue, select_wake_run_queue};
-#[cfg_attr(doc, doc(cfg(all(feature = "multitask", feature = "task-ext"))))]
+use crate::sync::PreemptIrqSaveState;
+#[cfg_attr(doc, doc(cfg(feature = "task-ext")))]
 #[cfg(feature = "task-ext")]
-pub use crate::task::{AxTaskExt, TaskExt};
-#[cfg_attr(doc, doc(cfg(all(feature = "multitask", feature = "irq"))))]
-#[cfg(feature = "irq")]
-pub use crate::timers::{
-    register_timer_callback, register_timer_deadline_source, register_timer_irq_callback,
+pub use crate::task::{
+    AddressSpaceSwitchProof, AxTaskExt, CpuOfflineRootSwitchProof, TaskAddressSpace,
+    TaskAddressSpaceMode, TaskExt,
 };
-#[cfg_attr(doc, doc(cfg(feature = "multitask")))]
+#[cfg(feature = "task-ext")]
+pub use crate::task::{SchedulerAddressSpaceActivation, SchedulerAddressSpaceOwner};
 pub use crate::{
     interrupt::InterruptSnapshot,
-    task::{CurrentTask, TaskId, TaskInner, TaskState},
+    task::{CurrentTask, TaskCreateError, TaskId, TaskInner, TaskState},
+    timers::{
+        ClockEventControl, HardKernelTimerAction, HardKernelTimerCallback, KernelTimerAction,
+        KernelTimerCallback, KernelTimerCancelOutcome, KernelTimerError, KernelTimerHandle,
+        MonotonicDeadline, MonotonicInstant, RestartableKernelTimerCallback, TimerCpuId,
+        arm_hard_kernel_timer, cancel_kernel_timer, disarm_hard_kernel_timer, init_timer_service,
+        register_hard_restartable_kernel_timer, register_kernel_timer,
+        register_restartable_kernel_timer, register_timer_callback,
+    },
     wait_queue::WaitQueue,
 };
 
@@ -36,9 +41,8 @@ pub type AxTaskRef = Arc<AxTask>;
 /// The weak reference type of a task.
 pub type WeakAxTaskRef = Weak<AxTask>;
 
-#[cfg(feature = "multitask")]
-static TASK_REGISTRY: spin::LazyLock<ax_kspin::SpinRwLock<BTreeMap<u64, WeakAxTaskRef>>> =
-    spin::LazyLock::new(|| ax_kspin::SpinRwLock::new(BTreeMap::new()));
+static TASK_REGISTRY: ax_lazyinit::LazyLock<crate::sync::SpinRwLock<BTreeMap<u64, WeakAxTaskRef>>> =
+    ax_lazyinit::LazyLock::new(|| crate::sync::SpinRwLock::new(BTreeMap::new()));
 
 /// The wrapper type for [`ax_cpumask::CpuMask`] with SMP configuration.
 pub type AxCpuMask = ax_cpumask::CpuMask<{ crate::build_info::CPU_CAPACITY }>;
@@ -63,61 +67,6 @@ cfg_if::cfg_if! {
     }
 }
 
-#[cfg(feature = "preempt")]
-struct KernelGuardIfImpl;
-
-#[cfg(feature = "preempt")]
-#[ax_crate_interface::impl_interface]
-impl ax_kernel_guard::KernelGuardIf for KernelGuardIfImpl {
-    fn disable_preempt() {
-        if let Some(curr) = current_may_uninit() {
-            curr.disable_preempt();
-        }
-    }
-
-    fn enable_preempt() {
-        if let Some(curr) = current_may_uninit() {
-            curr.enable_preempt(true);
-        }
-    }
-}
-
-#[cfg(feature = "lockdep")]
-struct KspinLockdepIfImpl;
-
-#[cfg(feature = "lockdep")]
-#[ax_crate_interface::impl_interface]
-impl ax_kspin::lockdep::KspinLockdepIf for KspinLockdepIfImpl {
-    fn collect_current_task_held_locks(snapshot: &mut ax_kspin::lockdep::HeldLockSnapshot) {
-        let _lockdep_irq_guard = IrqSave::new();
-        if let Some(curr) = current_may_uninit() {
-            curr.with_held_locks(|stack| snapshot.extend(stack));
-        }
-    }
-
-    fn push_current_task_held_lock(held: ax_kspin::lockdep::HeldLock) {
-        let _lockdep_irq_guard = IrqSave::new();
-        if let Some(curr) = current_may_uninit() {
-            curr.with_held_locks(|stack| stack.push(held));
-        }
-    }
-
-    fn pop_current_task_held_lock(lock_addr: usize) {
-        let _lockdep_irq_guard = IrqSave::new();
-        if let Some(curr) = current_may_uninit() {
-            curr.with_held_locks(|stack| stack.pop_checked(lock_addr));
-        }
-    }
-
-    fn console_write_str(s: &str) {
-        ax_hal::console::write_bytes(s.as_bytes());
-    }
-
-    fn fatal() -> ! {
-        ax_hal::power::system_off()
-    }
-}
-
 /// Gets the current task, or returns [`None`] if the current task is not
 /// initialized.
 pub fn current_may_uninit() -> Option<CurrentTask> {
@@ -139,6 +88,88 @@ pub fn current() -> CurrentTask {
     CurrentTask::get()
 }
 
+/// Disables preemption for the current task when preemption is configured.
+#[doc(hidden)]
+pub fn disable_preempt() -> usize {
+    #[cfg(feature = "preempt")]
+    {
+        crate::runtime_preempt::enter()
+    }
+    #[cfg(not(feature = "preempt"))]
+    {
+        0
+    }
+}
+
+/// Enables preemption for the current task when preemption is configured.
+#[doc(hidden)]
+pub fn enable_preempt(token: usize) {
+    #[cfg(feature = "preempt")]
+    {
+        crate::runtime_preempt::exit(token);
+    }
+    #[cfg(not(feature = "preempt"))]
+    let _ = token;
+}
+
+/// Enables preemption at the final IRQ-return boundary.
+#[doc(hidden)]
+pub fn enable_preempt_from_irq_return(token: usize) {
+    #[cfg(feature = "preempt")]
+    {
+        crate::runtime_preempt::exit_from_irq_return(token);
+    }
+    #[cfg(not(feature = "preempt"))]
+    let _ = token;
+}
+
+/// Reports scheduler work to the runtime preemption safe-point adapter.
+#[doc(hidden)]
+pub fn runtime_preemption_pending() -> bool {
+    #[cfg(feature = "preempt")]
+    {
+        current_may_uninit().is_some_and(|curr| curr.preemption_pending())
+    }
+    #[cfg(not(feature = "preempt"))]
+    {
+        false
+    }
+}
+
+/// Runs the legacy scheduler action after the runtime claims its baton.
+#[doc(hidden)]
+pub fn runtime_preempt_current() {
+    #[cfg(feature = "preempt")]
+    crate::task::TaskInner::current_check_preempt_pending();
+}
+
+#[cfg(feature = "lockdep")]
+#[doc(hidden)]
+pub fn collect_current_task_held_locks(snapshot: &mut crate::sync::HeldLockSnapshot) {
+    let _irq_guard = crate::sync::IrqSaveGuard::new();
+    if let Some(curr) = current_may_uninit() {
+        curr.with_held_locks(|stack| snapshot.extend(stack));
+    }
+}
+
+#[cfg(feature = "lockdep")]
+#[doc(hidden)]
+pub fn push_current_task_held_lock(held: crate::sync::HeldLock) {
+    let _irq_guard = crate::sync::IrqSaveGuard::new();
+    if let Some(curr) = current_may_uninit() {
+        curr.with_held_locks(|stack| stack.push(held));
+    }
+}
+
+#[cfg(feature = "lockdep")]
+#[doc(hidden)]
+pub fn pop_current_task_held_lock(lock_addr: usize) {
+    let _irq_guard = crate::sync::IrqSaveGuard::new();
+    if let Some(curr) = current_may_uninit() {
+        curr.with_held_locks(|stack| stack.pop_checked(lock_addr));
+    }
+}
+
 #[cfg(feature = "lockdep")]
 pub fn with_current_lockdep_stack<R>(f: impl FnOnce(&mut HeldLockStack) -> R) -> R {
     current().with_held_locks(f)
@@ -158,7 +189,7 @@ pub fn init_scheduler() {
 }
 
 pub(crate) fn cpu_mask_full() -> AxCpuMask {
-    use spin::LazyLock;
+    use ax_lazyinit::LazyLock;
 
     static CPU_MASK_FULL: LazyLock<AxCpuMask> = LazyLock::new(|| {
         let cpu_num = ax_hal::cpu_num();
@@ -180,41 +211,23 @@ pub fn init_scheduler_secondary(stack_ptr: VirtAddr, stack_size: usize) {
 /// Handles periodic timer ticks for the task manager.
 ///
 /// For example, advance scheduler states, checks timed events, etc.
-#[cfg(feature = "irq")]
-#[cfg_attr(doc, doc(cfg(feature = "irq")))]
 pub fn on_timer_tick() {
     on_timer_irq(true);
 }
 
 /// Handles a hardware timer interrupt.
-#[cfg(feature = "irq")]
-#[cfg_attr(doc, doc(cfg(feature = "irq")))]
 pub fn on_timer_irq(scheduler_tick: bool) {
-    use ax_kernel_guard::NoOp;
-    crate::timers::begin_hardware_timer_irq();
     crate::timers::check_events(scheduler_tick);
     if scheduler_tick {
         // Since irq and preemption are both disabled here,
-        // we can get current run queue with the default `ax_kernel_guard::NoOp`.
-        current_run_queue::<NoOp>().scheduler_timer_tick();
+        // we can get the current run queue without another context transition.
+        current_run_queue::<crate::sync::RawState>().scheduler_timer_tick();
     }
 }
 
-#[cfg(feature = "irq")]
 #[doc(hidden)]
 pub fn next_timer_deadline_nanos() -> Option<u64> {
     crate::timers::next_deadline_nanos()
-}
-
-/// Requests that the per-CPU hardware timer observe an external deadline.
-///
-/// The caller must publish the same deadline through a source registered with
-/// [`register_timer_deadline_source`] before calling this function. The timer
-/// is only moved earlier here; the common timer IRQ path recomputes the full
-/// minimum after every interrupt.
-#[cfg(feature = "irq")]
-pub fn request_timer_deadline_nanos(deadline_nanos: u64) {
-    crate::timers::request_deadline_nanos(deadline_nanos);
 }
 
 /// Scheduler ticks CPU `cpu` has spent running a non-idle task since boot.
@@ -222,18 +235,11 @@ pub fn request_timer_deadline_nanos(deadline_nanos: u64) {
 /// This is the load metric for an ondemand cpufreq governor: a monotonic per-CPU
 /// counter bumped once per timer tick when the CPU is not idle. Sample the delta
 /// over a window and divide by the elapsed ticks to get the busy fraction. Returns
-/// 0 for an out-of-range `cpu`. Requires the `irq` feature to actually advance
-/// (the counter only moves inside the timer tick).
+/// 0 for an out-of-range `cpu`. The counter only advances inside the timer tick.
 pub fn cpu_busy_ticks(cpu: usize) -> u64 {
     crate::run_queue::BUSY_TICKS
         .get(cpu)
         .map_or(0, |t| t.load(core::sync::atomic::Ordering::Relaxed))
-}
-
-#[cfg(feature = "irq")]
-#[doc(hidden)]
-pub fn note_programmed_timer_deadline_nanos(deadline_nanos: u64) {
-    crate::timers::note_programmed_deadline_nanos(deadline_nanos);
 }
 
 /// Adds the given task to the run queue, returns the task reference.
@@ -258,7 +264,7 @@ where
     let task_ref = task.into_arc();
     initialize_task_before_schedule(&task_ref, initialize, |task_ref| {
         register_task(task_ref);
-        select_run_queue::<NoPreemptIrqSave>(task_ref).add_task(task_ref.clone());
+        select_run_queue::<PreemptIrqSaveState>(task_ref).add_task(task_ref.clone());
     });
     task_ref
 }
@@ -279,7 +285,15 @@ pub fn spawn_raw<F>(f: F, name: String, stack_size: usize) -> AxTaskRef
 where
     F: FnOnce() + Send + 'static,
 {
-    spawn_task(TaskInner::new(f, name, stack_size))
+    try_spawn_raw(f, name, stack_size).expect("task stack allocation failed")
+}
+
+/// Tries to spawn a new task without publishing it until its stack exists.
+pub fn try_spawn_raw<F>(f: F, name: String, stack_size: usize) -> Result<AxTaskRef, TaskCreateError>
+where
+    F: FnOnce() + Send + 'static,
+{
+    Ok(spawn_task(TaskInner::try_new(f, name, stack_size)?))
 }
 
 /// Spawns a new task with the given name and the default stack size.
@@ -315,7 +329,7 @@ where
 ///
 /// [CFS]: https://en.wikipedia.org/wiki/Completely_Fair_Scheduler
 pub fn set_priority(prio: isize) -> bool {
-    current_run_queue::<NoPreemptIrqSave>().set_current_priority(prio)
+    current_run_queue::<PreemptIrqSaveState>().set_current_priority(prio)
 }
 
 /// Set the affinity for the current task.
@@ -346,7 +360,7 @@ pub fn set_current_affinity(cpumask: AxCpuMask) -> bool {
             .into_arc();
 
             // Migrate the current task to the correct CPU using the migration task.
-            current_run_queue::<NoPreemptIrqSave>().migrate_current(migration_task);
+            current_run_queue::<PreemptIrqSaveState>().migrate_current(migration_task);
         }
         true
     }
@@ -368,12 +382,10 @@ pub fn yield_now() {
 /// under internal kernel guards.
 #[doc(hidden)]
 pub(crate) fn yield_now_unchecked() {
-    current_run_queue::<NoPreemptIrqSave>().yield_current()
+    current_run_queue::<PreemptIrqSaveState>().yield_current()
 }
 
 /// Current task is going to sleep for the given duration.
-///
-/// If the feature `irq` is not enabled, it uses busy-wait instead.
 #[track_caller]
 pub fn sleep(dur: core::time::Duration) {
     sleep_until(ax_hal::time::monotonic_time() + dur);
@@ -381,16 +393,10 @@ pub fn sleep(dur: core::time::Duration) {
 
 /// Current task is going to sleep, it will be woken up at the given deadline.
 /// The deadline is measured against the monotonic clock.
-///
-/// If the feature `irq` is not enabled, it uses busy-wait instead.
 #[track_caller]
 pub fn sleep_until(deadline: ax_hal::time::TimeValue) {
-    #[cfg(feature = "irq")]
     might_sleep();
-    #[cfg(feature = "irq")]
-    current_run_queue::<NoPreemptIrqSave>().sleep_until(deadline);
-    #[cfg(not(feature = "irq"))]
-    ax_hal::time::busy_wait_until(deadline);
+    current_run_queue::<PreemptIrqSaveState>().sleep_until(deadline);
 }
 
 /// Exits the current task.
@@ -398,17 +404,28 @@ pub fn sleep_until(deadline: ax_hal::time::TimeValue) {
 pub fn exit(exit_code: i32) -> ! {
     might_sleep();
 
-    current_run_queue::<NoPreemptIrqSave>().exit_current(exit_code)
+    current_run_queue::<PreemptIrqSaveState>().exit_current(exit_code)
 }
 
 fn current_irq_context() -> bool {
-    #[cfg(feature = "irq")]
+    #[cfg(not(feature = "host-test"))]
     {
         ax_hal::irq::in_irq_context()
     }
-    #[cfg(not(feature = "irq"))]
+    #[cfg(feature = "host-test")]
     {
         false
+    }
+}
+
+fn current_cpu_id() -> usize {
+    #[cfg(not(feature = "host-test"))]
+    {
+        ax_hal::percpu::this_cpu_id()
+    }
+    #[cfg(feature = "host-test")]
+    {
+        0
     }
 }
 
@@ -470,7 +487,15 @@ impl AtomicContextSnapshot {
         let preempt_count = {
             #[cfg(feature = "preempt")]
             {
-                current.as_ref().map_or(0, |curr| curr.preempt_count())
+                let task_depth = current.as_ref().map_or(0, |curr| curr.preempt_count());
+                #[cfg(not(feature = "host-test"))]
+                {
+                    task_depth
+                }
+                #[cfg(feature = "host-test")]
+                {
+                    task_depth + crate::sync::host_preempt_depth()
+                }
             }
             #[cfg(not(feature = "preempt"))]
             {
@@ -482,23 +507,14 @@ impl AtomicContextSnapshot {
             irq_enabled: ax_hal::asm::irqs_enabled(),
             irq_context: current_irq_context(),
             preempt_count,
-            cpu_id: ax_hal::percpu::this_cpu_id(),
+            cpu_id: current_cpu_id(),
             task_id: current.as_ref().map(|curr| curr.id().as_u64()),
             task_state: current.as_ref().map(|curr| curr.state()),
         }
     }
 
     fn reasons(self) -> AtomicContextReasons {
-        let irq_disabled = {
-            #[cfg(feature = "irq")]
-            {
-                !self.irq_enabled
-            }
-            #[cfg(not(feature = "irq"))]
-            {
-                false
-            }
-        };
+        let irq_disabled = !self.irq_enabled;
 
         AtomicContextReasons {
             irq_disabled,
@@ -526,9 +542,18 @@ pub fn in_atomic_context() -> bool {
 /// Panics if it is executed in an atomic context.
 #[track_caller]
 pub fn might_sleep() {
+    might_sleep_at(core::panic::Location::caller());
+}
+
+/// Checks a sleep-like operation and attributes failures to `caller`.
+///
+/// Runtime capability adapters use this entry point because their generated
+/// cross-crate shim cannot preserve Rust's implicit `#[track_caller]` argument.
+#[doc(hidden)]
+pub fn might_sleep_at(caller: &'static core::panic::Location<'static>) {
     let snapshot = AtomicContextSnapshot::capture();
     if snapshot.is_atomic() {
-        panic_atomic_sleep(snapshot, core::panic::Location::caller());
+        panic_atomic_sleep(snapshot, caller);
     }
 }
 
@@ -557,7 +582,7 @@ fn panic_atomic_sleep(
     snapshot: AtomicContextSnapshot,
     caller: &'static core::panic::Location<'static>,
 ) -> ! {
-    let held_locks = ax_kspin::lockdep::current_task_held_lock_snapshot();
+    let held_locks = crate::sync::current_task_held_lock_snapshot();
     panic!(
         "sleeping or rescheduling is not allowed in atomic context: caller={}, reasons={}, \
          irq_enabled={}, irq_context={}, preempt_count={}, cpu_id={}, task_id={:?}, \
@@ -602,7 +627,7 @@ pub fn wake_task(task: &AxTaskRef) {
     // subsequent unblock_task call will again CAS-fail (task already Ready
     // or Running).
     if task.state() == TaskState::Blocked {
-        let mut rq = select_run_queue::<NoPreemptIrqSave>(task);
+        let mut rq = select_run_queue::<PreemptIrqSaveState>(task);
         rq.unblock_task(task.clone(), false);
     }
 }
@@ -610,7 +635,6 @@ pub fn wake_task(task: &AxTaskRef) {
 /// Registers a task for lookup by its scheduler task id.
 ///
 /// This keeps a weak reference only; expired entries are ignored by lookup.
-#[cfg(feature = "multitask")]
 pub fn register_task(task: &AxTaskRef) {
     TASK_REGISTRY
         .write()
@@ -618,39 +642,20 @@ pub fn register_task(task: &AxTaskRef) {
 }
 
 /// Finds a task by its scheduler task id.
-#[cfg(feature = "multitask")]
-pub fn task_by_id(task_id: u64) -> Option<AxTaskRef> {
-    if task_id == 0 {
-        return current_may_uninit().map(|curr| curr.clone());
-    }
-
+pub fn task_by_id(task_id: TaskId) -> Option<AxTaskRef> {
     TASK_REGISTRY
         .read()
-        .get(&task_id)
+        .get(&task_id.as_u64())
         .and_then(|task| task.upgrade())
 }
 
 /// Wakes a task by its scheduler task id.
-#[cfg(feature = "multitask")]
-pub fn wake_task_by_id(task_id: u64) -> bool {
+pub fn wake_task_by_id(task_id: TaskId) -> bool {
     let Some(task) = task_by_id(task_id) else {
         return false;
     };
     wake_task(&task);
     true
-}
-
-#[cfg(not(feature = "multitask"))]
-pub fn register_task(_task: &AxTaskRef) {}
-
-#[cfg(not(feature = "multitask"))]
-pub fn task_by_id(_task_id: u64) -> Option<AxTaskRef> {
-    None
-}
-
-#[cfg(not(feature = "multitask"))]
-pub fn wake_task_by_id(_task_id: u64) -> bool {
-    false
 }
 
 /// The idle task routine.
@@ -661,108 +666,9 @@ pub fn run_idle() -> ! {
     loop {
         yield_now_unchecked();
         trace!("idle task: waiting for IRQs...");
-        #[cfg(all(feature = "irq", not(feature = "host-test")))]
+        #[cfg(not(feature = "host-test"))]
         ax_hal::asm::wait_for_irqs();
     }
-}
-
-#[cfg(axtest)]
-pub(crate) fn axtask_api_constants_hold_for_test() -> bool {
-    // default_task_stack_size should return a non-zero value
-    let stack_size = default_task_stack_size();
-    assert!(stack_size > 0);
-    assert!(stack_size % 4096 == 0); // Should be page-aligned
-
-    true
-}
-
-#[cfg(axtest)]
-pub(crate) fn axtask_api_function_existence_hold_for_test() -> bool {
-    // Verify key API functions exist and are callable
-    // (Actual task operations tested in integration tests)
-    true
-}
-
-#[cfg(axtest)]
-pub(crate) fn axtask_api_atomic_context_structs_hold_for_test() -> bool {
-    // Test that in_atomic_context function exists and returns bool
-    let is_atomic = super::in_atomic_context();
-    // Should be false in test context (not in IRQ/preempt-disabled region)
-    assert!(is_atomic == true || is_atomic == false);
-
-    // Test that default_task_stack_size returns a reasonable value
-    let stack_size = super::default_task_stack_size();
-    assert!(stack_size > 0);
-
-    true
-}
-
-#[cfg(axtest)]
-pub(crate) fn axtask_api_current_and_exit_hold_for_test() -> bool {
-    // Test that current() and exit() functions exist
-    // (Can't actually call exit() in tests, but verify they compile)
-
-    // Verify current_task exists as a concept
-    let _ = "current_task_exists";
-
-    // Test stack size alignment
-    let stack_size = super::default_task_stack_size();
-    assert!(stack_size % 16 == 0); // TASK_STACK_ALIGN
-
-    true
-}
-
-#[cfg(axtest)]
-pub(crate) fn axtask_api_priority_constants_hold_for_test() -> bool {
-    // Test priority-related constants if they exist
-
-    // Test stack size is reasonable (at least 4KB)
-    let stack_size = super::default_task_stack_size();
-    assert!(stack_size >= 4096);
-
-    true
-}
-
-#[cfg(axtest)]
-pub(crate) fn axtask_api_type_aliases_hold_for_test() -> bool {
-    // Test that type aliases exist and are usable
-    // AxTaskRef = Arc<AxTask>
-    // WeakAxTaskRef = Weak<AxTask>
-    let _type_check: Option<super::AxTaskRef> = None;
-    let _weak_check: Option<super::WeakAxTaskRef> = None;
-
-    true
-}
-
-#[cfg(axtest)]
-pub(crate) fn axtask_api_scheduler_name_hold_for_test() -> bool {
-    // Test that Scheduler::scheduler_name() returns a non-empty string
-    let name = super::Scheduler::scheduler_name();
-    assert!(!name.is_empty());
-
-    true
-}
-
-#[cfg(axtest)]
-pub(crate) fn axtask_api_task_registry_functions_exist_hold_for_test() -> bool {
-    // Verify task registry functions exist (multitask feature)
-    // These are no-op when multitask is disabled, but should compile
-
-    #[cfg(feature = "multitask")]
-    {
-        // In multitask mode, task_by_id(0) returns current task
-        let result = super::task_by_id(0);
-        assert!(result.is_some() || result.is_none()); // Either is valid
-    }
-
-    #[cfg(not(feature = "multitask"))]
-    {
-        // Without multitask, task_by_id always returns None
-        let result = super::task_by_id(42);
-        assert!(result.is_none());
-    }
-
-    true
 }
 
 #[cfg(test)]
@@ -785,5 +691,64 @@ mod tests {
         );
 
         assert!(initialized.get());
+    }
+}
+
+#[cfg(test)]
+mod std_tests {
+    use super::*;
+
+    fn axtask_api_constants_hold_for_test() -> bool {
+        // default_task_stack_size should return a non-zero value
+        let stack_size = default_task_stack_size();
+        assert!(stack_size > 0);
+        assert!(stack_size.is_multiple_of(4096)); // Should be page-aligned
+
+        true
+    }
+
+    fn axtask_api_type_aliases_hold_for_test() -> bool {
+        // Test that type aliases exist and are usable
+        // AxTaskRef = Arc<AxTask>
+        // WeakAxTaskRef = Weak<AxTask>
+        let _type_check: Option<super::AxTaskRef> = None;
+        let _weak_check: Option<super::WeakAxTaskRef> = None;
+
+        true
+    }
+
+    fn axtask_api_scheduler_name_hold_for_test() -> bool {
+        // Test that Scheduler::scheduler_name() returns a non-empty string
+        let name = super::Scheduler::scheduler_name();
+        assert!(!name.is_empty());
+
+        true
+    }
+
+    fn axtask_api_task_registry_functions_exist_hold_for_test() -> bool {
+        let _lookup: fn(super::TaskId) -> Option<super::AxTaskRef> = super::task_by_id;
+        let _wake: fn(super::TaskId) -> bool = super::wake_task_by_id;
+
+        true
+    }
+
+    #[test]
+    fn axtask_api_constants_hold() {
+        assert!(axtask_api_constants_hold_for_test());
+    }
+
+    #[test]
+    fn axtask_api_type_aliases_hold() {
+        assert!(axtask_api_type_aliases_hold_for_test());
+    }
+
+    #[test]
+    fn axtask_api_scheduler_name_hold() {
+        assert!(axtask_api_scheduler_name_hold_for_test());
+    }
+
+    #[test]
+    fn axtask_api_task_registry_functions_exist_hold() {
+        assert!(axtask_api_task_registry_functions_exist_hold_for_test());
     }
 }

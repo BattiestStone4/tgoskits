@@ -26,7 +26,7 @@ ramdisk_cpio = []
 [dependencies]
 ax-hal = { workspace = true }
 ax-log = { workspace = true }
-ax-sync = { workspace = true }
+ax-sync = { workspace = true, features = ["sleep"] }
 ax-alloc = { workspace = true, optional = true }
 ax-mm = { workspace = true, optional = true }
 ax-driver = { workspace = true, optional = true }
@@ -44,5 +44,4 @@ sbi-rt = { workspace = true, features = ["legacy"] }
 
 cfg-if = "1.0.1"
 object = { version = "0.38", default-features = false, features = ["read", "pe"] }
-chrono = { workspace = true }
 uefi-raw = "0.14.0"

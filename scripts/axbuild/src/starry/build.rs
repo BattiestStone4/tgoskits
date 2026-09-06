@@ -120,6 +120,7 @@ pub(crate) fn load_cargo_config(request: &ResolvedStarryRequest) -> anyhow::Resu
         BareKernelLinkMode::Pie,
     )?;
     patch_starry_cargo_config(&mut cargo, request, metadata)?;
+    crate::build::append_cargo_rustflags(&mut cargo, &["-D", "warnings"]);
     Ok(cargo)
 }
 
@@ -156,10 +157,20 @@ pub(crate) async fn build_starry_artifact(
         "starry build package={} target={} arch={}",
         cargo.package, request.target, request.arch
     ));
-    let output = starry
+    let report_session = if request.arch == "aarch64" {
+        let target_dir =
+            crate::build::cargo_target_dir_for(starry.app.workspace_root(), &cargo.args)?;
+        Some(crate::build::start_future_incompat_report_session(
+            &target_dir,
+        )?)
+    } else {
+        None
+    };
+    let build_result = starry
         .app
         .build(cargo.clone(), request.build_info_path.clone())
-        .await?;
+        .await;
+    let output = crate::build::finish_future_incompat_report_session(report_session, build_result)?;
     stage.done();
     postprocess_starry_artifact(starry.app.workspace_root(), request, &cargo, &output)?;
     Ok(output)
@@ -184,6 +195,8 @@ pub(crate) fn postprocess_starry_artifact(
     ) {
         generate_uimage_from_its(workspace_root, &plan, &request.arch, &request.target, elf)?;
     }
+
+    validate_riscv_image_artifact(&request.arch, elf)?;
 
     Ok(())
 }
@@ -312,6 +325,67 @@ fn refresh_bin_if_present(kernel_elf: &Path) -> anyhow::Result<()> {
         .exec()
         .with_context(|| format!("failed to refresh {}", bin.display()))?;
     stage.done();
+    Ok(())
+}
+
+fn validate_riscv_image_artifact(arch: &str, kernel_elf: &Path) -> anyhow::Result<()> {
+    if arch != "riscv64" {
+        return Ok(());
+    }
+    let bin = kernel_elf.with_extension("bin");
+    if !bin.exists() {
+        bail!("RISC-V Image artifact is missing: {}", bin.display());
+    }
+    let image = fs::read(&bin).with_context(|| format!("failed to read {}", bin.display()))?;
+    validate_riscv_image_header(&image)
+        .with_context(|| format!("invalid RISC-V Image header in {}", bin.display()))?;
+    println!("[axbuild] validated RISC-V Image header: {}", bin.display());
+    Ok(())
+}
+
+fn validate_riscv_image_header(image: &[u8]) -> anyhow::Result<()> {
+    const HEADER_SIZE: usize = 0x40;
+    const TEXT_OFFSET: u64 = 0x20_0000;
+    const AUIPC_T0_FIXED_BITS: u32 = 0x297;
+    const JALR_ZERO_T0_FIXED_BITS: u32 = 0x0002_8067;
+
+    if image.len() < HEADER_SIZE {
+        bail!(
+            "image is only {} bytes, need at least {HEADER_SIZE}",
+            image.len()
+        );
+    }
+
+    let code0 = u32::from_le_bytes(image[0..4].try_into().unwrap());
+    let code1 = u32::from_le_bytes(image[4..8].try_into().unwrap());
+    if code0 & 0x0fff != AUIPC_T0_FIXED_BITS {
+        bail!("code0 is not `auipc t0, ...`: {code0:#010x}");
+    }
+    if code1 & 0x000f_ffff != JALR_ZERO_T0_FIXED_BITS {
+        bail!("code1 is not `jalr zero, ...(t0)`: {code1:#010x}");
+    }
+
+    let read_u64 =
+        |offset: usize| u64::from_le_bytes(image[offset..offset + 8].try_into().unwrap());
+    if read_u64(0x08) != TEXT_OFFSET {
+        bail!(
+            "text_offset at 0x08 is {:#x}, expected {TEXT_OFFSET:#x}",
+            read_u64(0x08)
+        );
+    }
+    let image_size = read_u64(0x10);
+    if image_size != image.len() as u64 {
+        bail!(
+            "image_size at 0x10 is {image_size:#x}, but the artifact is {} bytes",
+            image.len()
+        );
+    }
+    if &image[0x30..0x35] != b"RISCV" {
+        bail!("RISC-V magic at 0x30 is missing");
+    }
+    if &image[0x38..0x3c] != b"RSC\x05" {
+        bail!("RISC-V magic2 at 0x38 is missing");
+    }
     Ok(())
 }
 

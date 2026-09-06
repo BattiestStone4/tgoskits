@@ -150,6 +150,18 @@ lifecycle states"（vm/mod.rs:179）。它随 `start_with` 创建、随 `take_st
 teardown 回收，`Ready`/`Failed`/`Destroyed` 一律不携带。`reset()` 的"旧 runtime teardown"
 即走 `stop_and_join_runtime(Forced)` + `take_stopped_runtime`。
 
+**观察性计数器（VM 级聚合，非 per-vCPU）**：`VmRuntimeHandle` 持有一对 VM 级单调计数器
+`guest_entry_count` / `guest_park_count`（vm/mod.rs:192/207，均 `AtomicU64`），由 VM 内
+**所有** vCPU task 共享递增，不是每个 vCPU 各一份：
+- `guest_entry_count`：仅在 `run_vcpu` **成功返回后**由 vCPU run loop 调用 `inc_guest_entry`
+  （vcpus.rs:560 附近）递增；`Err` 分支（bind/`before_vcpu_run`/`vcpu.run()`/退出处理失败、
+  guest 从未运行）**不**递增。reset 重建 runtime 时归零。
+- `guest_park_count`：仅当 vCPU 在 suspend wait 的等待条件中真正 park（持锁、入队前发布，
+  vcpus.rs 的 `wait_for` 闭包内 `inc_guest_park`）时递增；resume 抢跑使 vCPU 从未 park，则不递增。
+- 语义边界：两者都是 VM 级聚合弱信号——证明"至少一个 vCPU 有进展"，**不是**"全部 vCPU/设备/
+  timer 已 quiesce"的强保证，也**不是**暂停完成确认 API（与 lifecycle.md §3 `pause()` 无确认 API
+  一致）。HTTP 控制面用它们区分"真实重入/真实 park"与"仅状态翻转"，但不应据此断言执行面已静默。
+
 **`pending_interrupts` 随 runtime 生死：** `queue_interrupt`（runtime 层**内部接口**，
 `pub(crate)`，vcpus.rs:86，由 crate 内设备模拟/中断控制器经 manager.rs:79-81 的 `inject_interrupt`
 调用，**非 `AxVM` 公共 API**）只在 VM 处于 `Running`/`Paused` 时接受新中断（vcpus.rs:89，否则
@@ -239,7 +251,7 @@ crate 内部的 `AxVM::prepare_resources_with()` 重建 vCPU/设备/中断结构
 | `Destroying` | **destroy 入口瞬态**：`destroy_with` 第一行 `replace(self, Machine::Destroying)`（machine.rs:476），执行期间持锁、`status()` 不可观测；`destroy_with` 内也不调用 `status()`。**但清理闭包失败时不回滚**：`f(Some(resources))?` 出错即返回，machine 停在 `Destroying`（resources 已被闭包消费）——锁释放后 `status()` 可观测到 `Destroying`。这是三个"不可观测"态中**唯一可达的泄漏路径**：重试 `destroy()` 走 `f(None)` 到 `Destroyed`（machine.rs:552-556；对应 lifecycle.md §4 ②） | machine.rs:476、:483/:548/:553 |
 
 **锁语义：** `status()`（vm/mod.rs:621）与所有转换方法走**同一把 machine lock**——
-`Mutex<Machine<..>>`（vm/mod.rs:580，`ax_kspin::SpinNoIrq`），**不可重入**。因此
+`IrqSafeMutex<Machine<..>>`（由 `ax_std::os::arceos::sync` 导出），**不可重入**。因此
 "转换期间锁被持有 → `status()` 阻塞"是保证不可观测性的机制，不是巧合。这也意味着外部代码
 **只能观测到稳定态**（`Ready`/`Running`/`Paused`/`Stopping`/`Stopped`/`Destroyed`）、
 **确实失败后**的 `Failed`（machine.rs:120/:217 的闭包失败路径），以及 **destroy 清理失败后的
@@ -248,9 +260,8 @@ crate 内部的 `AxVM::prepare_resources_with()` 重建 vCPU/设备/中断结构
 
 `wait_until_stopped`（vm/mod.rs:873-893）在 machine 锁**外**执行：每次迭代 `status()` 单次取锁、
 其余时间 `yield_now`，锁不跨迭代持有——因此 `destroy()`/`reset()` 的等待期间，同一 VM 上其他
-task 调 `status()` 可正常返回 `Stopping`（与 lifecycle.md §4 一致）。`SpinNoIrq`
-（= `BaseSpinLock<NoPreemptIrqSave>`，ax_kspin/src/lib.rs:69）获取时**关本地中断并保存状态**
-（`local_irq_save_and_disable`，kernel_guard/src/lib.rs:177-192）、释放时恢复——持锁期间本地中断
+task 调 `status()` 可正常返回 `Stopping`（与 lifecycle.md §4 一致）。`IrqSafeMutex`
+获取时禁止抢占并保存/关闭本地中断，释放时恢复——持锁期间本地中断
 被屏蔽；转换函数与 `status()` 持锁均为短暂（`status()` **持锁后**为 O(1) match；获取锁的等待时间
 取决于当前持锁者的剩余执行时间，通常微秒级），对延迟敏感的设备中断影响有限。
 

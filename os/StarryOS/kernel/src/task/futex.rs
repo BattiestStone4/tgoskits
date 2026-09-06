@@ -2,7 +2,7 @@
 
 use alloc::{
     collections::{btree_map::BTreeMap, vec_deque::VecDeque},
-    sync::{Arc, Weak},
+    sync::Arc,
     vec::Vec,
 };
 use core::{
@@ -15,9 +15,7 @@ use core::{
     time::Duration,
 };
 
-use ax_errno::AxResult;
 use ax_memory_addr::VirtAddr;
-use ax_sync::{LockdepMutexExt, Mutex};
 use ax_task::{
     current,
     future::{self, block_on, interruptible},
@@ -25,11 +23,52 @@ use ax_task::{
 use hashbrown::HashMap;
 
 use crate::{
-    mm::{AddrSpace, Backend, SharedPages},
+    StarryError, StarryResult,
+    mm::{AddrSpace, SharedFutexIdentity, SharedFutexRegion},
+    sync::{LockdepMutexExt, Mutex},
     task::{AsThread, ProcessData},
 };
 
 const NESTED_WAIT_QUEUE_LOCK_SUBCLASS: u32 = 1;
+
+/// Result of a user-memory operation performed while futex queues are locked.
+pub enum FutexAccessError {
+    /// The user mapping must be faulted in after releasing the queue locks.
+    Fault,
+    /// A bounded architecture atomic sequence must be retried later.
+    Retry,
+    /// The futex operation failed independently of user-memory residency.
+    Operation(StarryError),
+}
+
+/// Retries one futex operation whose locked section may only use nofault user
+/// access.
+///
+/// `operation` must release all futex queue locks before returning an error.
+/// Page population is therefore performed by `fault_in` only after the locked
+/// transaction has aborted without queue side effects.
+pub fn retry_futex_nofault<T>(
+    operation: impl FnMut() -> Result<T, FutexAccessError>,
+    fault_in: impl FnMut() -> StarryResult<()>,
+) -> StarryResult<T> {
+    retry_futex_nofault_with(operation, fault_in, ax_task::yield_now)
+}
+
+fn retry_futex_nofault_with<T>(
+    mut operation: impl FnMut() -> Result<T, FutexAccessError>,
+    mut fault_in: impl FnMut() -> StarryResult<()>,
+    mut retry: impl FnMut(),
+) -> StarryResult<T> {
+    loop {
+        match operation() {
+            Ok(value) => return Ok(value),
+            Err(FutexAccessError::Fault) => fault_in()?,
+            Err(FutexAccessError::Retry) => {}
+            Err(FutexAccessError::Operation(error)) => return Err(error),
+        }
+        retry();
+    }
+}
 
 /// Wait queue used by futex.
 #[derive(Default)]
@@ -94,15 +133,15 @@ struct WaitIfFuture<'a, F> {
     state: Option<Arc<WaiterState>>,
 }
 
-impl<F: FnOnce() -> bool + Unpin> Future for WaitIfFuture<'_, F> {
-    type Output = AxResult<bool>;
+impl<F: FnOnce() -> Result<bool, FutexAccessError> + Unpin> Future for WaitIfFuture<'_, F> {
+    type Output = Result<bool, FutexAccessError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut core::task::Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
 
         if let Some(condition) = this.condition.take() {
             let mut inner = this.queue.inner.lock();
-            if !condition() {
+            if !condition()? {
                 return Poll::Ready(Ok(false));
             }
 
@@ -170,7 +209,7 @@ impl WaitQueue {
         bitset: u32,
         timeout: Option<Duration>,
         condition: impl FnOnce() -> bool + Unpin,
-    ) -> AxResult<bool> {
+    ) -> StarryResult<bool> {
         self.wait_if_with_cleanup(bitset, timeout, None, condition)
     }
 
@@ -184,8 +223,25 @@ impl WaitQueue {
         timeout: Option<Duration>,
         cleanup: Option<FutexWaitCleanup>,
         condition: impl FnOnce() -> bool + Unpin,
-    ) -> AxResult<bool> {
-        block_on(interruptible(future::timeout(
+    ) -> StarryResult<bool> {
+        match self.wait_if_with_cleanup_nofault(bitset, timeout, cleanup, || Ok(condition())) {
+            Ok(waited) => Ok(waited),
+            Err(FutexAccessError::Operation(error)) => Err(error),
+            Err(FutexAccessError::Fault | FutexAccessError::Retry) => {
+                unreachable!("infallible wait condition returned a user access error")
+            }
+        }
+    }
+
+    /// Waits after checking a nofault condition while holding the queue lock.
+    pub fn wait_if_with_cleanup_nofault(
+        &self,
+        bitset: u32,
+        timeout: Option<Duration>,
+        cleanup: Option<FutexWaitCleanup>,
+        condition: impl FnOnce() -> Result<bool, FutexAccessError> + Unpin,
+    ) -> Result<bool, FutexAccessError> {
+        let timed = block_on(interruptible(future::timeout(
             timeout,
             WaitIfFuture {
                 queue: self,
@@ -194,7 +250,9 @@ impl WaitQueue {
                 condition: Some(condition),
                 state: None,
             },
-        )))??
+        )))
+        .map_err(|error| FutexAccessError::Operation(error.into()))?;
+        timed.map_err(|error| FutexAccessError::Operation(error.into()))?
     }
 
     fn wake_locked(queue: &mut VecDeque<Waiter>, count: usize, mask: u32, wakers: &mut Vec<Waker>) {
@@ -234,8 +292,8 @@ impl WaitQueue {
         wake_count: usize,
         target: &WaitQueue,
         wake2_count: usize,
-        condition: impl FnOnce() -> AxResult<bool>,
-    ) -> AxResult<usize> {
+        condition: impl FnOnce() -> Result<bool, FutexAccessError>,
+    ) -> Result<usize, FutexAccessError> {
         let mut condition = Some(condition);
         let mut wakers = Vec::new();
 
@@ -324,8 +382,8 @@ impl WaitQueue {
         requeue_count: usize,
         target_cleanup: FutexWaitCleanup,
         target: &WaitQueue,
-        condition: impl FnOnce() -> AxResult<bool>,
-    ) -> AxResult<Option<usize>> {
+        condition: impl FnOnce() -> Result<bool, FutexAccessError>,
+    ) -> Result<Option<usize>, FutexAccessError> {
         let mut condition = Some(condition);
         let mut wakers = Vec::new();
 
@@ -400,12 +458,16 @@ impl WaitQueue {
     }
 
     /// Checks if the wait queue is empty.
+    ///
+    /// O(1): reads the queue length only. This is called from `FutexGuard::Drop`
+    /// while holding the (per-process) futex-table lock on EVERY futex op, so it must
+    /// not scan — a prior `queue.retain(cancelled)` here made it O(n) under the table
+    /// lock, i.e. an O(N²) collapse of contended futex throughput (schbench's tail).
+    /// Cancelled waiters are already pruned by `wake` (its retain) and by each waiter's
+    /// own `WaitIfFuture::Drop`, so dropping the scan here only delays a benign
+    /// table-entry cleanup (also swept by the periodic `FutexTables` GC), never leaks.
     pub fn is_empty(&self) -> bool {
-        let mut inner = self.inner.lock();
-        inner
-            .queue
-            .retain(|waiter| !waiter.state.cancelled.load(AtomicOrdering::SeqCst));
-        inner.queue.is_empty()
+        self.inner.lock().queue.is_empty()
     }
 }
 
@@ -419,10 +481,8 @@ pub enum FutexKey {
 
     /// A futex in a shared memory region.
     Shared {
-        /// The offset of the futex within the shared memory region.
-        offset: usize,
-        /// The shared memory region.
-        region: Result<Weak<SharedPages>, Weak<()>>,
+        /// Stable backing-object identity and logical byte offset.
+        identity: SharedFutexIdentity,
     },
 }
 
@@ -439,23 +499,9 @@ impl FutexKey {
     /// Creates a new `FutexKey`.
     pub fn new(aspace: &AddrSpace, address: usize, mode: FutexKeyMode) -> Self {
         if matches!(mode, FutexKeyMode::Auto)
-            && let Some(area) = aspace.find_area(VirtAddr::from_usize(address))
+            && let Some(identity) = aspace.shared_futex_identity(VirtAddr::from_usize(address))
         {
-            match area.backend() {
-                Backend::Shared(backend) => {
-                    return Self::Shared {
-                        offset: address - area.start().as_usize(),
-                        region: Ok(Arc::downgrade(backend.pages())),
-                    };
-                }
-                Backend::File(file) => {
-                    return Self::Shared {
-                        offset: address - area.start().as_usize(),
-                        region: Err(file.futex_handle()),
-                    };
-                }
-                _ => {}
-            }
+            return Self::Shared { identity };
         }
         Self::Private { address }
     }
@@ -468,30 +514,28 @@ impl FutexKey {
     /// paths that also hold the aspace lock across long page-table operations,
     /// which could otherwise deadlock with concurrent CLONE_THREAD futex
     /// wait/wake pairs.
-    pub fn new_current(address: usize, mode: FutexKeyMode) -> Self {
+    pub fn new_current(address: usize, mode: FutexKeyMode) -> StarryResult<Self> {
         if matches!(mode, FutexKeyMode::Private) {
-            return Self::Private { address };
+            return Ok(Self::Private { address });
         }
         let curr = current();
-        let aspace_arc = curr.as_thread().proc_data.aspace();
+        let aspace_arc = curr.as_thread().proc_data.pin_aspace()?;
         let aspace = aspace_arc.lock();
-        Self::new(&aspace, address, mode)
+        Ok(Self::new(&aspace, address, mode))
     }
 
     /// Teardown variant that is anchored to the exiting process instead of
     /// whatever scheduler task is currently running on this CPU.
-    pub fn new_for_process_teardown(proc_data: &ProcessData, address: usize) -> Self {
-        let aspace_arc = proc_data.aspace();
-        let Some(aspace) = aspace_arc.try_lock() else {
-            return Self::Private { address };
-        };
-        Self::new(&aspace, address, FutexKeyMode::Auto)
+    pub fn new_for_process_teardown(proc_data: &ProcessData, address: usize) -> Option<Self> {
+        let aspace_arc = proc_data.pin_aspace().ok()?;
+        let aspace = aspace_arc.try_lock()?;
+        Some(Self::new(&aspace, address, FutexKeyMode::Auto))
     }
 
     fn as_usize(&self) -> usize {
         match self {
             FutexKey::Private { address } => *address,
-            FutexKey::Shared { offset, .. } => *offset,
+            FutexKey::Shared { identity } => identity.offset(),
         }
     }
 }
@@ -511,24 +555,43 @@ impl FutexEntry {
 }
 
 /// A table mapping memory addresses to futex wait queues.
-pub struct FutexTable(Mutex<HashMap<usize, Arc<FutexEntry>>>);
+/// Number of lock shards in a per-process futex table. Mirrors Linux's
+/// `futex_hash_bucket` array: futex ops on distinct addresses fall into distinct
+/// buckets, so contended-futex throughput scales toward `ncpu` instead of
+/// serializing all threads on one process-wide table lock.
+const FUTEX_SHARDS: usize = 64;
+
+pub struct FutexTable {
+    buckets: [Mutex<HashMap<usize, Arc<FutexEntry>>>; FUTEX_SHARDS],
+}
 
 impl FutexTable {
     /// Creates a new `FutexTable`.
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
-        Self(Mutex::new(HashMap::new()))
+        Self {
+            buckets: core::array::from_fn(|_| Mutex::new(HashMap::new())),
+        }
     }
 
-    /// Checks if the futex table is empty.
+    /// Selects the shard for a futex key via a Fibonacci hash (top bits after a
+    /// multiplicative mix) so 4-byte-aligned user addresses spread evenly.
+    #[inline]
+    fn bucket(&self, key: usize) -> &Mutex<HashMap<usize, Arc<FutexEntry>>> {
+        let h = (key as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        &self.buckets[(h >> (64 - 6)) as usize % FUTEX_SHARDS]
+    }
+
+    /// Checks if the futex table is empty (all shards). Only called by the
+    /// periodic table GC, not the hot path.
     pub fn is_empty(&self) -> bool {
-        self.0.lock().is_empty()
+        self.buckets.iter().all(|b| b.lock().is_empty())
     }
 
     /// Gets the wait queue associated with the given address.
     pub fn get(&self, key: &FutexKey) -> Option<FutexGuard<'_>> {
         let key = key.as_usize();
-        let entry = self.0.lock().get(&key).cloned()?;
+        let entry = self.bucket(key).lock().get(&key).cloned()?;
         Some(FutexGuard {
             table: self,
             key,
@@ -540,8 +603,8 @@ impl FutexTable {
     /// new one if it doesn't exist.
     pub fn get_or_insert(&self, key: &FutexKey) -> FutexGuard<'_> {
         let key = key.as_usize();
-        let mut table = self.0.lock();
-        let entry = table
+        let mut bucket = self.bucket(key).lock();
+        let entry = bucket
             .entry(key)
             .or_insert_with(|| Arc::new(FutexEntry::new()));
         FutexGuard {
@@ -560,14 +623,14 @@ impl FutexTable {
     }
 
     fn remove_waiter(&self, key: usize, state: &Arc<WaiterState>) {
-        let mut table = self.0.lock();
-        let should_remove = if let Some(entry) = table.get(&key) {
+        let mut bucket = self.bucket(key).lock();
+        let should_remove = if let Some(entry) = bucket.get(&key) {
             entry.wq.remove_waiter(state) && Arc::strong_count(entry) == 1
         } else {
             false
         };
         if should_remove {
-            table.remove(&key);
+            bucket.remove(&key);
         }
     }
 }
@@ -594,20 +657,20 @@ impl Drop for FutexGuard<'_> {
         // key between the count check and the remove() call, creating a new
         // reference that would be invalidated when we remove the entry.
         // Checking inside the lock makes check-and-remove atomic.
-        let mut table = self.table.0.lock();
+        let mut bucket = self.table.bucket(self.key).lock();
         // Re-check strong_count under lock — a concurrent get_or_insert may
         // have cloned the Arc in the meantime. The <= 2 threshold accounts
         // for the strong refs held by the table entry and this guard
         // (self.inner). If there are more refs, someone else is using the
         // entry, so we must not remove it from the table.
         if Arc::strong_count(&self.inner) <= 2 && self.inner.wq.is_empty() {
-            table.remove(&self.key);
+            bucket.remove(&self.key);
         }
     }
 }
 
 struct FutexTables {
-    map: BTreeMap<usize, Arc<FutexTable>>,
+    map: BTreeMap<SharedFutexRegion, Arc<FutexTable>>,
     operations: usize,
 }
 impl FutexTables {
@@ -618,7 +681,7 @@ impl FutexTables {
         }
     }
 
-    fn get_or_insert(&mut self, key: usize) -> Arc<FutexTable> {
+    fn get_or_insert(&mut self, key: SharedFutexRegion) -> Arc<FutexTable> {
         self.operations += 1;
         if self.operations == 100 {
             self.operations = 0;
@@ -644,12 +707,147 @@ pub fn futex_table_for(key: &FutexKey) -> Arc<FutexTable> {
 pub fn futex_table_for_process(proc_data: &ProcessData, key: &FutexKey) -> Arc<FutexTable> {
     match key {
         FutexKey::Private { .. } => proc_data.futex_table.clone(),
-        FutexKey::Shared { region, .. } => {
-            let ptr = match region {
-                Ok(pages) => Weak::as_ptr(pages) as usize,
-                Err(key) => Weak::as_ptr(key) as usize,
-            };
-            SHARED_FUTEX_TABLES.lock().get_or_insert(ptr)
+        FutexKey::Shared { identity } => SHARED_FUTEX_TABLES
+            .lock()
+            .get_or_insert(identity.region()),
+    }
+}
+
+#[cfg(all(test, not(axtest)))]
+mod tests {
+    use alloc::boxed::Box;
+    use core::{cell::Cell, task::Context};
+
+    use super::*;
+
+    #[test]
+    fn nofault_failure_is_transactional() {
+        let wait_queue = WaitQueue::new();
+        let mut wait = Box::pin(WaitIfFuture {
+            queue: &wait_queue,
+            bitset: u32::MAX,
+            cleanup: None,
+            condition: Some(|| Err(FutexAccessError::Fault)),
+            state: None,
+        });
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(matches!(
+            wait.as_mut().poll(&mut context),
+            Poll::Ready(Err(FutexAccessError::Fault))
+        ));
+        assert!(wait_queue.is_empty());
+
+        let source = WaitQueue::new();
+        let target = WaitQueue::new();
+        let state = Arc::new(WaiterState::new(None));
+        source.inner.lock().queue.push_back(Waiter {
+            waker: Waker::noop().clone(),
+            bitset: u32::MAX,
+            state: state.clone(),
+        });
+
+        assert!(matches!(
+            source.wake_op(1, &target, 1, || Err(FutexAccessError::Fault)),
+            Err(FutexAccessError::Fault)
+        ));
+        assert_eq!(source.inner.lock().queue.len(), 1);
+        assert!(!state.woken.load(AtomicOrdering::SeqCst));
+
+        let target_cleanup = FutexWaitCleanup {
+            table: Arc::new(FutexTable::new()),
+            key: 0x2000,
+        };
+        assert!(matches!(
+            source.wake_requeue_if(1, u32::MAX, 1, target_cleanup, &target, || {
+                Err(FutexAccessError::Retry)
+            }),
+            Err(FutexAccessError::Retry)
+        ));
+        assert_eq!(source.inner.lock().queue.len(), 1);
+        assert!(target.is_empty());
+        assert!(!state.woken.load(AtomicOrdering::SeqCst));
+
+        let attempts = Cell::new(0);
+        let fault_in_unlocked = Cell::new(false);
+        let result = retry_futex_nofault_with(
+            || {
+                attempts.set(attempts.get() + 1);
+                if attempts.get() == 1 {
+                    source.wake_op(0, &target, 0, || Err(FutexAccessError::Fault))
+                } else {
+                    source.wake_op(0, &target, 0, || Ok(false))
+                }
+            },
+            || {
+                let source_unlocked = !unsafe { source.inner.raw() }.is_owned_by_current();
+                let target_unlocked = !unsafe { target.inner.raw() }.is_owned_by_current();
+                fault_in_unlocked.set(source_unlocked && target_unlocked);
+                Ok(())
+            },
+            || {},
+        );
+
+        assert!(matches!(result, Ok(0)));
+        assert_eq!(attempts.get(), 2);
+        assert!(fault_in_unlocked.get());
+        assert_eq!(source.inner.lock().queue.len(), 1);
+        assert!(!state.woken.load(AtomicOrdering::SeqCst));
+    }
+}
+
+#[cfg(all(test, axtest))]
+mod axtests {
+    use ax_memory_addr::{MemoryAddr, PAGE_SIZE_4K, VirtAddr};
+    use ax_runtime::hal::paging::MappingFlags;
+
+    use super::*;
+    use crate::mm::{MappingOperation, SharedMemoryObject};
+
+    fn shared_offset(key: FutexKey) -> usize {
+        match key {
+            FutexKey::Shared { identity } => identity.offset(),
+            FutexKey::Private { .. } => panic!("shared mapping produced a private futex key"),
         }
+    }
+
+    #[axtest::axtest]
+    fn shared_futex_key_survives_vma_split() {
+        let start = VirtAddr::from_usize(0x7100_0000);
+        let second_page = start.checked_add(PAGE_SIZE_4K).unwrap();
+        let flags = MappingFlags::READ | MappingFlags::WRITE | MappingFlags::USER;
+        let pages = Arc::new(
+            SharedMemoryObject::allocate(PAGE_SIZE_4K * 2, PAGE_SIZE_4K).unwrap(),
+        );
+        let mut aspace = AddrSpace::new_empty(start, PAGE_SIZE_4K * 2).unwrap();
+        aspace
+            .map(
+                start,
+                PAGE_SIZE_4K * 2,
+                flags,
+                false,
+                MappingOperation::new_shared(start, pages),
+            )
+            .unwrap();
+
+        let before = shared_offset(FutexKey::new(
+            &aspace,
+            second_page.as_usize(),
+            FutexKeyMode::Auto,
+        ));
+        aspace
+            .protect(
+                second_page,
+                PAGE_SIZE_4K,
+                MappingFlags::READ | MappingFlags::USER,
+            )
+            .unwrap();
+        let after = shared_offset(FutexKey::new(
+            &aspace,
+            second_page.as_usize(),
+            FutexKeyMode::Auto,
+        ));
+
+        aspace.reset_uninstalled_for_loader().unwrap();
+        assert_eq!(before, after, "VMA split changed shared futex identity");
     }
 }

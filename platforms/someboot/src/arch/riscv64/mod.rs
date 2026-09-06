@@ -18,7 +18,7 @@ use page_table_generic::{PageTableEntry, PhysAddr, TableMeta, VirtAddr};
 pub use relocate::apply as relocate;
 
 use crate::{
-    ArchTrait, DCacheOp,
+    ArchTrait, DCacheOp, SystimerArch,
     mem::{MemAttributes, PageTableInfo, PteConfig, mmu},
     power::CpuOnError,
 };
@@ -245,8 +245,12 @@ impl ArchTrait for Arch {
         vaddr
     }
 
-    fn kernel_space() -> core::ops::Range<usize> {
-        addrspace::PAGE_OFFSET..usize::MAX
+    fn virtual_address_space()
+    -> Result<crate::mem::VirtualAddressSpaceLayout, crate::mem::VirtualAddressSpaceError> {
+        crate::mem::VirtualAddressSpaceLayout::try_new(
+            crate::mem::configured_user_space(1usize << 38),
+            addrspace::PAGE_OFFSET..usize::MAX,
+        )
     }
 
     fn is_mmu_enabled() -> bool {
@@ -301,7 +305,7 @@ impl ArchTrait for Arch {
         _secondary_entry as *const ()
     }
 
-    fn cpu_on(hartid: usize, entry: usize, arg: usize) -> Result<(), CpuOnError> {
+    fn kick_secondary_cpu(hartid: usize, entry: usize, arg: usize) -> Result<(), CpuOnError> {
         match sbi::hart_start(hartid, entry, arg) {
             Ok(()) => Ok(()),
             Err(sbi::HartStartError::AlreadyAvailable | sbi::HartStartError::AlreadyStarted) => {
@@ -316,52 +320,6 @@ impl ArchTrait for Arch {
             ))),
         }
     }
-
-    fn systimer_enable() {
-        // Only bring the timer source into a known idle state here.
-        // IRQ masking/unmasking is controlled separately by the timer core.
-        let _ = sbi::set_timer(u64::MAX);
-    }
-
-    fn systimer_irq_enable() {
-        unsafe {
-            core::arch::asm!(
-                "csrs sie, {stie}",
-                stie = in(reg) SIE_STIE,
-                options(nostack, preserves_flags)
-            );
-        }
-    }
-
-    fn systimer_irq_disable() {
-        unsafe {
-            core::arch::asm!(
-                "csrc sie, {stie}",
-                stie = in(reg) SIE_STIE,
-                options(nostack, preserves_flags)
-            );
-        }
-    }
-
-    fn systimer_irq_is_enabled() -> bool {
-        let sie: usize;
-        unsafe {
-            core::arch::asm!("csrr {sie}, sie", sie = out(reg) sie, options(nostack, preserves_flags));
-        }
-        (sie & SIE_STIE) != 0
-    }
-
-    fn systimer_set_interval(ticks: usize) {
-        let now = Self::systimer_tick() as u64;
-        let next = if ticks == usize::MAX {
-            u64::MAX
-        } else {
-            now.saturating_add(ticks as u64).max(now + 1)
-        };
-        let _ = sbi::set_timer(next);
-    }
-
-    fn systimer_ack() {}
 
     fn systimer_freq() -> usize {
         let cached = TIMEBASE_FREQ.load(Ordering::Relaxed);
@@ -418,20 +376,6 @@ impl ArchTrait for Arch {
         }
     }
 
-    fn irq_is_enabled(irq: crate::irq::IrqId) -> bool {
-        irq == irq::systimer_irq() && Self::systimer_irq_is_enabled()
-    }
-
-    fn irq_set_enable(irq: crate::irq::IrqId, enable: bool) {
-        if irq == irq::systimer_irq() {
-            if enable {
-                Self::systimer_irq_enable();
-            } else {
-                Self::systimer_irq_disable();
-            }
-        }
-    }
-
     fn dcache_range(op: DCacheOp, addr: usize, size: usize) {
         #[cfg(feature = "thead-mae")]
         {
@@ -443,9 +387,51 @@ impl ArchTrait for Arch {
             riscv_dma_fence();
         }
     }
+}
 
-    unsafe fn efi_enter_kernel(_system_table: *const ::core::ffi::c_void) -> bool {
-        false
+impl SystimerArch for Arch {
+    fn systimer_irq_id() -> crate::irq::IrqId {
+        irq::systimer_irq()
+    }
+
+    fn systimer_enable() {
+        // Only bring the timer source into a known idle state here.
+        // IRQ masking/unmasking is controlled separately by the timer core.
+        let _ = sbi::set_timer(u64::MAX);
+    }
+
+    fn systimer_irq_enable() {
+        unsafe {
+            core::arch::asm!(
+                "csrs sie, {stie}",
+                stie = in(reg) SIE_STIE,
+                options(nostack, preserves_flags)
+            );
+        }
+    }
+
+    fn systimer_irq_disable() {
+        unsafe {
+            core::arch::asm!(
+                "csrc sie, {stie}",
+                stie = in(reg) SIE_STIE,
+                options(nostack, preserves_flags)
+            );
+        }
+    }
+
+    fn systimer_irq_is_enabled() -> bool {
+        let sie: usize;
+        unsafe {
+            core::arch::asm!("csrr {sie}, sie", sie = out(reg) sie, options(nostack, preserves_flags));
+        }
+        (sie & SIE_STIE) != 0
+    }
+
+    fn systimer_set_interval(ticks: usize) {
+        let now = Self::systimer_tick() as u64;
+        let next = crate::timer::riscv64_interval::absolute_deadline(now, ticks as u64);
+        let _ = sbi::set_timer(next);
     }
 }
 

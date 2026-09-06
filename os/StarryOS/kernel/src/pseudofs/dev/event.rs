@@ -16,7 +16,6 @@ pub fn input_device_count() -> u32 {
     EVENT_DEVICE_COUNT.load(Ordering::Acquire)
 }
 
-use ax_errno::{AxError, AxResult};
 use ax_input::{
     ErasedInputDevice, Event, EventType, InputDevice, InputDeviceId, InputError,
     input_polling_fallback_should_drain,
@@ -25,19 +24,20 @@ use ax_runtime::hal::{
     irq::IrqId,
     time::{monotonic_time_nanos, wall_time},
 };
-use ax_sync::spin::SpinNoIrq as Mutex;
-use axfs_ng_vfs::{DeviceId, NodeFlags, NodeType, VfsResult};
+use axfs_ng_vfs::{DeviceId, NodeFlags, NodeType, VfsError, VfsResult};
 use axpoll::{IoEvents, PollSet, Pollable};
 use bitmaps::Bitmap;
 use linux_raw_sys::{
     general::{__kernel_old_time_t, __kernel_suseconds_t},
     ioctl::{EVIOCGID, EVIOCGRAB, EVIOCGVERSION},
 };
+use starry_vm::{VmMutPtr, vm_write_slice};
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 use crate::{
-    mm::UserPtr,
+    StarryError,
     pseudofs::{Device, DeviceOps, DirMapping, SimpleFs},
+    sync::IrqMutex as Mutex,
 };
 const KEY_CNT: usize = EventType::Key.bits_count();
 
@@ -129,7 +129,7 @@ pub struct EventDev {
     waiters: PollSet,
     /// IRQ domain id the runtime resolved for the underlying driver.
     irq: Option<IrqId>,
-    irq_handle: spin::Once<ax_runtime::hal::irq::IrqHandle>,
+    irq_handle: ax_lazyinit::OnceLock<ax_runtime::hal::irq::IrqHandle>,
     /// Monotonic timestamp (ns) of the last successful IRQ drain.
     /// When this is recent, IRQ delivery is considered healthy and the
     /// polling fallback stays at low frequency even with active waiters.
@@ -198,7 +198,7 @@ impl EventDev {
             }),
             waiters: PollSet::new(),
             irq,
-            irq_handle: spin::Once::new(),
+            irq_handle: ax_lazyinit::OnceLock::new(),
             last_irq_event: AtomicU64::new(0),
             polling_requested: AtomicBool::new(false),
             ev_bits,
@@ -215,12 +215,11 @@ impl EventDev {
         self.abs_bits[bit / 8] & (1 << (bit % 8)) != 0
     }
 
-    fn get_event_bits(&self, arg: usize, size: usize, ty: u8) -> AxResult<usize> {
+    fn get_event_bits(&self, arg: usize, size: usize, ty: u8) -> VfsResult<usize> {
         if ty == 0 {
-            let bits = UserPtr::<u8>::from(arg).get_as_mut_slice(size)?;
-            Ok(copy_bytes(self.ev_bits.as_bytes(), bits))
+            copy_to_user_bytes(arg, size, self.ev_bits.as_bytes())
         } else {
-            let ty = EventType::from_repr(ty).ok_or(AxError::InvalidInput)?;
+            let ty = EventType::from_repr(ty).ok_or(VfsError::InvalidInput)?;
             let mut kernel_bits = vec![0; size];
             {
                 let mut inner = self.inner.lock();
@@ -235,8 +234,7 @@ impl EventDev {
                 }
             }
             let bytes = size.min(ty.bits_count().div_ceil(8));
-            let bits = UserPtr::<u8>::from(arg).get_as_mut_slice(size)?;
-            bits[..bytes].copy_from_slice(&kernel_bits[..bytes]);
+            vm_write_slice(arg as *mut u8, &kernel_bits[..bytes]).map_err(StarryError::from)?;
             Ok(bytes)
         }
     }
@@ -327,7 +325,7 @@ impl EventDev {
 
     fn handle_irq(&self) -> ax_runtime::hal::irq::IrqReturn {
         // Use `lock()` rather than `try_lock()` so the virtio ISR is always
-        // acknowledged. `SpinNoIrq` guarantees the holder has local IRQs
+        // acknowledged. `IrqMutex` guarantees the holder has local IRQs
         // disabled, so this IRQ can only fire on a different CPU. Without the
         // ack, a level-triggered shared IRQ line stays asserted and can starve
         // other devices on the same line.
@@ -348,33 +346,31 @@ impl EventDev {
     }
 }
 
-fn copy_bytes(src: &[u8], dst: &mut [u8]) -> usize {
-    let len = src.len().min(dst.len());
-    dst[..len].copy_from_slice(&src[..len]);
-    len
+fn copy_to_user_bytes(arg: usize, size: usize, src: &[u8]) -> VfsResult<usize> {
+    let len = src.len().min(size);
+    vm_write_slice(arg as *mut u8, &src[..len]).map_err(StarryError::from)?;
+    Ok(len)
 }
 
-fn return_str(arg: usize, size: usize, s: &str) -> AxResult<usize> {
-    let slice = UserPtr::<u8>::from(arg).get_as_mut_slice(size)?;
-    Ok(copy_bytes(s.as_bytes(), slice))
+fn return_str(arg: usize, size: usize, s: &str) -> VfsResult<usize> {
+    copy_to_user_bytes(arg, size, s.as_bytes())
 }
 
-fn input_error_to_ax_error(err: InputError) -> AxError {
+fn input_error_to_vfs_error(err: InputError) -> VfsError {
     match err {
-        InputError::AlreadyExists => AxError::AlreadyExists,
-        InputError::Again => AxError::WouldBlock,
-        InputError::BadState => AxError::BadState,
-        InputError::InvalidInput | InputError::Unsupported => AxError::InvalidInput,
-        InputError::Io => AxError::Io,
-        InputError::NoMemory => AxError::NoMemory,
-        InputError::ResourceBusy => AxError::ResourceBusy,
+        InputError::AlreadyExists => VfsError::AlreadyExists,
+        InputError::Again => VfsError::WouldBlock,
+        InputError::BadState => VfsError::BadState,
+        InputError::InvalidInput | InputError::Unsupported => VfsError::InvalidInput,
+        InputError::Io => VfsError::Io,
+        InputError::NoMemory => VfsError::NoMemory,
+        InputError::ResourceBusy => VfsError::ResourceBusy,
     }
 }
 
-fn return_zero_bits(arg: usize, size: usize, bits: usize) -> AxResult<usize> {
-    let slice = UserPtr::<u8>::from(arg).get_as_mut_slice(size)?;
-    let len = bits.div_ceil(8).min(slice.len());
-    slice[..len].fill(0);
+fn return_zero_bits(arg: usize, size: usize, bits: usize) -> VfsResult<usize> {
+    let len = bits.div_ceil(8).min(size);
+    vm_write_slice(arg as *mut u8, &vec![0; len]).map_err(StarryError::from)?;
     Ok(len)
 }
 
@@ -406,7 +402,7 @@ impl DeviceOps for EventDev {
             return Ok(0);
         }
         if buf.len() < size_of::<InputEvent>() {
-            return Err(AxError::InvalidInput);
+            return Err(VfsError::InvalidInput);
         }
         self.request_polling();
         let mut read = 0;
@@ -431,14 +427,14 @@ impl DeviceOps for EventDev {
             read += out.len();
         }
         if read == 0 {
-            Err(AxError::WouldBlock)
+            Err(VfsError::WouldBlock)
         } else {
             Ok(read)
         }
     }
 
     fn write_at(&self, _buf: &[u8], _offset: u64) -> VfsResult<usize> {
-        Err(AxError::InvalidInput)
+        Err(VfsError::InvalidInput)
     }
 
     fn flags(&self) -> NodeFlags {
@@ -456,12 +452,16 @@ impl DeviceOps for EventDev {
     fn ioctl(&self, cmd: u32, arg: usize) -> VfsResult<usize> {
         match cmd {
             EVIOCGVERSION => {
-                *UserPtr::<u32>::from(arg).get_as_mut()? = 0x10001;
+                (arg as *mut u32)
+                    .vm_write(0x10001)
+                    .map_err(StarryError::from)?;
                 Ok(0)
             }
             EVIOCGID => {
                 let device_id = self.inner.lock().device.device_id();
-                *UserPtr::<InputDeviceId>::from(arg).get_as_mut()? = device_id;
+                (arg as *mut InputDeviceId)
+                    .vm_write(device_id)
+                    .map_err(StarryError::from)?;
                 Ok(0)
             }
             EVIOCGRAB => Ok(0),
@@ -478,12 +478,12 @@ impl DeviceOps for EventDev {
 
                 if ty != b'E' {
                     warn!("unknown ioctl for evdev: {cmd} {arg}");
-                    return Err(AxError::InvalidInput);
+                    return Err(VfsError::InvalidInput);
                 }
 
                 match dir {
                     // IOC_WRITE
-                    1 => return Err(AxError::InvalidInput),
+                    1 => return Err(VfsError::InvalidInput),
                     // IOC_READ
                     2 => {
                         #[allow(clippy::single_match)]
@@ -510,8 +510,7 @@ impl DeviceOps for EventDev {
                             // virtio-tablet; we synthesize the bit at probe
                             // for any non-touchscreen with REL/ABS axes.
                             0x09 => {
-                                let slice = UserPtr::<u8>::from(arg).get_as_mut_slice(size)?;
-                                return Ok(copy_bytes(&self.prop_bits, slice));
+                                return copy_to_user_bytes(arg, size, &self.prop_bits);
                             }
                             // EVIOCGKEY
                             0x18 => {
@@ -522,8 +521,7 @@ impl DeviceOps for EventDev {
                                     key_state.extend_from_slice(bytes);
                                     key_state
                                 };
-                                let bits = UserPtr::<u8>::from(arg).get_as_mut_slice(size)?;
-                                return Ok(copy_bytes(&key_state, bits));
+                                return copy_to_user_bytes(arg, size, &key_state);
                             }
                             // EVIOCGLED
                             0x19 => {
@@ -550,7 +548,7 @@ impl DeviceOps for EventDev {
                             // screen pixels; without it motion is treated
                             // as noise.
                             if size < size_of::<InputAbsInfo>() {
-                                return Err(AxError::InvalidInput);
+                                return Err(VfsError::InvalidInput);
                             }
                             let axis = nr & (ABS_CNT - 1);
                             // Linux's evdev returns EINVAL for any axis the
@@ -559,11 +557,11 @@ impl DeviceOps for EventDev {
                             // (size==0 selector), so without this pre-check
                             // userspace would see EIO and reject the device.
                             if !self.axis_supported(axis) {
-                                return Err(AxError::InvalidInput);
+                                return Err(VfsError::InvalidInput);
                             }
                             let info = match self.inner.lock().device.get_abs_info(axis) {
                                 Ok(info) => info,
-                                Err(err) => return Err(input_error_to_ax_error(err)),
+                                Err(err) => return Err(input_error_to_vfs_error(err)),
                             };
                             let abs = InputAbsInfo {
                                 value: 0,
@@ -574,16 +572,15 @@ impl DeviceOps for EventDev {
                                 resolution: info.res,
                             };
                             let bytes = abs.as_bytes();
-                            let slice = UserPtr::<u8>::from(arg).get_as_mut_slice(size)?;
-                            slice[..bytes.len()].copy_from_slice(bytes);
+                            vm_write_slice(arg as *mut u8, bytes).map_err(StarryError::from)?;
                             return Ok(bytes.len());
                         }
-                        return Err(AxError::InvalidInput);
+                        return Err(VfsError::InvalidInput);
                     }
                     _ => {}
                 }
 
-                Err(AxError::InvalidInput)
+                Err(VfsError::InvalidInput)
             }
         }
     }

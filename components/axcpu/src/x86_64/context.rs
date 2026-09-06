@@ -6,8 +6,10 @@ use core::{
 };
 
 use ax_memory_addr::VirtAddr;
-use cpu_local::{CurrentThreadHeader, PreparedThreadSwitch};
+use cpu_local::{ExecutionContextHeader, PreparedContextSwitch};
 
+#[cfg(feature = "uspace")]
+use crate::InstalledAddressSpace;
 use crate::{KernelTlsBase, TaskLocalState};
 
 /// Saved registers when a trap (interrupt or exception) occurs.
@@ -370,9 +372,9 @@ pub struct TaskContext {
     rsp: u64,
     /// Architecture-neutral current-header and kernel-TLS switch state.
     task_local: TaskLocalState,
-    /// The `CR3` value restored for this task's userspace address space.
+    /// Complete identity projected to `CR3` at the architecture boundary.
     #[cfg(feature = "uspace")]
-    page_table_root: ax_memory_addr::PhysAddr,
+    address_space: InstalledAddressSpace,
     /// Extended states, i.e., FP/SIMD states.
     #[cfg(feature = "fp-simd")]
     ext_state: ExtendedState,
@@ -402,7 +404,7 @@ impl TaskContext {
             rsp: 0,
             task_local: TaskLocalState::new(),
             #[cfg(feature = "uspace")]
-            page_table_root: crate::asm::read_kernel_page_table(),
+            address_space: InstalledAddressSpace::default(),
             #[cfg(feature = "fp-simd")]
             ext_state: ExtendedState::default(),
         }
@@ -430,21 +432,33 @@ impl TaskContext {
         self.task_local.set_kernel_tls(kernel_tls);
     }
 
-    /// Sets the pinned task-owned current-thread header restored by the raw
+    /// Sets the pinned task-owned execution-context header restored by the raw
     /// switch tail in LinuxCurrent images.
-    pub fn set_current_header(&mut self, header: NonNull<CurrentThreadHeader>) {
-        self.task_local.set_current_header(header);
+    pub fn set_context_header(&mut self, header: NonNull<ExecutionContextHeader>) {
+        self.task_local.set_context_header(header);
     }
 
-    /// Returns the configured task-owned current-thread header.
-    pub const fn current_header(&self) -> Option<NonNull<CurrentThreadHeader>> {
-        self.task_local.current_header()
+    /// Returns the configured task-owned execution-context header.
+    pub const fn context_header(&self) -> Option<NonNull<ExecutionContextHeader>> {
+        self.task_local.context_header()
     }
 
-    /// Changes the page table root restored for this task.
+    /// Changes the complete address space restored for this task.
     #[cfg(feature = "uspace")]
-    pub fn set_page_table_root(&mut self, page_table_root: ax_memory_addr::PhysAddr) {
-        self.page_table_root = page_table_root;
+    pub fn set_address_space(&mut self, address_space: InstalledAddressSpace) {
+        self.address_space = address_space;
+    }
+
+    /// Writes this context's materialized userspace root immediately.
+    ///
+    /// # Safety
+    ///
+    /// The caller must own the current CPU context and prevent a concurrent
+    /// scheduler switch while the hardware root is being replaced.
+    #[cfg(feature = "uspace")]
+    pub unsafe fn activate_address_space(&self) {
+        self.address_space.validate_architecture_support();
+        unsafe { crate::asm::install_user_address_space(self.address_space) };
     }
 
     /// Completes every helper operation that must precede current publication.
@@ -455,14 +469,14 @@ impl TaskContext {
             _next_ctx.ext_state.restore();
         }
         #[cfg(feature = "uspace")]
-        if self.page_table_root != _next_ctx.page_table_root {
+        if self.address_space != _next_ctx.address_space {
+            _next_ctx.address_space.validate_architecture_support();
             // SAFETY: the scheduler owns both contexts with IRQs disabled.
-            unsafe { crate::asm::write_user_page_table(_next_ctx.page_table_root) };
-            // Writing CR3 flushes the non-global TLB entries.
+            unsafe { crate::asm::install_user_address_space(_next_ctx.address_space) };
         }
     }
 
-    /// Commits current-thread publication and performs the raw transfer.
+    /// Commits current-context publication and performs the raw transfer.
     ///
     /// # Safety
     ///
@@ -473,10 +487,10 @@ impl TaskContext {
     pub unsafe fn switch_to_prepared(
         &mut self,
         next_ctx: &Self,
-        prepared: PreparedThreadSwitch<'_>,
+        prepared: PreparedContextSwitch<'_>,
     ) {
         assert_eq!(
-            next_ctx.current_header(),
+            next_ctx.context_header(),
             Some(prepared.next_header()),
             "prepared switch token must belong to the next task context",
         );
