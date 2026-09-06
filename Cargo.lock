@@ -348,7 +348,6 @@ dependencies = [
  "ax-sync",
  "axklib",
  "cfg-if",
- "chrono",
  "object 0.38.1",
  "rdrive",
  "sbi-rt",
