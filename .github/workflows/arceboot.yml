@@ -42,7 +42,8 @@ jobs:
           targets: riscv64gc-unknown-none-elf
 
       - name: Add llvm-tools to PATH
-        run: echo "$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/^host: //p')/bin" >> "$GITHUB_PATH"
+        run: |
+          echo "$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/^host: //p')/bin" >> "$GITHUB_PATH"
 
       - name: Check format
         run: cargo fmt --check -p arceboot
@@ -90,7 +91,8 @@ jobs:
           targets: riscv64gc-unknown-none-elf
 
       - name: Add llvm-tools to PATH
-        run: echo "$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/^host: //p')/bin" >> "$GITHUB_PATH"
+        run: |
+          echo "$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/^host: //p')/bin" >> "$GITHUB_PATH"
 
       - name: Install test dependencies
         run: |

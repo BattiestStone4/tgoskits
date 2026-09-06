@@ -87,7 +87,7 @@ impl ax_sync::interface::RwLockOps for BootRwLockOps {
         let acquired = if mode == LOCK_MODE_READ {
             // Increment the reader count unless a writer holds the lock.
             loop {
-                let cur = state.load(Ordering::Relaxed);
+                let cur = state.load(Ordering::Acquire);
                 if cur == RW_WRITE_LOCKED {
                     if is_try {
                         break false;
