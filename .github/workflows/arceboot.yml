@@ -37,6 +37,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: nightly-2026-07-15
           components: rustfmt, clippy, rust-src, llvm-tools
           targets: riscv64gc-unknown-none-elf
 
@@ -81,6 +82,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: nightly-2026-07-15
           components: rust-src, llvm-tools
           targets: riscv64gc-unknown-none-elf
 
