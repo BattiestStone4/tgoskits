@@ -19,10 +19,6 @@ default = ["alloc", "paging", "ramdisk_cpio"]
 
 alloc = ["dep:ax-alloc"]
 paging = ["ax-hal/paging", "dep:ax-mm"]
-
-# Filesystem-backed boot media. Not ported to the tgoskits driver stack yet:
-# it needs a virtio-blk rdif driver plus an ax-fs-ng runtime adapter.
-fs = []
 net = ["dep:ax-driver", "dep:ax-net", "dep:rdrive", "ax-driver/net"]
 display = ["dep:ax-driver", "dep:ax-display", "dep:rdrive", "ax-driver/display"]
 

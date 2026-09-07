@@ -12,10 +12,7 @@ const SPACE: u8 = b' ';
 const MAX_CMD_LEN: usize = 256;
 
 fn print_prompt() {
-    // Without the `fs` feature the shell only sees the ramdisk root.
-    #[cfg(feature = "fs")]
-    let dir = crate::medium::virtio_disk::current_dir().unwrap();
-    #[cfg(not(feature = "fs"))]
+    // The shell only sees the ramdisk root until storage media are supported.
     let dir: alloc::string::String = "/".into();
     ax_log::ax_print!("[Arceboot]: {}$ ", dir);
 }

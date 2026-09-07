@@ -5,8 +5,6 @@ use alloc::{
 use core::str;
 
 use ax_hal::mem::phys_to_virt;
-#[cfg(feature = "fs")]
-use ax_hal::mem::{PhysAddr, VirtAddr, virt_to_phys};
 use ax_io::{self as io};
 
 const CPIO_MAGIC: &[u8; 6] = b"070701";
@@ -159,35 +157,6 @@ fn ramdisk_enabled() -> bool {
     crate::config::boot::use_ramdisk()
 }
 
-fn ramdisk_load_enabled() -> bool {
-    #[cfg(feature = "fs")]
-    {
-        crate::config::boot::load_ramdisk()
-    }
-    #[cfg(not(feature = "fs"))]
-    {
-        false
-    }
-}
-
-#[cfg(feature = "fs")]
-fn do_load_ramdisk() -> Option<(usize, usize)> {
-    let file_data = crate::medium::virtio_disk::read(crate::config::boot::ramdisk_file()).unwrap();
-    let file_size = file_data.len();
-
-    let start_addr = ax_alloc::global_allocator()
-        .alloc_pages(file_size / 4096 + 1, 4096, ax_alloc::UsageKind::RustHeap)
-        .unwrap();
-    unsafe {
-        core::ptr::copy_nonoverlapping(file_data.as_ptr(), start_addr as *mut u8, file_size);
-    }
-    debug!(
-        "Ramdisk will be load to {:#x}, size is {:#x}",
-        start_addr, file_size
-    );
-    Some((start_addr, file_size))
-}
-
 fn enable_dtb_ramdisk(addr: usize, size: usize) {
     unsafe {
         let mut parser = crate::dtb::DtbParser::new(crate::dtb::GLOBAL_NOW_DTB_ADDRESS).unwrap();
@@ -213,29 +182,10 @@ pub fn check_ramdisk() {
     info!("Checking ramdisk.....");
     // Check the detailed annotations and explanations in configs/platforms/riscv64-qemu-virt.toml
     if crate::medium::ramdisk_cpio::ramdisk_enabled() {
-        let (start_addr_phys, size) = if crate::medium::ramdisk_cpio::ramdisk_load_enabled() {
-            #[cfg(feature = "fs")]
-            {
-                match crate::medium::ramdisk_cpio::do_load_ramdisk() {
-                    Some((addr, si)) => (virt_to_phys(VirtAddr::from_usize(addr)).as_usize(), si),
-                    None => {
-                        error!("Load ramdisk failed!");
-                        return;
-                    }
-                }
-            }
-            #[cfg(not(feature = "fs"))]
-            {
-                // Unreachable: `ramdisk_load_enabled()` is always false
-                // without the `fs` feature.
-                (0, 0)
-            }
-        } else {
-            (
-                crate::config::boot::ramdisk_start(),
-                crate::config::boot::ramdisk_size(),
-            )
-        };
+        let (start_addr_phys, size) = (
+            crate::config::boot::ramdisk_start(),
+            crate::config::boot::ramdisk_size(),
+        );
 
         crate::medium::ramdisk_cpio::set_ramdisk_addr(start_addr_phys);
         crate::medium::ramdisk_cpio::enable_dtb_ramdisk(start_addr_phys, size);

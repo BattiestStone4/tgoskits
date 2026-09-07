@@ -2,12 +2,6 @@
 #![no_main]
 #![allow(dead_code)]
 
-#[cfg(feature = "fs")]
-compile_error!(
-    "arceboot `fs` feature is not ported to tgoskits yet: it needs a virtio-blk rdif driver plus \
-     an ax-fs-ng runtime adapter"
-);
-
 #[macro_use]
 extern crate ax_log;
 extern crate alloc;

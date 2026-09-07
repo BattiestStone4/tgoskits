@@ -32,8 +32,6 @@ Build-time configuration is passed through environment variables (see
 | Variable | Meaning | Default |
 |---|---|---|
 | `AX_USE_RAMDISK` | Enable ramdisk support (`1`) | off |
-| `AX_LOAD_RAMDISK` | Load the ramdisk from storage (`1`, needs the `fs` feature) | off |
-| `AX_RAMDISK_FILE` | Ramdisk file path (only with `AX_LOAD_RAMDISK`) | `/ramdisk.cpio` |
 | `AX_RAMDISK_START` | Physical start of a pre-loaded ramdisk (hex) | `0x84000000` |
 | `AX_RAMDISK_SIZE` | Pre-loaded ramdisk size in bytes (hex) | `0x40000000` |
 | `SOMEBOOT_RISCV64_KERNEL_LOAD_PADDR` | riscv64 load address | `0x80200000` |
@@ -47,12 +45,11 @@ Build-time configuration is passed through environment variables (see
 | `ramdisk_cpio` | Working |
 | `net` | Compiles; boot-time IRQ handling is not wired yet |
 | `display` | Compiles; boot-time IRQ handling is not wired yet |
-| `fs` / `virtiodisk` | **Not ported yet.** The upstream code used the legacy
-`axdriver`/`axfs` stack (`axfs::api::*`, virtio-blk via `axdriver`). tgoskits
-replaced that with the `rdrive` driver registry and `ax-fs-ng`, and has no
-virtio-blk rdif driver. Enabling `fs` hits an explicit `compile_error!`.
-Porting it requires a virtio-blk rdif driver plus an `ax-fs-ng` runtime
-adapter (the `axruntime/src/fs/block.rs` glue is the reference). |
+| `fs` / `virtiodisk` | Removed with the migration; the upstream code used the
+legacy `axdriver`/`axfs` stack. Porting it back requires a virtio-blk rdif
+driver plus an `ax-fs-ng` runtime adapter (the `axruntime/src/fs/block.rs`
+glue is the reference). The original code is preserved in the imported
+history and in the rustsbi repository. |
 
 ## Porting notes (rustsbi -> tgoskits)
 

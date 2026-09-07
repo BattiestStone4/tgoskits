@@ -13,21 +13,7 @@ pub mod boot {
         matches!(option_env!("AX_USE_RAMDISK"), Some("1"))
     }
 
-    /// Whether ArceBoot needs to load the ramdisk from a storage medium.
-    ///
-    /// Not supported yet in the tgoskits port (requires the `fs`/virtio-blk
-    /// path), so this must stay `false`.
-    pub fn load_ramdisk() -> bool {
-        matches!(option_env!("AX_LOAD_RAMDISK"), Some("1"))
-    }
-
-    /// Ramdisk file path, used only when [`load_ramdisk`] is set.
-    pub fn ramdisk_file() -> &'static str {
-        option_env!("AX_RAMDISK_FILE").unwrap_or("/ramdisk.cpio")
-    }
-
-    /// Physical start address of a pre-loaded ramdisk (used when
-    /// `use_ramdisk && !load_ramdisk`).
+    /// Physical start address of a pre-loaded ramdisk.
     pub fn ramdisk_start() -> usize {
         option_env!("AX_RAMDISK_START")
             .and_then(parse_hex)
