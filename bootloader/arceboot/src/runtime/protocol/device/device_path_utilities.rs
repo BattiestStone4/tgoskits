@@ -35,9 +35,14 @@ unsafe fn get_node_subtype(protocol: *const DevicePathProtocol) -> u8 {
 }
 #[inline]
 unsafe fn get_node_length_u16(protocol: *const DevicePathProtocol) -> u16 {
-    // Little-endian 2 bytes at offset 2
-    // equivalent to read_unaligned((b+2) as *const u16)
-    unsafe { *(protocol as *const u16).add(1) }
+    // Device path nodes are byte-packed, so the node address is not
+    // guaranteed to be u16-aligned; read the 2-byte little-endian length at
+    // offset 2 unaligned and explicitly little-endian.
+    unsafe {
+        u16::from_le(ptr::read_unaligned(
+            (protocol as *const u8).add(2) as *const u16
+        ))
+    }
 }
 #[inline]
 unsafe fn get_node_length(protocol: *const DevicePathProtocol) -> usize {

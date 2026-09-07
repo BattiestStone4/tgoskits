@@ -47,9 +47,35 @@ pub fn alloc_pages(_alloc_type: AllocateType, _memory_type: MemoryType, count: u
     }
 }
 
-pub fn free_pages(_addr: PhysAddr, _page: usize) {
-    // The EFI page mappings are single-shot allocations in a bootloader; the
-    // UEFI `FreePages` service is intentionally a no-op here.
+/// Releases a page allocation obtained from [`alloc_pages`].
+///
+/// Returns `false` if the address does not match a tracked allocation.
+#[cfg(feature = "paging")]
+pub fn free_pages(addr: PhysAddr, _page: usize) -> bool {
+    // The UEFI spec wants `AllocatePages` to report a physical address, but
+    // ArceBoot keeps its page tables active for the payload and hands out the
+    // mapping's virtual address so the payload can use it directly. Match
+    // that same value back against the tracked allocations here.
+    // Identity-mapping the allocations and reporting true physical addresses
+    // is future work (the same caveat as the GOP FrameBufferBase).
+    let va = VirtAddr::from_usize(addr.as_usize());
+    let mut pages = ALLOCATED_PAGES.lock();
+    let Some(idx) = pages.iter().position(|(v, _)| *v == va) else {
+        return false;
+    };
+    let (_, size) = pages.swap_remove(idx);
+    drop(pages);
+    ax_mm::kernel_aspace()
+        .lock()
+        .unmap(va, size)
+        .inspect_err(|e| error!("failed to unmap EFI pages at {:#x}: {:?}", va.as_usize(), e))
+        .is_ok()
+}
+
+/// Without the paging stack there are no tracked page allocations to free.
+#[cfg(not(feature = "paging"))]
+pub fn free_pages(_addr: PhysAddr, _page: usize) -> bool {
+    false
 }
 
 pub fn allocate_pool(_memory_type: MemoryType, size: usize) -> *mut u8 {

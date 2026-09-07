@@ -13,6 +13,9 @@ impl core::fmt::Write for SbiConsoleWriter {
     }
 }
 
+// Host-side unit tests link against std, which provides its own panic
+// handler.
+#[cfg(not(test))]
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     // Print through the SBI console directly: the panic may fire before

@@ -77,9 +77,17 @@ pub extern "efiapi" fn output_string(
     _this: *mut SimpleTextOutputProtocol,
     string: *const u16,
 ) -> Status {
+    // Bound the scan like `test_string`: the string is caller-owned memory,
+    // so a missing terminator must not make the firmware walk arbitrary
+    // memory. A string longer than the cap is truncated.
+    const MAX_OUTPUT_CHARS: usize = 1024;
+
+    if string.is_null() {
+        return Status::INVALID_PARAMETER;
+    }
     unsafe {
         let mut len = 0;
-        while *string.add(len) != 0 {
+        while len < MAX_OUTPUT_CHARS && *string.add(len) != 0 {
             len += 1;
         }
         let message = core::slice::from_raw_parts(string, len).iter();

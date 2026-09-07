@@ -103,19 +103,29 @@ pub unsafe extern "efiapi" fn allocate_pages(
     count: usize,
     addr: *mut PhysicalAddress,
 ) -> Status {
+    if addr.is_null() {
+        return Status::INVALID_PARAMETER;
+    }
     let ptr = crate::runtime::service::memory::alloc_pages(alloc_ty, mem_ty, count);
     if ptr.is_null() {
         return Status::OUT_OF_RESOURCES;
     }
 
+    // The value handed out is the mapping's virtual address; see the note
+    // in `memory::free_pages` about the deferred physical-address contract.
     unsafe { *addr = ptr as u64 };
     Status::SUCCESS
 }
 pub unsafe extern "efiapi" fn free_pages(addr: PhysicalAddress, pages: usize) -> Status {
-    let phys_addr = PhysAddr::from_usize(addr.try_into().unwrap());
-    crate::runtime::service::memory::free_pages(phys_addr, pages);
-
-    Status::SUCCESS
+    let Ok(addr) = usize::try_from(addr) else {
+        return Status::INVALID_PARAMETER;
+    };
+    let phys_addr = PhysAddr::from_usize(addr);
+    if crate::runtime::service::memory::free_pages(phys_addr, pages) {
+        Status::SUCCESS
+    } else {
+        Status::NOT_FOUND
+    }
 }
 pub unsafe extern "efiapi" fn get_memory_map(
     _size: *mut usize,
