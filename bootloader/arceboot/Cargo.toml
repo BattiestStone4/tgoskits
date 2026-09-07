@@ -17,13 +17,25 @@ targets = ["riscv64gc-unknown-none-elf"]
 [features]
 default = ["alloc", "paging", "ramdisk_cpio"]
 
+# Features are additive on a common base: `paging` needs the allocator, the
+# device subsystems need the full mapping base, and the ramdisk medium needs
+# the allocator for its parsers. The per-feature clippy gate compiles each
+# feature standalone, so these dependencies must reflect what the gated code
+# actually requires.
 alloc = ["dep:ax-alloc"]
-paging = ["ax-hal/paging", "dep:ax-mm"]
-net = ["dep:ax-driver", "dep:ax-net", "dep:rdrive", "ax-driver/net"]
-display = ["dep:ax-driver", "dep:ax-display", "dep:rdrive", "ax-driver/display"]
+paging = ["alloc", "ax-hal/paging", "dep:ax-mm"]
+net = ["alloc", "paging", "dep:ax-driver", "dep:rdrive", "ax-driver/net"]
+display = [
+    "alloc",
+    "paging",
+    "dep:ax-driver",
+    "dep:ax-display",
+    "dep:rdrive",
+    "ax-driver/display",
+]
 
 # Boot Media
-ramdisk_cpio = []
+ramdisk_cpio = ["alloc"]
 
 [dependencies]
 ax-hal = { workspace = true }
@@ -32,7 +44,6 @@ ax-sync = { workspace = true, features = ["sleep"] }
 ax-alloc = { workspace = true, optional = true }
 ax-mm = { workspace = true, optional = true }
 ax-driver = { workspace = true, optional = true }
-ax-net = { workspace = true, optional = true }
 ax-display = { workspace = true, optional = true }
 ax-plat = { workspace = true }
 ax-io = { workspace = true, features = ["alloc"] }

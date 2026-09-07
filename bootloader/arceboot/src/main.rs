@@ -10,6 +10,7 @@ use ax_hal::mem::{MemRegionFlags, PhysAddr, memory_regions, phys_to_virt};
 
 mod config;
 mod dtb;
+#[cfg(feature = "paging")]
 mod klib;
 mod log;
 mod medium;
@@ -93,19 +94,20 @@ fn init_devices() {
 
 #[cfg(feature = "net")]
 fn init_net() {
-    use alloc::vec::Vec;
-    let mut nics: Vec<alloc::boxed::Box<dyn ax_net::EthernetDriver>> = Vec::new();
-    for dev in rdrive::get_list::<ax_driver::net::PlatformNetDevice>() {
-        let (net, name, irq) = ax_driver::net::take_rd_net_device(dev)
-            .unwrap_or_else(|err| panic!("failed to open net device: {err:?}"));
-        if irq.is_some() {
-            warn!("net device {name} has an IRQ binding but ArceBoot runs without IRQ support");
-        }
-        let driver = ax_net::RdNetDriver::new(name, net, None)
-            .unwrap_or_else(|err| panic!("failed to adapt net device: {err:?}"));
-        nics.push(alloc::boxed::Box::new(driver));
+    // The ax-net queue runtime needs IRQ-driven executors, which a bootloader
+    // without interrupt support cannot provide. Only report the probed
+    // devices here; bringing the network stack up for netboot is future work.
+    let devices = rdrive::get_list::<ax_driver::net::PlatformNetDevice>();
+    if devices.is_empty() {
+        info!("no net devices were probed");
+        return;
     }
-    ax_net::init_network(nics, Default::default());
+    for dev in devices {
+        info!(
+            "net device {} probed; the network stack is not wired up in ArceBoot yet",
+            dev.descriptor().name
+        );
+    }
 }
 
 #[cfg(feature = "display")]
