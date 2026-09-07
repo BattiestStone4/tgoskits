@@ -35,9 +35,10 @@ display = [
 ]
 
 # Boot Media
-ramdisk_cpio = ["alloc"]
+ramdisk_cpio = ["alloc", "dep:arceboot-cpio"]
 
 [dependencies]
+arceboot-cpio = { path = "cpio", optional = true }
 ax-hal = { workspace = true }
 ax-log = { workspace = true }
 ax-sync = { workspace = true, features = ["sleep"] }

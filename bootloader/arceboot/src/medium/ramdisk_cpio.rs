@@ -1,42 +1,39 @@
-use alloc::{
-    string::{String, ToString},
-    vec::Vec,
-};
+use alloc::string::{String, ToString};
 use core::str;
 
+use arceboot_cpio as cpio;
 use ax_hal::mem::phys_to_virt;
 use ax_io::{self as io};
 
-const CPIO_MAGIC: &[u8; 6] = b"070701";
+/// Physical address of the pre-loaded ramdisk (0 = disabled).
 pub static mut CPIO_BASE: usize = 0x0;
+/// Length of the ramdisk archive in bytes. While scanning this is the
+/// (clamped) upper bound; after [`init_ramdisk`] it is the archive's real
+/// length as derived from the trailer record.
+static mut CPIO_LEN: usize = 0;
 
-#[repr(C)]
-#[derive(Debug)]
-struct CpioNewcHeader {
-    c_magic: [u8; 6],
-    c_ino: [u8; 8],
-    c_mode: [u8; 8],
-    c_uid: [u8; 8],
-    c_gid: [u8; 8],
-    c_nlink: [u8; 8],
-    c_mtime: [u8; 8],
-    c_filesize: [u8; 8],
-    c_devmajor: [u8; 8],
-    c_devminor: [u8; 8],
-    c_rdevmajor: [u8; 8],
-    c_rdevminor: [u8; 8],
-    c_namesize: [u8; 8],
-    c_check: [u8; 8],
+fn truncated() -> io::Error {
+    ax_log::error!("ramdisk archive is truncated or malformed");
+    io::Error::UnexpectedEof
 }
 
-fn parse_hex_field(field: &[u8]) -> usize {
-    // 将ASCII十六进制转换为数字
-    let s = core::str::from_utf8(field).unwrap_or("0");
-    usize::from_str_radix(s, 16).unwrap_or(0)
+/// Maps a [`cpio::Error`] to an [`io::Error`].
+fn map_cpio_error(e: cpio::Error) -> io::Error {
+    match e {
+        cpio::Error::Truncated => truncated(),
+        cpio::Error::Invalid => io::Error::InvalidData,
+    }
 }
 
-fn align_up(addr: usize, align: usize) -> usize {
-    (addr + align - 1) & !(align - 1)
+/// The enabled ramdisk archive as a byte slice, if any.
+fn ramdisk_archive() -> io::Result<&'static [u8]> {
+    let (base, len) = unsafe { (CPIO_BASE, CPIO_LEN) };
+    if base == 0 {
+        error!("Ramdisk is not enabled!");
+        return Err(io::Error::Unsupported);
+    }
+    // Safety: the ramdisk stays mapped for the lifetime of the bootloader.
+    Ok(unsafe { core::slice::from_raw_parts(phys_to_virt(base.into()).as_ptr(), len) })
 }
 
 /// Returns the current working directory as a [`String`].
@@ -45,116 +42,75 @@ pub fn current_dir() -> io::Result<String> {
 }
 
 /// Read the entire contents of a file into a bytes vector.
-pub fn read(path: &str) -> io::Result<Vec<u8>> {
-    if unsafe { CPIO_BASE } == 0 {
-        error!("Ramdisk is not enabled!");
-        return core::prelude::v1::Err(io::Error::Unsupported);
+pub fn read(path: &str) -> io::Result<alloc::vec::Vec<u8>> {
+    let archive = ramdisk_archive()?;
+    match cpio::find_entry(archive, path) {
+        Ok(Some(data)) => Ok(data.to_vec()),
+        Ok(None) => Err(io::Error::NotFound),
+        Err(e) => Err(map_cpio_error(e)),
     }
-
-    let mut ptr = phys_to_virt(unsafe { CPIO_BASE.into() }).as_usize();
-
-    loop {
-        let hdr = unsafe { &*(ptr as *const CpioNewcHeader) };
-
-        if &hdr.c_magic != CPIO_MAGIC {
-            break;
-        }
-
-        let namesize = parse_hex_field(&hdr.c_namesize);
-        let filesize = parse_hex_field(&hdr.c_filesize);
-
-        let name_ptr = ptr + core::mem::size_of::<CpioNewcHeader>();
-        let name = unsafe {
-            let slice = core::slice::from_raw_parts(name_ptr as *const u8, namesize - 1);
-            str::from_utf8(slice).unwrap_or("<invalid utf8>")
-        };
-
-        if name == "TRAILER!!!" {
-            break;
-        }
-
-        let file_start = align_up(name_ptr + namesize, 4);
-        let file_end = file_start + filesize;
-
-        let is_match = if path.starts_with('/') {
-            &path[1..] == name
-        } else {
-            path == name
-        };
-
-        if is_match {
-            let data = unsafe { core::slice::from_raw_parts(file_start as *const u8, filesize) };
-            let mut bytes = Vec::with_capacity(filesize as usize);
-            bytes.extend_from_slice(data);
-            return Ok(bytes);
-        }
-
-        ptr = align_up(file_end, 4);
-    }
-
-    core::prelude::v1::Err(io::Error::NotFound)
 }
 
 /// Read the entire contents of a file into a string.
 pub fn read_to_string(path: &str) -> io::Result<String> {
-    if unsafe { CPIO_BASE } == 0 {
-        error!("Ramdisk is not enabled!");
-        return core::prelude::v1::Err(io::Error::Unsupported);
-    }
-
-    let mut ptr = phys_to_virt(unsafe { CPIO_BASE.into() }).as_usize();
-
-    loop {
-        let hdr = unsafe { &*(ptr as *const CpioNewcHeader) };
-
-        if &hdr.c_magic != CPIO_MAGIC {
-            break;
-        }
-
-        let namesize = parse_hex_field(&hdr.c_namesize);
-        let filesize = parse_hex_field(&hdr.c_filesize);
-
-        let name_ptr = ptr + core::mem::size_of::<CpioNewcHeader>();
-        let name = unsafe {
-            let slice = core::slice::from_raw_parts(name_ptr as *const u8, namesize - 1);
-            str::from_utf8(slice).unwrap_or("<invalid utf8>")
-        };
-
-        if name == "TRAILER!!!" {
-            break;
-        }
-
-        let file_start = align_up(name_ptr + namesize, 4);
-        let file_end = file_start + filesize;
-
-        let is_match = if path.starts_with('/') {
-            &path[1..] == name
-        } else {
-            path == name
-        };
-
-        if is_match {
-            let data = unsafe {
-                let slice = core::slice::from_raw_parts(file_start as *const u8, filesize);
-                str::from_utf8(slice).unwrap_or("<invalid utf8>")
-            };
-            return Ok(data.to_string());
-        }
-
-        ptr = align_up(file_end, 4);
-    }
-
-    core::prelude::v1::Err(io::Error::NotFound)
-}
-
-fn set_ramdisk_addr(addr: usize) {
-    unsafe {
-        CPIO_BASE = addr;
+    let archive = ramdisk_archive()?;
+    match cpio::find_entry(archive, path) {
+        Ok(Some(data)) => Ok(str::from_utf8(data).unwrap_or("<invalid utf8>").to_string()),
+        Ok(None) => Err(io::Error::NotFound),
+        Err(e) => Err(map_cpio_error(e)),
     }
 }
 
 fn ramdisk_enabled() -> bool {
     crate::config::boot::use_ramdisk()
+}
+
+/// Clamps the configured upper bound to the memory region containing the
+/// ramdisk, so a wrong `AX_RAMDISK_SIZE` cannot make the archive scan walk
+/// past actual RAM.
+fn clamp_to_memory_region(start: usize, bound: usize) -> io::Result<usize> {
+    for region in ax_hal::mem::memory_regions() {
+        let region_start = region.paddr.as_usize();
+        let region_end = region_start + region.size;
+        if region_start <= start && start < region_end {
+            return Ok(bound.min(region_end - start));
+        }
+    }
+    error!("ramdisk start {:#x} is not inside any memory region", start);
+    Err(io::Error::InvalidData)
+}
+
+/// Initializes the ramdisk from a pre-loaded archive: clamps the configured
+/// bound to RAM, walks the archive to derive its real length (bounded by the
+/// clamped `upper_bound`), and leaves the ramdisk disabled on any error.
+///
+/// Returns the archive's real length, which is what the DTB
+/// `linux,initrd-end` property must be computed from.
+pub fn init_ramdisk(start: usize, upper_bound: usize) -> io::Result<usize> {
+    let bound = clamp_to_memory_region(start, upper_bound)?;
+    unsafe {
+        CPIO_BASE = start;
+        CPIO_LEN = bound;
+    }
+    // Safety: the ramdisk is pre-loaded by the platform (or the QEMU
+    // `-device loader`) into the physical range we just clamped to RAM.
+    let archive =
+        unsafe { core::slice::from_raw_parts(phys_to_virt(start.into()).as_ptr(), bound) };
+    match cpio::walk_archive(archive, |_, _| false) {
+        Ok(total) => {
+            unsafe { CPIO_LEN = total };
+            Ok(total)
+        }
+        Err(e) => {
+            // Leave the ramdisk disabled: a broken archive must not be
+            // readable through the EFI file path either.
+            unsafe {
+                CPIO_BASE = 0;
+                CPIO_LEN = 0;
+            }
+            Err(map_cpio_error(e))
+        }
+    }
 }
 
 fn enable_dtb_ramdisk(addr: usize, size: usize) {
@@ -181,18 +137,23 @@ fn enable_dtb_ramdisk(addr: usize, size: usize) {
 pub fn check_ramdisk() {
     info!("Checking ramdisk.....");
     // Check the detailed annotations and explanations in configs/platforms/riscv64-qemu-virt.toml
-    if crate::medium::ramdisk_cpio::ramdisk_enabled() {
-        let (start_addr_phys, size) = (
-            crate::config::boot::ramdisk_start(),
-            crate::config::boot::ramdisk_size(),
-        );
+    if ramdisk_enabled() {
+        let start = crate::config::boot::ramdisk_start();
+        let bound = crate::config::boot::ramdisk_size();
 
-        crate::medium::ramdisk_cpio::set_ramdisk_addr(start_addr_phys);
-        crate::medium::ramdisk_cpio::enable_dtb_ramdisk(start_addr_phys, size);
-        info!(
-            "read test file context: {}",
-            crate::medium::ramdisk_cpio::read_to_string("/test/arceboot.txt").unwrap()
-        );
+        match init_ramdisk(start, bound) {
+            Ok(total) => {
+                info!("Ramdisk at {:#x}, archive length: {:#x}", start, total);
+                enable_dtb_ramdisk(start, total);
+            }
+            Err(e) => error!("Ramdisk init failed ({e:?}); ramdisk is disabled"),
+        }
+
+        // Best-effort probe of the test file; its absence is not fatal.
+        match read_to_string("/test/arceboot.txt") {
+            Ok(text) => info!("read test file context: {}", text),
+            Err(e) => warn!("read test file failed: {:?}", e),
+        }
     }
     info!("Checking for ramdisk is done!");
 }

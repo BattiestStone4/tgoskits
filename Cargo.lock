@@ -332,6 +332,7 @@ dependencies = [
 name = "arceboot"
 version = "0.0.1"
 dependencies = [
+ "arceboot-cpio",
  "ax-alloc",
  "ax-crate-interface",
  "ax-ctor-bare",
@@ -352,6 +353,10 @@ dependencies = [
  "sbi-rt",
  "uefi-raw",
 ]
+
+[[package]]
+name = "arceboot-cpio"
+version = "0.1.0"
 
 [[package]]
 name = "arceos-arce_agent"
