@@ -15,7 +15,16 @@ pub struct PeMeta {
 }
 
 pub fn load_efi_file(path: &str) -> alloc::vec::Vec<u8> {
-    crate::medium::ramdisk_cpio::read(path).expect("Failed to read EFI file from ramdisk")
+    #[cfg(feature = "ramdisk_cpio")]
+    return crate::medium::ramdisk_cpio::read(path).expect("Failed to read EFI file from ramdisk");
+
+    // Without a boot medium there is nothing to load; only reachable when the
+    // crate is built with none of the medium features enabled.
+    #[cfg(not(feature = "ramdisk_cpio"))]
+    {
+        let _ = path;
+        panic!("no boot medium is compiled in (enable the `ramdisk_cpio` feature)");
+    }
 }
 
 pub fn parse_efi_file(data: &[u8]) -> File<'_> {

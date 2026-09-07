@@ -343,7 +343,6 @@ dependencies = [
  "ax-log",
  "ax-memory-addr",
  "ax-mm",
- "ax-net",
  "ax-plat",
  "ax-sync",
  "axklib",

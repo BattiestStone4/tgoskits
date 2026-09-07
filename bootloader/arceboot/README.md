@@ -43,7 +43,7 @@ Build-time configuration is passed through environment variables (see
 | `alloc` | Working |
 | `paging` | Working |
 | `ramdisk_cpio` | Working |
-| `net` | Compiles; boot-time IRQ handling is not wired yet |
+| `net` | Device probing only; the ax-net queue runtime needs IRQ-driven executors, which a bootloader without interrupt support cannot provide |
 | `display` | Compiles; boot-time IRQ handling is not wired yet |
 | `fs` / `virtiodisk` | Removed with the migration; the upstream code used the
 legacy `axdriver`/`axfs` stack. Porting it back requires a virtio-blk rdif

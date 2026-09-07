@@ -1,38 +1,50 @@
 use alloc::vec::Vec;
 
-use ax_hal::{
-    mem::{PhysAddr, VirtAddr},
-    paging::MappingFlags,
-};
+use ax_hal::mem::PhysAddr;
+#[cfg(feature = "paging")]
+use ax_hal::{mem::VirtAddr, paging::MappingFlags};
+#[cfg(feature = "paging")]
 use ax_memory_addr::VirtAddrRange;
 use ax_sync::Mutex;
 use uefi_raw::table::boot::{AllocateType, MemoryType};
 
+#[cfg(feature = "paging")]
 static ALLOCATED_PAGES: Mutex<Vec<(VirtAddr, usize)>> = Mutex::new(Vec::new());
 static ALLOCATED_POOLS: Mutex<Vec<(usize, core::alloc::Layout)>> = Mutex::new(Vec::new());
 
 pub fn alloc_pages(_alloc_type: AllocateType, _memory_type: MemoryType, count: usize) -> *mut u8 {
-    let size = count * 4096;
-    let mut aspace = ax_mm::kernel_aspace().lock();
-    // Map a fresh RWX region above the RAM linear-mapping window instead of
-    // `protect`ing heap pages: protecting a range that shares a 2 MiB linear
-    // mapping with the page tables themselves faults while the split is in
-    // flight (the physical pages backing the PTE writes become unmapped).
-    let hint = VirtAddr::from_usize(0x9000_0000);
-    let limit = VirtAddrRange::from_start_size(VirtAddr::from_usize(0), usize::MAX);
-    let va = aspace
-        .find_free_area(hint, size, limit)
-        .expect("no free VA for EFI pages");
-    aspace
-        .map_alloc(
-            va,
-            size,
-            MappingFlags::READ | MappingFlags::WRITE | MappingFlags::EXECUTE,
-            true,
-        )
-        .expect("failed to map EFI pages");
-    ALLOCATED_PAGES.lock().push((va, size));
-    va.as_mut_ptr()
+    // Mapping EFI pages requires the paging stack; without it the service is
+    // simply unavailable.
+    #[cfg(not(feature = "paging"))]
+    {
+        let _ = count;
+        core::ptr::null_mut()
+    }
+
+    #[cfg(feature = "paging")]
+    {
+        let size = count * 4096;
+        let mut aspace = ax_mm::kernel_aspace().lock();
+        // Map a fresh RWX region above the RAM linear-mapping window instead of
+        // `protect`ing heap pages: protecting a range that shares a 2 MiB linear
+        // mapping with the page tables themselves faults while the split is in
+        // flight (the physical pages backing the PTE writes become unmapped).
+        let hint = VirtAddr::from_usize(0x9000_0000);
+        let limit = VirtAddrRange::from_start_size(VirtAddr::from_usize(0), usize::MAX);
+        let va = aspace
+            .find_free_area(hint, size, limit)
+            .expect("no free VA for EFI pages");
+        aspace
+            .map_alloc(
+                va,
+                size,
+                MappingFlags::READ | MappingFlags::WRITE | MappingFlags::EXECUTE,
+                true,
+            )
+            .expect("failed to map EFI pages");
+        ALLOCATED_PAGES.lock().push((va, size));
+        va.as_mut_ptr()
+    }
 }
 
 pub fn free_pages(_addr: PhysAddr, _page: usize) {
