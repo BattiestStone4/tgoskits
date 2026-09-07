@@ -9,7 +9,7 @@
 #   AX_LOG        log level passed as AX_LOG env (default: debug)
 #   AX_PROFILE    cargo profile (default: release)
 #
-# Ramdisk boot config (see boot/arceboot/src/config.rs):
+# Ramdisk boot config (see bootloader/arceboot/src/config.rs):
 #   AX_USE_RAMDISK=1      enable ramdisk support
 #   AX_RAMDISK_START      physical start of the pre-loaded ramdisk (hex)
 #   AX_RAMDISK_SIZE       ramdisk size in bytes (hex)
@@ -26,7 +26,7 @@ TARGET=riscv64gc-unknown-none-elf
 FEATURES=${AX_FEATURES:-}
 PROFILE=${AX_PROFILE:-release}
 
-# The linker script is wired through boot/arceboot/build.rs
+# The linker script is wired through bootloader/arceboot/build.rs
 # (`-Taxplat.x`, the axplat-dyn -> somehal -> someboot script chain; see
 # scripts/axbuild/src/build/info.rs). The riscv64 load address defaults to
 # 0x8020_0000 (override with SOMEBOOT_RISCV64_KERNEL_LOAD_PADDR). The

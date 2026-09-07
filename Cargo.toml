@@ -15,9 +15,8 @@ resolver = "3"
 members = [
     "apps/starry/orangepi-5-plus-uvc/rust",
 
+    "bootloader/arceboot",
     "bootloader/axloader",
-
-    "boot/arceboot",
     "components/axtest/axtest",
     "components/axtest/axtest_macros",
     "components/cpu-local",

@@ -19,6 +19,6 @@ fn panic(info: &PanicInfo) -> ! {
     // `ax_log` is initialized, in which case the `log` facade would swallow
     // the message silently.
     let mut writer = SbiConsoleWriter;
-    let _ = write!(writer, "ArceBoot panicked: {}\n", info);
+    let _ = writeln!(writer, "ArceBoot panicked: {}", info);
     ax_hal::power::system_off()
 }

@@ -8,6 +8,12 @@ authors = ["Zhihang Shao <dio_ro@outlook.com>", "Jingxuan Wei <jensenwei007@gmai
 description = "Cross-platform operating system bootloader built from tgoskits components"
 publish = false
 
+# ArceBoot is a riscv64 bare-metal bootloader (it uses RISC-V inline asm via
+# sbi-rt), so `cargo xtask clippy` must check it for the riscv64 target rather
+# than the host.
+[package.metadata.docs.rs]
+targets = ["riscv64gc-unknown-none-elf"]
+
 [features]
 default = ["alloc", "paging", "ramdisk_cpio"]
 

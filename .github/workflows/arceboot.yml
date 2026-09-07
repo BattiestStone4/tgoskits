@@ -3,7 +3,7 @@ name: ArceBoot
 on:
   pull_request:
     paths:
-      - "boot/arceboot/**"
+      - "bootloader/arceboot/**"
       - "scripts/build-arceboot.sh"
       - "Cargo.toml"
       - "Cargo.lock"
@@ -12,7 +12,7 @@ on:
   push:
     branches: ["main", "dev"]
     paths:
-      - "boot/arceboot/**"
+      - "bootloader/arceboot/**"
       - "scripts/build-arceboot.sh"
       - "Cargo.toml"
       - "Cargo.lock"
@@ -112,7 +112,7 @@ jobs:
           test -s target/riscv64gc-unknown-none-elf/release/rustsbi-prototyper-dynamic.elf
 
       - name: Build hello UEFI app and ramdisk
-        run: bash boot/arceboot/scripts/test/build_hello_efi.sh
+        run: bash bootloader/arceboot/scripts/test/build_hello_efi.sh
 
       - name: Run QEMU
         run: |
@@ -120,7 +120,7 @@ jobs:
             -m 256M -nographic -machine virt \
             -bios "$QEMU_BIOS" \
             -kernel target/riscv64gc-unknown-none-elf/release/arceboot.bin \
-            -device loader,file=boot/arceboot/tests/hello-efi/ramdisk.cpio,addr=0x84000000 \
+            -device loader,file=bootloader/arceboot/tests/hello-efi/ramdisk.cpio,addr=0x84000000 \
             > qemu-hello-efi.log 2>&1 || true
 
       - name: Upload QEMU log
@@ -135,4 +135,4 @@ jobs:
         run: grep -aqF "$BIOS_BANNER" qemu-hello-efi.log
 
       - name: Check UEFI app output
-        run: bash boot/arceboot/scripts/test/check_hello_efi.sh qemu-hello-efi.log
+        run: bash bootloader/arceboot/scripts/test/check_hello_efi.sh qemu-hello-efi.log
