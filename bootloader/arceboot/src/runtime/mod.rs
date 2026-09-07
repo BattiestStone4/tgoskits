@@ -2,6 +2,7 @@ use object::Object;
 use uefi_raw::table::boot::{AllocateType, MemoryType};
 
 mod entry;
+mod header;
 mod loader;
 mod protocol;
 mod service;
@@ -60,7 +61,13 @@ pub fn efi_runtime_init() {
         meta.machine, meta.image_base, mapping as u64, meta.size_of_image, meta.entry_rva, mapping,
     );
 
-    let func = entry::resolve_entry_func(mapping, meta.entry_rva as u64);
+    let func = entry::resolve_entry_func(mapping, meta.entry_rva as u64, meta.size_of_image as u64)
+        .unwrap_or_else(|| {
+            panic!(
+                "PE entry RVA 0x:{:x} is outside the loaded image (size_of_image=0x{:x})",
+                meta.entry_rva, meta.size_of_image
+            )
+        });
     // UEFI applications often expect a non-null ImageHandle (gImageHandle) for library init.
     static mut DUMMY_IMAGE_HANDLE: usize = 1;
     let image_handle = core::ptr::addr_of_mut!(DUMMY_IMAGE_HANDLE) as *mut core::ffi::c_void;

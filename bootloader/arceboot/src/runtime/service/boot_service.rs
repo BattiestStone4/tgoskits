@@ -6,8 +6,8 @@ use uefi_raw::{
     Boolean, Char16, Event, Guid, Handle, PhysicalAddress, Status,
     protocol::device_path::DevicePathProtocol,
     table::boot::{
-        AllocateType, EventNotifyFn, EventType, InterfaceType, MemoryDescriptor, MemoryType,
-        OpenProtocolInformationEntry, TimerDelay, Tpl,
+        AllocateType, BootServices, EventNotifyFn, EventType, InterfaceType, MemoryDescriptor,
+        MemoryType, OpenProtocolInformationEntry, TimerDelay, Tpl,
     },
 };
 
@@ -20,7 +20,11 @@ pub struct Boot {
 impl Boot {
     pub fn new() -> Self {
         let services = uefi_raw::table::boot::BootServices {
-            header: Default::default(),
+            // 'BOOTSERV' signature, EFI 2.70 revision and whole-table size;
+            // the CRC-32 is stamped after the table is finalized below.
+            header: crate::runtime::header::table_header::<BootServices>(
+                crate::runtime::header::BOOT_SERVICES_SIGNATURE,
+            ),
             raise_tpl,
             restore_tpl,
             allocate_pages,
@@ -68,6 +72,9 @@ impl Boot {
         };
         let services_raw = Box::into_raw(Box::new(services));
         let services = unsafe { &mut *services_raw };
+        // The service table contents are final now, so this is the point to
+        // stamp the header CRC-32.
+        unsafe { crate::runtime::header::stamp_table_crc(services_raw) };
         Boot {
             services,
             services_raw,
@@ -106,6 +113,12 @@ pub unsafe extern "efiapi" fn allocate_pages(
     if addr.is_null() {
         return Status::INVALID_PARAMETER;
     }
+    // Zero-page requests are invalid per the UEFI contract; a count whose
+    // byte size would overflow is reported by `alloc_pages` as a null
+    // pointer and mapped to OUT_OF_RESOURCES below.
+    if count == 0 {
+        return Status::INVALID_PARAMETER;
+    }
     let ptr = crate::runtime::service::memory::alloc_pages(alloc_ty, mem_ty, count);
     if ptr.is_null() {
         return Status::OUT_OF_RESOURCES;
@@ -121,10 +134,13 @@ pub unsafe extern "efiapi" fn free_pages(addr: PhysicalAddress, pages: usize) ->
         return Status::INVALID_PARAMETER;
     };
     let phys_addr = PhysAddr::from_usize(addr);
-    if crate::runtime::service::memory::free_pages(phys_addr, pages) {
-        Status::SUCCESS
-    } else {
-        Status::NOT_FOUND
+    match crate::runtime::service::memory::free_pages(phys_addr, pages) {
+        Ok(()) => Status::SUCCESS,
+        Err(crate::runtime::service::memory::FreePagesError::NotTracked) => Status::NOT_FOUND,
+        Err(crate::runtime::service::memory::FreePagesError::InvalidPageCount) => {
+            Status::INVALID_PARAMETER
+        }
+        Err(crate::runtime::service::memory::FreePagesError::UnmapFailed) => Status::DEVICE_ERROR,
     }
 }
 pub unsafe extern "efiapi" fn get_memory_map(
@@ -382,24 +398,6 @@ pub unsafe extern "C" fn uninstall_multiple_protocol_interfaces(_handle: Handle,
 }
 
 // CRC / memory
-const CRC32_TABLE: [u32; 256] = {
-    const P: u32 = 0xEDB8_8320;
-    let mut tbl = [0u32; 256];
-    let mut i = 0usize;
-    while i < 256 {
-        let mut c = i as u32;
-        let mut j = 0;
-        while j < 8 {
-            // reflected step
-            c = if (c & 1) != 0 { (c >> 1) ^ P } else { c >> 1 };
-            j += 1;
-        }
-        tbl[i] = c;
-        i += 1;
-    }
-    tbl
-};
-
 pub unsafe extern "efiapi" fn calculate_crc32(
     data: *const c_void,
     data_size: usize,
@@ -417,16 +415,7 @@ pub unsafe extern "efiapi" fn calculate_crc32(
     }
 
     let bytes = unsafe { core::slice::from_raw_parts(data as *const u8, data_size) };
-
-    // Reflected algorithm with init/final XOR
-    let mut crc: u32 = 0xFFFF_FFFF;
-    for &b in bytes {
-        let idx = ((crc ^ (b as u32)) & 0xFF) as usize;
-        crc = (crc >> 8) ^ CRC32_TABLE[idx];
-    }
-    crc ^= 0xFFFF_FFFF;
-
-    unsafe { *crc32_out = crc };
+    unsafe { *crc32_out = crate::runtime::header::crc32(bytes) };
     Status::SUCCESS
 }
 

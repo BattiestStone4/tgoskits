@@ -12,6 +12,17 @@ use uefi_raw::table::boot::{AllocateType, MemoryType};
 static ALLOCATED_PAGES: Mutex<Vec<(VirtAddr, usize)>> = Mutex::new(Vec::new());
 static ALLOCATED_POOLS: Mutex<Vec<(usize, core::alloc::Layout)>> = Mutex::new(Vec::new());
 
+/// Reason a [`free_pages`] request could not be honored.
+#[derive(Debug)]
+pub enum FreePagesError {
+    /// The address does not match a tracked allocation.
+    NotTracked,
+    /// The page count does not match the tracked allocation exactly.
+    InvalidPageCount,
+    /// The address was tracked, but unmapping it failed.
+    UnmapFailed,
+}
+
 pub fn alloc_pages(_alloc_type: AllocateType, _memory_type: MemoryType, count: usize) -> *mut u8 {
     // Mapping EFI pages requires the paging stack; without it the service is
     // simply unavailable.
@@ -23,7 +34,15 @@ pub fn alloc_pages(_alloc_type: AllocateType, _memory_type: MemoryType, count: u
 
     #[cfg(feature = "paging")]
     {
-        let size = count * 4096;
+        // Reject zero-page requests and sizes whose byte length would wrap
+        // before touching the paging stack; both are reported as a null
+        // pointer (the caller maps them to parameter/resource errors).
+        if count == 0 {
+            return core::ptr::null_mut();
+        }
+        let Some(size) = count.checked_mul(4096) else {
+            return core::ptr::null_mut();
+        };
         let mut aspace = ax_mm::kernel_aspace().lock();
         // Map a fresh RWX region above the RAM linear-mapping window instead of
         // `protect`ing heap pages: protecting a range that shares a 2 MiB linear
@@ -49,9 +68,11 @@ pub fn alloc_pages(_alloc_type: AllocateType, _memory_type: MemoryType, count: u
 
 /// Releases a page allocation obtained from [`alloc_pages`].
 ///
-/// Returns `false` if the address does not match a tracked allocation.
+/// The UEFI `FreePages` page count is part of the caller contract: only the
+/// exact allocation may be released, so a partial or oversized count is an
+/// error rather than a reason to unmap the whole tracked range.
 #[cfg(feature = "paging")]
-pub fn free_pages(addr: PhysAddr, _page: usize) -> bool {
+pub fn free_pages(addr: PhysAddr, pages: usize) -> Result<(), FreePagesError> {
     // The UEFI spec wants `AllocatePages` to report a physical address, but
     // ArceBoot keeps its page tables active for the payload and hands out the
     // mapping's virtual address so the payload can use it directly. Match
@@ -59,23 +80,29 @@ pub fn free_pages(addr: PhysAddr, _page: usize) -> bool {
     // Identity-mapping the allocations and reporting true physical addresses
     // is future work (the same caveat as the GOP FrameBufferBase).
     let va = VirtAddr::from_usize(addr.as_usize());
-    let mut pages = ALLOCATED_PAGES.lock();
-    let Some(idx) = pages.iter().position(|(v, _)| *v == va) else {
-        return false;
+    let Some(expected_size) = pages.checked_mul(4096) else {
+        return Err(FreePagesError::InvalidPageCount);
     };
-    let (_, size) = pages.swap_remove(idx);
-    drop(pages);
+    let mut tracked = ALLOCATED_PAGES.lock();
+    let Some(idx) = tracked.iter().position(|(v, _)| *v == va) else {
+        return Err(FreePagesError::NotTracked);
+    };
+    if tracked[idx].1 != expected_size {
+        return Err(FreePagesError::InvalidPageCount);
+    }
+    let (_, size) = tracked.swap_remove(idx);
+    drop(tracked);
     ax_mm::kernel_aspace()
         .lock()
         .unmap(va, size)
         .inspect_err(|e| error!("failed to unmap EFI pages at {:#x}: {:?}", va.as_usize(), e))
-        .is_ok()
+        .map_err(|_| FreePagesError::UnmapFailed)
 }
 
 /// Without the paging stack there are no tracked page allocations to free.
 #[cfg(not(feature = "paging"))]
-pub fn free_pages(_addr: PhysAddr, _page: usize) -> bool {
-    false
+pub fn free_pages(_addr: PhysAddr, _pages: usize) -> Result<(), FreePagesError> {
+    Err(FreePagesError::NotTracked)
 }
 
 pub fn allocate_pool(_memory_type: MemoryType, size: usize) -> *mut u8 {

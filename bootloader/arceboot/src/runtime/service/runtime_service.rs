@@ -6,7 +6,7 @@ use uefi_raw::{
     capsule::CapsuleHeader,
     table::{
         boot::MemoryDescriptor,
-        runtime::{ResetType, TimeCapabilities, VariableAttributes},
+        runtime::{ResetType, RuntimeServices, TimeCapabilities, VariableAttributes},
     },
     time::Time,
 };
@@ -20,7 +20,11 @@ pub struct Runtime {
 impl Runtime {
     pub fn new() -> Self {
         let services = uefi_raw::table::runtime::RuntimeServices {
-            header: Default::default(),
+            // 'RUNTSERV' signature, EFI 2.70 revision and whole-table size;
+            // the CRC-32 is stamped after the table is finalized below.
+            header: crate::runtime::header::table_header::<RuntimeServices>(
+                crate::runtime::header::RUNTIME_SERVICES_SIGNATURE,
+            ),
             get_time,
             set_time,
             get_wakeup_time,
@@ -38,6 +42,9 @@ impl Runtime {
         };
         let services_raw = Box::into_raw(Box::new(services));
         let services = unsafe { &mut *services_raw };
+        // The service table contents are final now, so this is the point to
+        // stamp the header CRC-32.
+        unsafe { crate::runtime::header::stamp_table_crc(services_raw) };
         Self {
             services,
             services_raw,

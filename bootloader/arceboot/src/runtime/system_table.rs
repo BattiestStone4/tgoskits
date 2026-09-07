@@ -3,7 +3,7 @@ use core::ptr::null_mut;
 
 use ax_lazyinit::LazyInit;
 use ax_sync::Mutex;
-use uefi_raw::table::{Header, configuration::ConfigurationTable, system::SystemTable};
+use uefi_raw::table::{configuration::ConfigurationTable, system::SystemTable};
 
 use crate::runtime::{
     protocol::{
@@ -75,11 +75,10 @@ pub fn init_system_table() {
     let configuration_table = Box::into_raw(configuration_table);
 
     let system_table = Box::new(SystemTable {
-        // Build the UEFI Table Header.
-        // For the System Table, its signature is 'IBI SYST' (little-endian).
-        // The Header size is the size of the entire Header structure,
-        // and the CRC32 calculation will first fill the CRC32 field with 0 before calculation.
-        header: Header::default(),
+        // Build the UEFI Table Header: 'IBI SYST' signature, EFI 2.70
+        // revision, whole-table size and a CRC-32 stamped once the table
+        // contents below are final (see `stamp_table_crc`).
+        header: crate::runtime::header::table_header::<SystemTable>(SystemTable::SIGNATURE),
 
         firmware_vendor: VENDOR.as_ptr(),
         firmware_revision: REVERSION,
@@ -101,6 +100,9 @@ pub fn init_system_table() {
     });
     let system_table_raw = Box::into_raw(system_table);
     let system_table = unsafe { &mut *system_table_raw };
+    // The table contents (protocol pointers, services, configuration table)
+    // are final now, so this is the point to stamp the header CRC-32.
+    unsafe { crate::runtime::header::stamp_table_crc(system_table_raw) };
 
     SYSTEM_TABLE.init_once(Mutex::new(Table {
         system_table,
