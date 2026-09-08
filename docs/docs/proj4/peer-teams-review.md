@@ -88,7 +88,7 @@ title: "Proj4 各队决赛技术评审"
 ### C02【火锅宇泡面】优先级分层 RR + 优先级感知唤醒抢占
 - **出处**：报告 §5.1（P22-29）。消融：单队列→多级队列使 rknn p50 1741→626 ms；叠加 I/O 唤醒优化整环 total 1959→363 ms（v4 是最大跃迁点）；QEMU 唤醒→运行延迟 p50 149986→59 µs。
 - **净内容**：
-  1. axsched 单 RR 队列 → 按优先级分层的多级队列（BTreeMap<isize, List>），RRTask 双优先级（入队原子语义："先设优先级再暴露"，跨层惰性修复）；
+  1. axsched 单 RR 队列 → 按优先级分层的多级队列（`BTreeMap<isize, List>`），RRTask 双优先级（入队原子语义："先设优先级再暴露"，跨层惰性修复）；
   2. wait_queue `notify_one/wake_by_ref` 默认 resched=false 不强制让出 → 唤醒后判 `should_preempt(current)` 置 preempt_pending（sched-rr feature 门控），补上"高优先级唤醒即抢占"一环。
 - **与上游关系**：【代码核验】dev `components/axsched/src/round_robin.rs` 仍是单队列、`set_priority()` 返回 false 的桩（round_robin.rs:146）；dev 已有替代调度器 `fifo.rs`/`cfs.rs`（a3868568b1，在 next）与 `preempt_pending`/`notify_one(resched)` 机制——**净新增的是"分层 RR + 优先级感知抢占判定"，不是第三套调度器**。其 sched_setscheduler 等系统调用侧基本已在上游（见 §6）。
 - **合入动作**：拆 components/axsched + axtask + starry-kernel 三段；与 fifo/cfs 的 feature 面合并，避免并行机制；补 axsched 单测（QEMU 唤醒延迟可做 host 侧测例）；时间片数值与每 CPU 队列细节报告未给，需向作者要代码。报告无 fork 链接【存疑】。
