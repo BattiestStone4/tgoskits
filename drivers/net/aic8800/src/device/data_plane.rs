@@ -8,7 +8,7 @@ use crate::{
     },
     protocol::{BLOCK_SIZE, ethernet_tx_frame},
     registers::{ReceiveLength, flow_credits},
-    rx::{ParsedFrame, RX_CAPACITY, parse_fifo},
+    rx::{ParsedFrame, parse_fifo},
 };
 
 const IO_RETRY: Duration = Duration::from_millis(1);
@@ -16,6 +16,7 @@ const IO_RETRY: Duration = Duration::from_millis(1);
 // available for commands, as in the vendor DATA_FLOW_CTRL_THRESH contract.
 const DATA_TX_RESERVED_CREDITS: u8 = 2;
 const INTERNAL_TX_CAPACITY: usize = 2;
+const INTERNAL_TX_BYTE_CAPACITY: usize = 8 * 1024;
 const ETHERTYPE_EAPOL: [u8; 2] = [0x88, 0x8e];
 
 impl AicDevice {
@@ -75,7 +76,7 @@ impl AicDevice {
             .events
             .iter()
             .position(|event| !matches!(event, AicEvent::Receive(_)))?;
-        self.data.events.remove(index)
+        self.data.remove_event(index)
     }
 
     pub(super) fn request_receive_scan(&mut self) {
@@ -172,28 +173,29 @@ impl AicDevice {
         response: SdioResponse,
     ) -> Result<(), AicError> {
         let receive_data = expect_data(response)?;
-        let frames = parse_fifo(&receive_data).map_err(|error| {
-            let header_length = receive_data.len().min(24);
-            let mut header = [0; 24];
-            header[..header_length].copy_from_slice(&receive_data[..header_length]);
-            let header_words = [
-                u64::from_le_bytes(header[0..8].try_into().expect("fixed header word")),
-                u64::from_le_bytes(header[8..16].try_into().expect("fixed header word")),
-                u64::from_le_bytes(header[16..24].try_into().expect("fixed header word")),
-            ];
-            log::error!(
-                "malformed AIC RX frame on {path:?}: transfer={} header={:02x?}",
-                receive_data.len(),
-                &receive_data[..header_length]
-            );
-            AicError::MalformedRxFrame {
-                offset: error.offset,
-                packet_type: error.packet_type,
-                declared_length: error.declared_length,
-                available_length: error.available_length,
-                header_words,
-            }
-        })?;
+        let frames =
+            parse_fifo(&receive_data, self.mailbox_confirmation_id()).map_err(|error| {
+                let header_length = receive_data.len().min(24);
+                let mut header = [0; 24];
+                header[..header_length].copy_from_slice(&receive_data[..header_length]);
+                let header_words = [
+                    u64::from_le_bytes(header[0..8].try_into().expect("fixed header word")),
+                    u64::from_le_bytes(header[8..16].try_into().expect("fixed header word")),
+                    u64::from_le_bytes(header[16..24].try_into().expect("fixed header word")),
+                ];
+                log::error!(
+                    "malformed AIC RX frame on {path:?}: transfer={} header={:02x?}",
+                    receive_data.len(),
+                    &receive_data[..header_length]
+                );
+                AicError::MalformedRxFrame {
+                    offset: error.offset,
+                    packet_type: error.packet_type,
+                    declared_length: error.declared_length,
+                    available_length: error.available_length,
+                    header_words,
+                }
+            })?;
         for frame in frames {
             match frame {
                 ParsedFrame::Data {
@@ -206,8 +208,8 @@ impl AicDevice {
                     for frame in frames {
                         if frame.get(12..14) == Some(&ETHERTYPE_EAPOL) {
                             self.consume_eapol(&frame)?;
-                        } else if self.data.events.len() < RX_CAPACITY {
-                            self.data.events.push_back(AicEvent::Receive(frame));
+                        } else {
+                            self.data.push_event(AicEvent::Receive(frame))?;
                         }
                     }
                 }
@@ -263,18 +265,17 @@ impl AicDevice {
                         return Err(AicError::MalformedResponse);
                     }
                     self.data.link.clear_peer();
-                    self.data.internal_tx.clear();
+                    self.data.clear_internal_tx();
                     let resetting = self.lifecycle.control.as_ref().is_some_and(|control| {
                         matches!(&control.operation,
                             super::control::ControlOperation::Connect(connect)
                                 if connect.phase == super::control::ConnectPhase::Resetting)
                     });
                     if !resetting && self.lifecycle.control.take().is_some() {
-                        self.data.events.push_back(AicEvent::ControlFailed(
-                            AicError::Disconnected {
+                        self.data
+                            .push_event(AicEvent::ControlFailed(AicError::Disconnected {
                                 reason_code: indication.reason_code,
-                            },
-                        ));
+                            }))?;
                     }
                 }
                 ParsedFrame::Indication {
@@ -333,10 +334,9 @@ impl AicDevice {
             .take()
             .ok_or(AicError::CompletionMismatch)?;
         match active.completion {
-            super::owner::TxCompletion::User(token) => self
-                .data
-                .events
-                .push_back(AicEvent::TransmitComplete(token)),
+            super::owner::TxCompletion::User(token) => {
+                self.data.push_event(AicEvent::TransmitComplete(token))?
+            }
             super::owner::TxCompletion::Internal(super::owner::InternalTxKind::M2) => {}
             super::owner::TxCompletion::Internal(super::owner::InternalTxKind::M4) => {
                 let (station_index, _) = self.data.link.peer().ok_or(AicError::WpaProtocol)?;
@@ -357,7 +357,7 @@ impl AicDevice {
         let Some((interface_index, station_index)) = self.data.link.tx_indices() else {
             return;
         };
-        if let Some(internal) = self.data.internal_tx.pop_front() {
+        if let Some(internal) = self.data.pop_internal_tx() {
             let Ok(wire_frame) = ethernet_tx_frame(
                 &internal.ethernet_frame,
                 interface_index,
@@ -428,7 +428,16 @@ impl AicDevice {
         kind: super::owner::InternalTxKind,
         eapol: Vec<u8>,
     ) -> Result<(), AicError> {
-        if self.data.internal_tx.len() >= INTERNAL_TX_CAPACITY {
+        let ethernet_length = 14usize
+            .checked_add(eapol.len())
+            .ok_or(AicError::TxQueueFull)?;
+        if self.data.internal_tx.len() >= INTERNAL_TX_CAPACITY
+            || self
+                .data
+                .internal_tx_bytes
+                .checked_add(ethernet_length)
+                .is_none_or(|bytes| bytes > INTERNAL_TX_BYTE_CAPACITY)
+        {
             return Err(AicError::TxQueueFull);
         }
         let local_mac = self
@@ -437,11 +446,12 @@ impl AicDevice {
             .mac_address()
             .ok_or(AicError::InvalidMacAddress)?;
         let (_, bssid) = self.data.link.peer().ok_or(AicError::WpaProtocol)?;
-        let mut ethernet = Vec::with_capacity(14 + eapol.len());
+        let mut ethernet = Vec::with_capacity(ethernet_length);
         ethernet.extend_from_slice(&bssid);
         ethernet.extend_from_slice(&local_mac);
         ethernet.extend_from_slice(&ETHERTYPE_EAPOL);
         ethernet.extend_from_slice(&eapol);
+        self.data.internal_tx_bytes += ethernet.len();
         self.data.internal_tx.push_back(super::owner::InternalTx {
             kind,
             ethernet_frame: ethernet,
@@ -552,8 +562,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        common::{ChipVariant, SDIO_TYPE_CFG_CMD_RSP, SDIO_TYPE_DATA},
-        rx::RX_CAPACITY,
+        common::{ChipVariant, SDIO_TYPE_CFG_CMD_RSP, SDIO_TYPE_CFG_PRINT, SDIO_TYPE_DATA},
+        rx::{RX_BYTE_CAPACITY, RX_CAPACITY},
     };
 
     fn indication_fifo(message_id: u16, payload: &[u8]) -> Vec<u8> {
@@ -662,6 +672,41 @@ mod tests {
     }
 
     #[test]
+    fn mailbox_confirmation_survives_control_budget_exhaustion() {
+        const PRINT_PACKET_LENGTH: usize = 8;
+        const PRINT_AGGREGATE_LENGTH: usize = 4 + PRINT_PACKET_LENGTH;
+        const RESPONSE_PACKET_LENGTH: usize = 12;
+        const RESPONSE_AGGREGATE_LENGTH: usize = 4 + RESPONSE_PACKET_LENGTH;
+        const EXPECTED_MESSAGE_ID: u16 = 2;
+
+        let response_offset = crate::rx::CONTROL_RX_CAPACITY * PRINT_AGGREGATE_LENGTH;
+        let mut fifo = vec![0; response_offset + RESPONSE_AGGREGATE_LENGTH];
+        for index in 0..crate::rx::CONTROL_RX_CAPACITY {
+            let offset = index * PRINT_AGGREGATE_LENGTH;
+            fifo[offset..offset + 2].copy_from_slice(&(PRINT_PACKET_LENGTH as u16).to_le_bytes());
+            fifo[offset + 2] = SDIO_TYPE_CFG_PRINT;
+        }
+        fifo[response_offset..response_offset + 2]
+            .copy_from_slice(&(RESPONSE_PACKET_LENGTH as u16).to_le_bytes());
+        fifo[response_offset + 2] = SDIO_TYPE_CFG_CMD_RSP;
+        fifo[response_offset + 4..response_offset + 6]
+            .copy_from_slice(&EXPECTED_MESSAGE_ID.to_le_bytes());
+
+        let mut device = AicDevice::new(ChipVariant::Aic8800D80).unwrap();
+        device.lifecycle.mailbox = Some(MailboxState::confirmation_for_test(
+            MonotonicTime::from_nanos(10),
+        ));
+        device.io.receive.active = true;
+
+        device
+            .consume_receive_data(RxPath::Command, SdioResponse::Data(fifo))
+            .unwrap();
+
+        assert_eq!(device.mailbox_confirmation_id(), None);
+        assert!(!device.mailbox_waiting_for_receive());
+    }
+
+    #[test]
     fn receive_events_do_not_stall_after_the_first_bounded_window() {
         let mut device = AicDevice::new(ChipVariant::Aic8800D80).unwrap();
         device.lifecycle.state = AicState::Ready;
@@ -670,7 +715,7 @@ mod tests {
             device
                 .consume_receive_data(RxPath::Command, SdioResponse::Data(data_fifo(marker as u8)))
                 .unwrap();
-            let event = device.data.events.pop_front();
+            let event = device.data.pop_event();
             assert!(
                 matches!(event, Some(AicEvent::Receive(frame)) if frame[0] == marker as u8),
                 "receive event {marker} was lost after the bounded window"
@@ -683,7 +728,7 @@ mod tests {
         let mut device = AicDevice::new(ChipVariant::Aic8800D80).unwrap();
         device.lifecycle.state = AicState::Ready;
         device.io.receive.active = true;
-        device.data.events.push_back(AicEvent::ControlComplete);
+        device.data.push_event(AicEvent::ControlComplete).unwrap();
 
         assert!(matches!(
             device.drive_ready(MonotonicTime::from_nanos(0)),
@@ -697,7 +742,7 @@ mod tests {
         let mut device = AicDevice::new(ChipVariant::Aic8800DC).unwrap();
         device.lifecycle.state = AicState::Ready;
         for _ in 0..RX_CAPACITY {
-            device.data.events.push_back(AicEvent::Receive(vec![0]));
+            device.data.push_event(AicEvent::Receive(vec![0])).unwrap();
         }
         device
             .data
@@ -708,6 +753,34 @@ mod tests {
             device.drive_ready(MonotonicTime::default()),
             AicAction::Event(AicEvent::TransmitComplete(token)) if token == TxToken::new(1)
         ));
+    }
+
+    #[test]
+    fn receive_event_queue_obeys_item_and_byte_limits() {
+        let mut device = AicDevice::new(ChipVariant::Aic8800D80).unwrap();
+        for _ in 0..RX_CAPACITY {
+            device
+                .data
+                .push_event(AicEvent::Receive(vec![0; 2048]))
+                .unwrap();
+        }
+        device
+            .data
+            .push_event(AicEvent::Receive(vec![0; 2048]))
+            .unwrap();
+
+        assert_eq!(device.data.events.len(), RX_CAPACITY);
+        assert_eq!(device.data.event_bytes, RX_BYTE_CAPACITY);
+
+        device.data.push_event(AicEvent::ControlComplete).unwrap();
+        assert_eq!(device.data.events.len(), RX_CAPACITY);
+        assert!(
+            device
+                .data
+                .events
+                .iter()
+                .any(|event| matches!(event, AicEvent::ControlComplete))
+        );
     }
 
     #[test]
