@@ -7,10 +7,8 @@
 // This file has been modified by KylinSoft on 2025.
 
 use ax_memory_addr::{MemoryAddr, PAGE_SIZE_4K, VirtAddr};
-use ax_task::current;
-use starry_vm::vm_write_slice;
 
-use crate::{StarryError, StarryResult, task::AsThread};
+use crate::{StarryError, StarryResult, mm::vm_write_slice};
 
 // A cache query owns a backend snapshot, so keep fewer entries than Linux
 // needs for its byte-only scratch page. Neither batch buffer can allocate.
@@ -72,9 +70,14 @@ fn validate_mincore_request(
 /// - EFAULT: vec points to invalid address
 /// - EINVAL: addr not page-aligned
 /// - ENOMEM: length > (TASK_SIZE - addr), negative length, or unmapped memory
-pub fn sys_mincore(addr: usize, length: usize, vec: *mut u8) -> StarryResult<isize> {
+pub fn sys_mincore(
+    current: &crate::task::UserTaskRef,
+    addr: usize,
+    length: usize,
+    vec: *mut u8,
+) -> crate::StarryResult<isize> {
     let start_addr = VirtAddr::from(addr);
-    let curr = current();
+    let curr = current;
     let cred = curr.as_thread().cred();
     let aspace_pin = curr.as_thread().proc_data.pin_aspace()?;
     let (user_base, user_end) = {
@@ -130,7 +133,7 @@ pub fn sys_mincore(addr: usize, length: usize, vec: *mut u8) -> StarryResult<isi
             }
         }
         if filled != 0 {
-            vm_write_slice(vec.wrapping_add(completed), &result[..filled])?;
+            vm_write_slice(current, vec.wrapping_add(completed), &result[..filled])?;
         }
         if let Some(error) = range_error {
             return Err(error);
