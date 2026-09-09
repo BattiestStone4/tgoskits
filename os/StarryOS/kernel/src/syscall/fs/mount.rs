@@ -665,6 +665,9 @@ pub fn sys_mount(
             return Err(StarryError::InvalidInput);
         }
         let mp = target.mountpoint();
+        if flags & MS_BIND == 0 {
+            mp.set_filesystem_readonly(flags & MS_RDONLY != 0);
+        }
         mp.set_readonly((flags & MS_RDONLY) != 0);
         mp.set_mount_flags((flags & MOUNT_OPTION_FLAGS) as u32);
         crate::file::notify_mount_namespace_changed(&mount_namespace);
@@ -695,6 +698,9 @@ pub fn sys_mount(
         "proc" => {
             let fs = crate::pseudofs::proc::new_procfs(current.as_thread().active_pid_namespace());
             let target = ax_fs_ng::vfs::current_fs_context().lock().resolve(target)?;
+            if flags & MS_RDONLY != 0 {
+                fs.set_readonly(true);
+            }
             let mp = target.mount_with_source(&fs, mount_source(&source))?;
             if (flags & MS_RDONLY) != 0 {
                 mp.set_readonly(true);
@@ -704,6 +710,9 @@ pub fn sys_mount(
         "sysfs" | "devtmpfs" | "tmpfs" => {
             let fs = MemoryFs::new();
             let target = ax_fs_ng::vfs::current_fs_context().lock().resolve(target)?;
+            if flags & MS_RDONLY != 0 {
+                fs.set_readonly(true);
+            }
             let mp = target.mount_with_source(&fs, mount_source(&source))?;
             if (flags & MS_RDONLY) != 0 {
                 mp.set_readonly(true);
@@ -716,6 +725,9 @@ pub fn sys_mount(
             // machinery here, but must not inherit tmpfs's visible identity.
             let fs = MemoryFs::new_ramfs();
             let target = ax_fs_ng::vfs::current_fs_context().lock().resolve(target)?;
+            if flags & MS_RDONLY != 0 {
+                fs.set_readonly(true);
+            }
             let mp = target.mount_with_source(&fs, mount_source(&source))?;
             if (flags & MS_RDONLY) != 0 {
                 mp.set_readonly(true);
@@ -725,6 +737,9 @@ pub fn sys_mount(
         "devpts" => {
             let fs = new_devptsfs(parse_devpts_options(current, data)?);
             let target = ax_fs_ng::vfs::current_fs_context().lock().resolve(target)?;
+            if flags & MS_RDONLY != 0 {
+                fs.set_readonly(true);
+            }
             let mp = target.mount(&fs)?;
             if (flags & MS_RDONLY) != 0 {
                 mp.set_readonly(true);
@@ -740,6 +755,9 @@ pub fn sys_mount(
             };
             let fs = crate::pseudofs::cgroup::new_cgroup2fs(cgroup_root);
             let target = ax_fs_ng::vfs::current_fs_context().lock().resolve(target)?;
+            if flags & MS_RDONLY != 0 {
+                fs.set_readonly(true);
+            }
             let mp = target.mount_with_source(&fs, mount_source(&source))?;
             mp.set_lifetime_guard(Arc::new(cgroup_root_pin));
             if (flags & MS_RDONLY) != 0 {
@@ -749,7 +767,7 @@ pub fn sys_mount(
         }
         #[cfg(feature = "ext4")]
         "ext4" => {
-            mount_ext4(&source, &target, (flags & MS_RDONLY) != 0)?;
+            mount_ext4(&source, &target, flags)?;
         }
         "overlay" => {
             let (lower_paths, upper_path, work_path) = parse_overlay_options(current, data)?;
@@ -768,10 +786,10 @@ pub fn sys_mount(
                 work_dir,
             })?;
             let target = ctx.resolve(target)?;
-            let mp = target.mount_with_source(&fs, mount_source(&source))?;
-            if readonly || (flags & MS_RDONLY) != 0 {
-                mp.set_readonly(true);
+            if readonly || flags & MS_RDONLY != 0 {
+                fs.set_readonly(true);
             }
+            let mp = target.mount_with_source(&fs, mount_source(&source))?;
             mp.set_mount_flags((flags & MOUNT_OPTION_FLAGS) as u32);
         }
         _ => return Err(StarryError::NoSuchDevice),
@@ -786,17 +804,49 @@ fn mount_source(source: &str) -> &str {
 }
 
 #[cfg(feature = "ext4")]
-fn mount_ext4(source: &str, _target: &str, _readonly: bool) -> StarryResult<()> {
-    // The old loop-backed ext4 adapter implemented the removed synchronous
-    // polling queue API. Keep its source for the later virtual-device
-    // migration, but do not expose it through mount(2) as an IRQ-capable
-    // device. Linux uses ENODEV when the requested filesystem/device backend
-    // is not available in the running kernel.
-    warn!(
-        "mount_ext4: block backend for source {:?} has not been migrated",
-        source
-    );
-    Err(StarryError::NoSuchDevice)
+struct LoopMountLease(Arc<dyn crate::pseudofs::DeviceOps>);
+
+#[cfg(feature = "ext4")]
+impl Drop for LoopMountLease {
+    fn drop(&mut self) {
+        self.0.close(false);
+    }
+}
+
+#[cfg(feature = "ext4")]
+fn mount_ext4(source: &str, target: &str, flags: i32) -> StarryResult<()> {
+    use ax_fs_ng::vfs::{FileBackend, new_filesystem_from_file};
+    use axfs_ng_vfs::NodeType;
+
+    use crate::pseudofs::{Device, dev::r#loop::LoopDevice};
+
+    let (source_location, target_location) = {
+        let context = ax_fs_ng::vfs::current_fs_context();
+        let context = context.lock();
+        (context.resolve(source)?, context.resolve(target)?)
+    };
+    if source_location.metadata()?.node_type != NodeType::BlockDevice {
+        return Err(Errno::ENOTBLK.into());
+    }
+    let device = source_location.entry().downcast::<Device>()?;
+    let loop_device = device
+        .inner()
+        .as_any()
+        .downcast_ref::<LoopDevice>()
+        .ok_or(StarryError::NoSuchDevice)?;
+    device.inner().open(false)?;
+    let lease = LoopMountLease(device.inner().clone());
+    let readonly = flags & MS_RDONLY != 0;
+    if !readonly && loop_device.is_read_only()? {
+        return Err(StarryError::ReadOnlyFilesystem);
+    }
+    // The filesystem owns the lease, including across lazy detach and open files.
+    // No filesystem-context lock is held during superblock or backing-file I/O.
+    let fs = new_filesystem_from_file(FileBackend::Direct(source_location), readonly, lease)?;
+    let mount = target_location.mount_with_source(&fs, source)?;
+    mount.set_readonly(readonly || fs.is_readonly());
+    mount.set_mount_flags((flags & MOUNT_OPTION_FLAGS) as u32);
+    Ok(())
 }
 
 pub fn sys_umount2(
@@ -804,8 +854,6 @@ pub fn sys_umount2(
     target: *const c_char,
     flags: i32,
 ) -> crate::StarryResult<isize> {
-    use alloc::boxed::Box;
-
     let target = vm_load_string(current, target)?;
     debug!("sys_umount2 <= target: {target:?}, flags: {flags:#x}");
 
@@ -855,33 +903,15 @@ pub fn sys_umount2(
         return Err(StarryError::from(Errno::EBUSY));
     }
 
-    // Flush closed-file page cache entries before the filesystem itself is
-    // flushed by `Location::unmount()`. Otherwise data written through a file
-    // descriptor that has already been closed can remain only in axfs-ng's
-    // global cached-file list and miss the unmount writeback.
-    ax_fs_ng::file::sync_all_cached_files(false)?;
-
-    // Retrieve the writeback callback (if any) before unmount tears down
-    // the mount.  For ext4-on-loop mounts this flushes the block device
-    // cache to the backing file after the filesystem is unmounted; for
-    // other filesystem types (tmpfs) the callback is absent.
-    let writeback = {
-        let ud = target.user_data();
-        ud.get::<Box<dyn Fn() -> StarryResult<()> + Send + Sync>>()
-    }; // user_data lock released
+    // Flush this filesystem's closed-file cache before its own flush. An
+    // unrelated filesystem's busy mapping must not reject this unmount.
+    ax_fs_ng::file::sync_filesystem_cached_files(target.filesystem())?;
 
     if plan.targets().any(is_mount_busy) {
         return Err(StarryError::from(Errno::EBUSY));
     }
     target.commit_unmount(plan)?;
     crate::file::notify_mount_namespace_changed(&mount_namespace);
-
-    // After unmount, filesystem block I/O has stopped; it is safe to do VFS
-    // writeback here. Propagate writeback errors so userspace sees EIO when
-    // dirty data could not be persisted to the backing file.
-    if let Some(cb) = writeback {
-        cb()?;
-    }
 
     Ok(0)
 }

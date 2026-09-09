@@ -19,9 +19,10 @@ use inherit_methods_macro::inherit_methods;
 
 use crate::{
     DeviceId, DirEntry, DirEntrySink, DirNode, DirNodeOps, DirectoryCursor, DirectoryReadState,
-    Filesystem, FilesystemOps, Metadata, MetadataUpdate, Mutex, MutexGuard, NodeFlags, NodeOps,
-    NodePermission, NodeType, OpenOptions, Reference, ReferenceKey, RenameOptions, TypeMap,
-    VfsError, VfsResult, WeakDirEntry, XattrSetMode,
+    Filesystem, FilesystemMountLease, FilesystemMountState, FilesystemOps, Metadata,
+    MetadataUpdate, Mutex, MutexGuard, NodeFlags, NodeOps, NodePermission, NodeType, OpenOptions,
+    Reference, ReferenceKey, RenameOptions, TypeMap, VfsError, VfsResult, WeakDirEntry,
+    XattrSetMode,
     path::{DOT, DOTDOT, PathBuf, verify_entry_name},
 };
 
@@ -269,6 +270,7 @@ pub struct Mountpoint {
     peer_group_id: AtomicU64,
     /// Read-only flag for this mountpoint.
     readonly: AtomicBool,
+    filesystem_state: Arc<FilesystemMountState>,
     /// Mount option flags (Linux MS_* bits: MS_NOSUID=2, MS_NODEV=4,
     /// MS_NOEXEC=8, MS_NOATIME=0x400, MS_RELATIME=0x800000,
     /// MS_STRICTATIME=0x1000000). MS_RDONLY is tracked separately via
@@ -287,6 +289,8 @@ pub struct Mountpoint {
     /// Resource ownership tied to the active mount rather than the cached
     /// lifetime of this mountpoint object.
     lifetime_guard: Mutex<Option<Arc<dyn Any + Send + Sync>>>,
+    // Declared last: dentries retire before the filesystem drains its caches.
+    _filesystem_lease: Option<Arc<dyn FilesystemMountLease>>,
 }
 
 impl Mountpoint {
@@ -296,7 +300,8 @@ impl Mountpoint {
         location_in_parent: Option<Location>,
         device: u64,
     ) -> Arc<Self> {
-        Self::new_with_root_and_source(root, location_in_parent, device, "none".into())
+        let state = Arc::new(FilesystemMountState::new(root.filesystem().is_readonly()));
+        Self::new_with_root_and_source(root, location_in_parent, device, "none".into(), state)
     }
 
     fn new_with_root_and_source(
@@ -304,7 +309,9 @@ impl Mountpoint {
         location_in_parent: Option<Location>,
         device: u64,
         source: String,
+        filesystem_state: Arc<FilesystemMountState>,
     ) -> Arc<Self> {
+        let filesystem_lease = root.filesystem().mount_lease();
         Arc::new(Self {
             root,
             location: Mutex::new(location_in_parent),
@@ -314,6 +321,7 @@ impl Mountpoint {
             mount_id: MOUNT_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
             peer_group_id: AtomicU64::new(0),
             readonly: AtomicBool::new(false),
+            filesystem_state,
             mount_flags: AtomicU32::new(0),
             expired: AtomicBool::new(false),
             propagation: Mutex::new(PropagationType::Private),
@@ -321,6 +329,7 @@ impl Mountpoint {
             slaves: Mutex::default(),
             masters: Mutex::default(),
             lifetime_guard: Mutex::new(None),
+            _filesystem_lease: filesystem_lease,
         })
     }
 
@@ -339,6 +348,7 @@ impl Mountpoint {
             location_in_parent,
             DEVICE_COUNTER.fetch_add(1, Ordering::Relaxed),
             source.to_owned(),
+            fs.mount_state.clone(),
         );
         result.readonly.store(fs.is_readonly(), Ordering::Release);
         result
@@ -359,6 +369,7 @@ impl Mountpoint {
             Some(location_in_parent),
             source.mountpoint.device(),
             source.mountpoint.source.clone(),
+            source.mountpoint.filesystem_state.clone(),
         );
         result
             .readonly
@@ -382,6 +393,7 @@ impl Mountpoint {
             location_in_parent,
             source.device(),
             source.source.clone(),
+            source.filesystem_state.clone(),
         );
         result
             .readonly
@@ -638,6 +650,16 @@ impl Mountpoint {
         self.readonly.load(Ordering::Acquire)
     }
 
+    /// Returns the superblock write restriction shared across namespace copies.
+    pub fn is_filesystem_readonly(&self) -> bool {
+        self.filesystem_state.is_readonly()
+    }
+
+    /// Updates the shared VFS superblock state, not a bind mount's local flags.
+    pub fn set_filesystem_readonly(&self, readonly: bool) {
+        self.filesystem_state.set_readonly(readonly);
+    }
+
     pub fn set_readonly(&self, readonly: bool) {
         self.readonly.store(readonly, Ordering::Release);
     }
@@ -794,7 +816,7 @@ impl Location {
     }
 
     pub fn is_readonly(&self) -> bool {
-        self.mountpoint.is_readonly()
+        self.mountpoint.is_readonly() || self.mountpoint.is_filesystem_readonly()
     }
 
     pub fn entry(&self) -> &DirEntry {
@@ -1235,7 +1257,7 @@ impl Location {
     fn finish_unmount(&self) {
         self.mountpoint.clear_expired();
         if let Ok(directory) = self.entry.as_dir() {
-            directory.forget();
+            directory.clear_cached_entries();
         }
     }
 

@@ -54,7 +54,10 @@ pub(crate) use self::mount_table::{MountTableFile, notify_mount_namespace_change
 #[cfg(feature = "qperf-metrics")]
 pub(crate) use self::pipe::qperf_metrics_snapshot as pipe_qperf_metrics_snapshot;
 pub use self::{
-    fs::{Directory, File, ResolveAtResult, resolve_at, with_fs},
+    fs::{
+        Directory, File, ResolveAtResult, metadata_to_kstat, resolve_at, resolve_at_checked,
+        resolve_fd, with_fs,
+    },
     io_uring::IoUring,
     net::Socket,
     nsfd::NsFd,
@@ -181,6 +184,15 @@ pub type IoSrc<'a> = dyn ReadBuf + 'a;
 
 #[allow(dead_code)]
 pub trait FileLike: Pollable + DowncastSync {
+    /// Whether this file supports epoll interest registration.
+    ///
+    /// A file may provide synchronous poll readiness without supporting epoll
+    /// registration. Such file types must opt out here so epoll_ctl returns
+    /// EPERM before creating or looking up an interest.
+    fn supports_epoll(&self) -> bool {
+        true
+    }
+
     /// Validate a scalar write length before importing the user buffer.
     ///
     /// File types with count errors that take precedence over `EFAULT` can

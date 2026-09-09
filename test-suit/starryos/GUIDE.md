@@ -152,7 +152,15 @@ STARRY_SYSTEM_TEST_SUMMARY: total=1 passed=1 failed=0 elapsed_s=0.012
 开始标记用于在超时时定位卡住的 binary；失败时保留该 binary 的原始输出、
 `STARRY_SYSTEM_TEST_FAILED`、退出码和耗时。
 
-### PR #1775 LTP 阶段
+### LTP 接管范围
+
+后续 syscall 测试逐项迁移的断言映射、覆盖损失和验证状态记录在
+[`MIGRATION.md`](../../scripts/test/ltp-syscalls/MIGRATION.md) 与
+[`migration.csv`](../../scripts/test/ltp-syscalls/migration.csv)。该清单包含待审计项，
+不能把候选数量当成已经完成的迁移数量；每项迁移保留独立提交。本轮 PR #2322 冻结为已完成的
+13 个原程序：9 项部分替代、4 项无等效清理，没有完整等效替代项。IPv6 及其他未完成
+候选保留原测试。当前实际清单包含 74 个共同 LTP 用例，x86_64 另有 2 个旧入口用例；
+这是累计执行集合，不是本轮新增数量。两个 native 隔离回归单独计数。
 
 `qemu/system/ltp-syscalls` 使用 rootfs 中固定的 Linux Test Project
 `20260529`（上游 commit `3a64d78f58bdceba93ed321e91215fb969a047ed`）。
@@ -164,6 +172,24 @@ wrapper 在 guest 内依次确认 `/opt/ltp/Version`、`runtest/syscalls` 的唯
 六个 errno 用例，不能把“前四项通过后进程被错误替换、随后退出 0”当成成功。
 `CMakeLists.txt` 把该门槛写入每个 wrapper，兼容新旧 LTP 输出中 `TPASS` 的空格差异。
 这些门槛不从历史绿色日志推导，也不随共同集重新生成而丢失。
+`filesystem-passes.txt` 另行约束上游 `all_filesystems` 用例在指定文件系统内的
+`TPASS` 数量：ext4 未执行时，即使 tmpfs 已通过，wrapper 也必须失败。
+LTP 分组的共享 prebuild 安装 e2fsprogs，CMake 把 `mkfs.ext4`、配置及运行依赖
+注入测试镜像；wrapper 的 PATH 包含 sbin。不得通过隐藏格式化工具或只运行 tmpfs
+来报告 ext4 测试迁移完成。
+LTP 分组还安装 `ltp-isolation-exit-fs`，在 native 阶段验证活跃 cwd 阻止卸载及
+退出通知前释放 cwd，以及 loop 挂载、bind 别名和 lazy detach 的最终释放。
+回归还在最后关闭时留下脏页，再重新挂载核对写回结果。这些是运行设施的配套回归，
+不是上游 LTP 用例，不计入 `cases.txt` 或共同集数量。
+`ltp-isolation-access-context` 同样属于 native 配套回归：验证访问检查中的真实／有效
+凭据、目录搜索及空路径，以及 bind 别名和命名空间副本中的共享只读状态。
+它同时核对 `statfs`、`/proc/self/mountinfo` 和 `/proc/mounts` 的实际报告。
+仅特定体系结构存在的 syscall 用 `cases-<arch>.txt` 补充共同清单，CMake 根据
+`CMAKE_C_COMPILER_TARGET` 的架构前缀加载。`cases-x86_64.txt` 中旧 `epoll_create`
+入口用例只在 x86_64 执行，不能把其他架构不存在该入口的 `TCONF` 放行。
+体系结构专有项分别核对对应目标的原始日志，不参加四架构共同集求交。
+system runner 即使使用 `--capture-failures`，也会回放 LTP 阶段成功用例的输出，
+使四架构共同集生成器能够核对 `TPASS` 完成数量；原生 C 阶段仍只回放失败输出。
 
 system runner 固定分成两个顺序阶段：先按名称执行剩余的原生 C binary，再执行所有
 `ltp-syscalls-*` wrapper。两个阶段仍对每个 binary 分配独立 PID/mount namespace，日志用
@@ -200,6 +226,19 @@ scripts/test/ltp-syscalls/generate-common.sh \
 流程中整项移除，由最终共同集中的官方 LTP 结果承担回归；原 C cases 中 LTP 没有表达的
 自定义断言不再保留，也不再宣称仍被覆盖。ArceOS C 测试仍由 ArceOS 自己的测试入口维护。
 性能基准 `apps/starry/wakeup-latency-bench` 作为独立 Starry app 保留，供后续调优使用。
+
+逐项 syscall 迁移以 `scripts/test/ltp-syscalls/migration.csv` 为账本。按当前工作约定，
+候选 LTP 出错时保留原测试，记录候选、失败架构、错误输出及证据路径后暂缓，先处理
+无需修复且四架构通过的替换。暂缓不是通过，不删除失败候选，也不放宽 wrapper 的失败
+传播或完成数量检查。已完成替换仍须逐项记录未承接的断言。本轮已停止继续迁移，后续工作仅处理当前 PR 的
+持续集成问题。停机同步对照本机 Linux v7.1 PREEMPT_RT 的命令锁、禁止抢占及阶段确认
+逻辑；wait 重启与信号通知确认修复的范围、源码依据和红绿证据分别记录在
+`MIGRATION.md` 第 7、8 节。
+
+定向运行累计 LTP 集合使用 `cargo xtask starry test qemu --arch <arch> -c qemu/system/ltp-syscalls`；
+完整系统验证使用 `cargo xtask starry test qemu --arch <arch> -c qemu/system`。四个架构
+`x86_64`、`aarch64`、`riscv64`、`loongarch64` 在同一工作区串行执行，只有实际完成的
+测试结果才能计为通过。
 
 子测例 CMake 产物应安装到：
 

@@ -175,6 +175,7 @@ sched_setscheduler04
 sched_yield01
 sched_setaffinity01
 sched_getaffinity01
+getcpu01
 sched_setattr01
 sched_getattr01
 sched_getattr02
@@ -218,3 +219,24 @@ memfd_create04
 perf_event_open01
 perf_event_open02
 perf_event_open03
+
+# Alarm migration candidates.
+alarm02
+alarm05
+alarm06
+faccessat201
+faccessat202
+readdir01
+rename03
+rename04
+rename05
+rename07
+rmdir01
+rmdir02
+access04
+
+# Deferred or incomplete probes; not admitted to the execution manifest.
+fallocate04
+fchmodat2_01
+fchmodat2_02
+getcwd01
