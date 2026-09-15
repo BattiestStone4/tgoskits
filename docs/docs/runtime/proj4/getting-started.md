@@ -18,7 +18,7 @@ title: "Proj4 网球机器人上手指南"
 
 机器人是一台四轮底盘小车，左右两侧各由一个编码电机差速驱动，底盘控制器是 ESP32-C3，电机驱动是 DRV8833 双路 H 桥，供电是锂电池加降压板。车上的机械臂是 ZP10D 舵机臂，视觉用普通的 USB 摄像头（UVC 协议），另有一个用于投放网球的桶。
 
-这几部分通过不同接口接到主控板上：摄像头走 USB，底盘和机械臂各占一个串口。ESP32-C3 上跑的是自研固件，通过 UART 协议接收主控板发来的速度和方向指令，协议定义在 `hardware/esp32_base_control/PROTOCOL.md`。主控板跑 StarryOS 操作系统，用户态程序根据摄像头画面决定底盘怎么走、机械臂什么时候动。
+这几部分通过不同接口接到主控板上：摄像头走 USB，底盘和机械臂各占一个串口。ESP32-C3 上跑的是自研固件，通过 UART 协议接收主控板发来的速度和方向指令，帧格式是 `[0xAA] [0x55] [CMD] [LEN] [PAYLOAD] [CHK]`，校验字取 `CMD ^ LEN ^ PAYLOAD` 的逐字节异或；主控侧实现见 `pengzechen/aka-rk3588` 的 `motor/uart_motor_driver.hpp`，协议测试见 `chenlongos/AKA-00` 的 `tests/test_uart.py`。主控板跑 StarryOS 操作系统，用户态程序根据摄像头画面决定底盘怎么走、机械臂什么时候动。
 
 主控板可以整块替换，这是这个项目的核心设计。同一台小车，换上 RK3588 板就是高算力版本，换上 SG2002 板就是低成本版本。两条路线共用底盘、机械臂、摄像头硬件，也用同一份训练出来的 YOLOv8n 模型，只在"主控板 + 推理链 + 用户态程序"上分叉。
 
@@ -134,15 +134,16 @@ mkimage -l target/riscv64gc-unknown-none-elf/release/starryos.uimg
 
 ### 3.2 编译用户态程序
 
-两块平台的编译工具链完全不同，这一步最容易出错。RK3588 上的 `tennis_app` 是 C++ 程序，依赖 RKNN、libjpeg-turbo、libuvc 等 C 库，最高依赖 `GLIBC_2.34`，所以必须用 glibc 的 aarch64 工具链编译，不能用 musl——这也是 4.2 里 RK3588 的 rootfs 必须选 Jammy 这类 glibc 系统的原因。它用 CMake 构建，产物落在 `tennis-app/install/rk3588_linux_aarch64/tennis_app/` 下，包含可执行文件、`configs/`、`model/`、`lib/` 和 `validation/` 五部分。
+两块平台的编译工具链完全不同，这一步最容易出错。RK3588 上的 `tennis_app` 是 C++ 程序，源码在 `pengzechen/aka-rk3588` 仓库里，代码不在本仓库。它依赖 RKNN、libjpeg-turbo、libuvc 等 C 库，最高依赖 `GLIBC_2.34`，所以必须用 glibc 的 aarch64 工具链编译，不能用 musl——这也是 4.2 里 RK3588 的 rootfs 必须选 Jammy 这类 glibc 系统的原因。它用 CMake 构建，产物落在 `tennis-app/install/rk3588_linux_aarch64/tennis_app/` 下，包含可执行文件、`configs/`、`model/`、`lib/` 和 `validation/` 五部分。
 
 SG2002 上的 `akars` 是独立的 Rust 项目，代码不在本仓库里，需要单独获取。它编译成 riscv64 musl 目标，只用玄铁 V3.4.0 工具链验证过：
 
 ```bash
-git clone https://github.com/pengzechen/akars     # 上游
-# 开发用的分支在 https://github.com/BattiestStone4/akars
+git clone https://github.com/BattiestStone4/akars     # Rust 版，开发分支也在这里
 cargo build --release --target riscv64gc-unknown-linux-musl
 ```
+
+同名的 C++ 版本在 `pengzechen/aka-sg2002`，Rust 版的推理、电机、机械臂和状态机都是照着它移植的，对照调试时有用。
 
 这里有一个必须注意的地方：akars 的 `.cargo/config.toml` 默认指定的动态加载器是 `ld-musl-riscv64v0p7_xthead.so.1`，而板子的 rootfs 里只有标准的加载器。如果直接用它默认的配置编译，程序在板子上会因为找不到加载器而起不来。解决办法是把加载器改成标准路径后重新编译：
 
@@ -226,7 +227,7 @@ docker run --rm --privileged -v "$PWD/deploy":/deploy -w /deploy \
 mount -o loop,offset=16777728 sdcard_akars.img /mnt
 ```
 
-设备树（`aka-00-sg2002.dtb` 或 `cv181x.dtb`）要放进第一个 FAT 分区，引导时要用。准备完成后整卡写入 SD 卡：
+设备树（`aka-00-sg2002.dtb`，在 `os/StarryOS/configs/board/` 下，`aka-00-sg2002-uboot.toml` 里的 `dtb_file` 指的就是它）要放进第一个 FAT 分区，引导时要用。准备完成后整卡写入 SD 卡：
 
 ```bash
 # macOS
@@ -272,7 +273,7 @@ sudo dd if=deploy/sdcard_akars.img of=/dev/sdX bs=4M conv=fsync
 SG2002 的 U-Boot 默认会去加载第一个分区里的旧内核 `boot.sd`（一个跑厂商 Linux 5.10 的镜像），那不是 StarryOS，直接回车走自动启动就会进旧系统。所以上电后要在倒计时结束前按键打断自动启动，进入 U-Boot 命令行手动引导：
 
 ```bash
-fatload  mmc 0:1 0x81000000 cv181x.dtb
+fatload  mmc 0:1 0x81000000 aka-00-sg2002.dtb
 ext4load mmc 0:2 0x82200000 /starryos.uimg
 bootm    0x82200000 - 0x81000000
 ```
