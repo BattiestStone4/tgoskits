@@ -289,6 +289,14 @@ sudo dd if=deploy/sdcard_akars.img of=/dev/sdX bs=4M conv=fsync
 
 第一个分区里的 `fip.bin` **不要换**。这个文件和板型是绑死的，里面是 OpenSBI 加 SPL，负责初始化 DDR 和 SDIO 物理层，包含采样延迟参数，换错板型的 fip 会导致无线大包传输失败甚至启动异常。荔枝派 Nano 的 fip 是 440832 字节（sha1 `5b4d1faf…`），AKA-00 车板是 509440 字节。
 
+判断手上这份 `fip.bin` 属于哪块板，查它的大小和 sha1：
+
+```bash
+stat -c %s fip.bin && sha1sum fip.bin
+```
+
+**尺寸相同不等于可以通用**：509440 字节这一档不止一块板在用，最终要靠 sha1 区分。换 fip 之前先比 sha1，并且确认它和提取它的那份镜像对得上。
+
 这块板只能手动插拔 SD 卡刷写，没有网络刷机。仓库里 `cargo starry board` 那套远程开发板服务是给 OrangePi 这类板子用的，荔枝派 Nano 不走这条路。
 
 ### 4.4 把卡装进机器人
