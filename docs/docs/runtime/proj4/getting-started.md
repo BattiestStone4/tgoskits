@@ -202,11 +202,21 @@ akars 在板子上运行还需要运行时库：`libcviruntime.so`、`libcvikern
 
 第四条，手头保留一份能正常启动的底包镜像。卡写坏了直接重刷整卡，不要在已经损坏的卡上继续叠写，那样只会越写越乱。
 
-还有一条容易被忽略的限制：**tgoskits 目前只能识别按 4 KB 对齐的 ext4 分区**。发行版做出来的 ext4 一般不是这个对齐方式，所以不能把现成的官方 rootfs 分区直接拿来用，只能自己新建。新建时用这个命令：
+还有一条容易被忽略的限制：**StarryOS 的 ext4 实现只支持 ext4 特性集里的一个子集**，分区带上了它不认识的特性，挂载时会直接被拒绝。清单在 `fs/rsext4/src/superblock/features.rs` 的 `SUPPORTED_RO_COMPAT_FEATURES` 里。较新的 `mke2fs`（1.47 起）默认会打开 `orphan_file`，这个特性不在清单内，所以自己新建分区时要显式关掉：
 
 ```bash
 sudo mkfs.ext4 -b 4096 -O ^orphan_file /dev/sdXY
 ```
+
+这里的 `-b 4096` 指的是**文件系统块大小**，不是分区起始偏移，两件事不要混。块大小在 1024 到 4096 之间都能挂上，写 4096 是为了和仓库里现成的镜像保持一致。
+
+拿到一个别人做好的 ext4 分区（比如发行版给的 rootfs），先查它的块大小和特性，再决定要不要重建：
+
+```bash
+dumpe2fs -h /dev/sdXY | grep -E '^Block size|^Filesystem features'
+```
+
+块大小落在 1024 到 4096 之间、特性里没有 `orphan_file`，就可以直接用，不必重建。只有查出来不合格，才需要新建一个再把数据拷进去。
 
 ### 4.2 RK3588 部署应用
 
@@ -252,6 +262,8 @@ docker run --rm --privileged -v "$PWD/deploy":/deploy -w /deploy \
 ```
 
 如果还要跑 6.3 里的固定图片推理校验，把 `apps/starry/aka00-tennis-yolo/install/sg2002_riscv64_musl/akars_tennis/` 整个目录复制到第二个分区根下的 `/akars_tennis`，`lib/`、`model/`、`validation/` 三份都要在，复制完同样要 `sync`。
+
+上面的复制走的是开发机上宿主机的 ext4 驱动。仓库在自编译 rootfs 的实践里记过一条经验：宿主机写进去的文件，StarryOS 侧读回时可能因为元数据校验和对不上而报 I/O 错误，把 `metadata_csum` 关掉能避开，`scripts/prepare-selfhost-rootfs.sh` 建镜像时就是这么做的，细节在 `os/StarryOS/docs/starryos-self-compilation.md`。换内核是整文件覆盖，风险比逐块改写小，但真遇到读回报错，先往这个方向查。
 
 如果 loop 分区节点没建好，可以改用 offset 直接挂载第二个分区（起于 32769 扇区，即 16777728 字节）：
 
@@ -558,6 +570,7 @@ SG2002 上则要关注摄像头采集帧率和每帧的分段耗时，`akars` �
 | SG2002 重启后回到旧系统 | 自动启动走了第一个分区的旧内核 | 每次手动引导，见 5.2 |
 | 串口输出乱码 | 波特率不对，或 fip 和板型不匹配 | 核对 115200 和 1500000，核对 fip 尺寸 |
 | rootfs 挂载失败或文件丢失 | 写入后没 `sync` 就断电 | 重刷整卡，以后遵守 4.1 的规则 |
+| rootfs 挂载被直接拒绝，日志说特性不支持 | 分区的 ext4 带了 StarryOS 不认识的特性，多半是 `orphan_file` | 按 4.1 的办法查特性；确实带上了就重建分区再拷数据 |
 | 挂载 rootfs 找不到分区 | `bootargs` 里的 `root=` 没指对 | 检查内核命令行里的 rootfs 分区参数 |
 | 系统完全没有任何输出 | SD 卡或固件问题 | 换一张确认可用的卡重刷 |
 
