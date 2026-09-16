@@ -86,7 +86,7 @@ sudo apt install qemu-system-arm qemu-system-riscv64 qemu-system-x86 \
 rustup show
 ```
 
-其中 `u-boot-tools` 提供 `mkimage` 命令，后面校验 SG2002 内核镜像时必须用到；`cargo-binutils` 提供 `rust-objcopy` 和 `rust-nm`，内核构建要用这两个工具处理符号表。要在本机编 SG2002 的内核，还需要额外准备 riscv64-linux-musl 交叉编译器（`riscv64-linux-musl-cross`，或玄铁 V3.4.0 工具链），并确保它的 gcc 在 `PATH` 里。这几样凑不齐就直接用容器，不要在本机上硬凑。
+其中 `u-boot-tools` 提供 `mkimage` 命令，后面校验 SG2002 内核镜像时必须用到；`cargo-binutils` 提供 `rust-objcopy` 和 `rust-nm`，内核构建要用这两个工具处理符号表。构建时还会用到生成符号表的 `gen_ksym`，它不在上面这些系统包里，默认由构建过程自己 `cargo install ksym` 装上（离线环境可以先手动装好）。要在本机编 SG2002 的内核，还需要额外准备 riscv64-linux-musl 交叉编译器（`riscv64-linux-musl-cross`，或玄铁 V3.4.0 工具链），并确保它的 gcc 在 `PATH` 里。这几样凑不齐就直接用容器，不要在本机上硬凑。
 
 ### 2.3 先跑一次 QEMU 确认环境可用
 
@@ -198,11 +198,11 @@ akars 在板子上运行还需要运行时库：`libcviruntime.so`、`libcvikern
 
 第二条，优先往 FAT 分区写文件。FAT 分区结构简单，断电不容易坏。
 
-第三条，每次换内核之前，先把旧的 `/starryos.uimg` 改名留一份备份，万一新内核起不来还能换回去。
+第三条，每次换内核之前，先把分区里旧的那份内核镜像改名留一份备份，万一新内核起不来还能换回去。
 
 第四条，手头保留一份能正常启动的底包镜像。卡写坏了直接重刷整卡，不要在已经损坏的卡上继续叠写，那样只会越写越乱。
 
-还有一条限制要知道：**StarryOS 的 ext4 实现只支持 ext4 特性集里的一个子集**。挂载时的检查在 `fs/rsext4/src/superblock/features.rs`，它只看两个字段——`s_feature_incompat` 和 `s_feature_ro_compat`，分别对照 `SUPPORTED_INCOMPAT_FEATURES` 和 `SUPPORTED_RO_COMPAT_FEATURES` 两份清单，清单外的特性位会让挂载失败（`s_feature_ro_compat` 只在读写挂载时才校验）。第三个字段 `s_feature_compat` 不参与检查。
+还有一条限制要知道：**StarryOS 的 ext4 实现只支持 ext4 特性集里的一个子集**。挂载时的检查在 `fs/rsext4/src/superblock/features.rs`。就特性位而言它只看两个字段——`s_feature_incompat` 和 `s_feature_ro_compat`，分别对照 `SUPPORTED_INCOMPAT_FEATURES` 和 `SUPPORTED_RO_COMPAT_FEATURES` 两份清单，清单外的特性位会让挂载失败（`s_feature_ro_compat` 只在读写挂载时才校验），第三个字段 `s_feature_compat` 不参与检查。特性位之外还有一项检查：`s_def_hash_version` 必须不超过 `MAX_DEFAULT_DIRECTORY_HASH_VERSION`（5），`mkfs.ext4` 的默认值在这之内。
 
 这个区别有实际影响：较新的 `mke2fs`（1.47 起）默认开出的 `orphan_file` 正是 `s_feature_compat` 里的位（`EXT4_FEATURE_COMPAT_ORPHAN_FILE`，`0x1000`），**不在检查范围内，不会导致挂载失败**，不需要为它做任何处理。用默认参数 `mkfs.ext4` 建出来的文件系统可以直接挂上。
 
@@ -245,44 +245,15 @@ cargo starry quick-start orangepi-5-plus run --serial /dev/ttyUSB0
 
 ### 4.3 SG2002 写卡
 
-SG2002 的卡上分两个区：第一个区是 FAT，放 `fip.bin`、设备树和旧内核；第二个区是 ext4，放 rootfs 和 StarryOS 内核。要换的是第二个区里的 `/starryos.uimg`，整个过程在开发机的容器里对镜像文件做，做完再整卡写入 SD 卡。
+SG2002 的卡上分两个区：第一个区是 FAT，放 `fip.bin`、设备树和内核；第二个区是 ext4，放 rootfs。
 
-```bash
-docker run --rm --privileged -v "$PWD/deploy":/deploy -w /deploy \
-  ghcr.io/rcore-os/tgoskits-container:latest bash -lc '
-    set -e
-    LOOP=$(losetup -f --show -P sdcard_akars.img); partprobe $LOOP; sleep 1
-    mount ${LOOP}p2 /mnt
-    cp /mnt/starryos.uimg /mnt/starryos.uimg.prev-$(date +%m%d)   # 先备份旧的
-    cp starryos.uimg /mnt/starryos.uimg                            # 换内核
-    cp akars /mnt/root/akars; cp akars /mnt/usr/local/bin/akars
-    chmod +x /mnt/root/akars /mnt/usr/local/bin/akars
-    # 补上 musl 程序需要的两个库
-    [ -e /mnt/lib/libgcc_s.so.1 ] || cp /opt/riscv64-linux-musl-cross/riscv64-linux-musl/lib/libgcc_s.so.1 /mnt/lib/
-    [ -e /mnt/lib/libc.so ] || ln -s ld-musl-riscv64.so.1 /mnt/lib/libc.so
-    sync; md5sum /mnt/starryos.uimg starryos.uimg
-    umount /mnt; losetup -d $LOOP
-  '
-```
+这两个区之间有一条写入界线：**第一个 FAT 分区可以由开发机直接写，第二个 ext4 分区不行。** 仓库在自编译 rootfs 的实践中记过这件事，出处是 `os/StarryOS/docs/starryos-self-compilation.md`：在宿主机侧挂载并写入 rootfs 之后，`rsext4` 会读不回来，表现为 `Block num already free!` 或 `Input/output error`。那份记录给出的操作结论是 ext4 的写入尽量交给运行中的 StarryOS，宿主机只负责用 `mkfs.ext4` 建空文件系统，把宿主机侧的修改压到最少。
 
-如果还要跑 6.3 里的固定图片推理校验，把 `apps/starry/aka00-tennis-yolo/install/sg2002_riscv64_musl/akars_tennis/` 整个目录复制到第二个分区根下的 `/akars_tennis`，`lib/`、`model/`、`validation/` 三份都要在，复制完同样要 `sync`。
+那份记录后来在「根因分析（2026-05-25 更新）」里修正过归因：`rsext4` 本身不是根因，实际原因是宿主机侧的写法——`debugfs -w` 写裸块时不计算 `metadata_csum` 的校验和、`debugfs -w` 写出的目录项不可靠，以及反复 mount/unmount/e2fsck 累积损坏。归因变了，操作结论没变：宿主机侧的 ext4 写入越少越好。
 
-**上面这些复制走的是开发机上宿主机的 ext4 驱动，它和 StarryOS 侧的 `rsext4` 并不完全兼容。** 仓库在自编译 rootfs 的实践中记过这个问题：宿主机写过的镜像，`rsext4` 读回时会在元数据校验和、块位图解释和 JBD2 日志回放三处对不上，表现为 `Block num already free!` 或 `Input/output error`，而且一旦发生就不可逆。那份记录的结论是 rootfs 的写操作应该交给运行中的 StarryOS 完成，宿主机只负责用 `mkfs.ext4` 建空文件系统，出处是 `os/StarryOS/docs/starryos-self-compilation.md`。
+落到这条流程上就是：**内核和设备树在烧卡之后由开发机写进 FAT 分区，用户程序等板子起来之后再在 StarryOS 里写进 rootfs。** 开发机始终不碰 ext4 分区。
 
-落到这条流程上，两点要守住：
-
-- **只在可丢弃的镜像上做。** 上面这套操作改的是开发机上的一个镜像文件，改坏了重刷整卡就行，所以 4.1 第四条（保留一份能正常启动的底包镜像）在这里是硬要求。每次改动都从底包镜像重新走一遍，不要在已经改过的镜像上再叠一次——问题会一层层累积，出问题时也分不清是哪一步带进来的。
-- **烧进卡之后要在板子上确认。** 宿主机的 `cp` 不报错不代表 `rsext4` 读得回来，`md5sum` 一致只能说明两边内容相同，说明不了文件系统结构是好的。起机后实际读一下换进去的文件、把程序跑一次，这一步才算过。真遇到读回出错，往上面那三个方向查，不用怀疑内核镜像本身。
-
-想彻底避开这个问题，可以把内核和设备树放进第一个 FAT 分区，从第一分区引导，这条路宿主机侧的 `rsext4` 完全不参与，命令见 5.2。`/akars_tennis` 这类必须留在 rootfs 里的内容没法这样处理，按上面的方式做，并接受"这块卡随时可以从底包镜像重来"这个前提。
-
-如果 loop 分区节点没建好，可以改用 offset 直接挂载第二个分区（起于 32769 扇区，即 16777728 字节）：
-
-```bash
-mount -o loop,offset=16777728 sdcard_akars.img /mnt
-```
-
-设备树（`aka-00-sg2002.dtb`，在 `os/StarryOS/configs/board/` 下，`aka-00-sg2002-uboot.toml` 里的 `dtb_file` 指的就是它）要放进第一个 FAT 分区，引导时要用。准备完成后整卡写入 SD 卡：
+第一步，把底包镜像整卡写入 SD 卡：
 
 ```bash
 # macOS
@@ -297,6 +268,27 @@ sudo dd if=deploy/sdcard_akars.img of=/dev/sdX bs=4M conv=fsync
 ```
 
 底包镜像的来源有三条路：用荔枝派官方的镜像，用 `chenlongos/AKA-00` 仓库 releases 里的 `sd_licheervnano_with_AKA00_v0_*.img.xz`（那是一个跑厂商 Linux 的镜像，适合做性能对照），或者用已经配好的 `sdcard_akars.img`。前面两个的 `fip.bin` 需要从荔枝派官方镜像里提取。
+
+第二步，把内核和设备树放进第一个分区。整卡写完、重新插卡之后，第一个 FAT 分区就是一个普通移动盘：macOS 上会出现在 `/Volumes/` 下，Linux 上挂载 `/dev/sdX1` 即可。这一步不需要 loop 设备和分区偏移，直接往里拷文件：
+
+```bash
+cp starryos.uimg aka-00-sg2002.dtb /Volumes/<第一个分区>/    # macOS 上的挂载点
+sync                                                          # 写完先把数据落到盘上，再弹出
+```
+
+设备树（`aka-00-sg2002.dtb`）在 `os/StarryOS/configs/board/` 下，`aka-00-sg2002-uboot.toml` 里的 `dtb_file` 指的就是它。换内核之前先把分区里那份旧的改名留一份备份，对应 4.1 第三条；FAT 分区结构简单，这一步在开发机上做没有问题。
+
+第三步，上电并从第一个分区引导，命令见 5.2。
+
+第四步，进系统之后把用户程序写进 rootfs。这一步的写入由板子上的 `rsext4` 完成，开发机只负责把数据送过去，走的是 5.3 里那条 SSH 管道：
+
+```bash
+cat akars | ssh root@<板子IP> 'cat > /root/akars && chmod +x /root/akars && sync'
+```
+
+`akars` 运行时需要的 `libcviruntime.so`、`libcvikernel.so`、`libstdc++.so.6` 和 `libgcc_s.so.1` 按同一条通道送进 `/lib`，送完 `sync`。要跑 6.3 里的固定图片推理校验，把 `apps/starry/aka00-tennis-yolo/install/sg2002_riscv64_musl/akars_tennis/` 整个目录按同样的方式传到第二个分区根下的 `/akars_tennis`，`lib/`、`model/`、`validation/` 三份都要在。
+
+判断这一步是否成功，看的是**板子读得回来**，不是开发机写得进去：在 StarryOS 里 `ls -l` 一遍传上去的文件、再把程序实际跑一次，才算过。真遇到读回出错，往上面那三个方向查，不用怀疑内核镜像本身。
 
 第一个分区里的 `fip.bin` **不要换**。这个文件和板型是绑死的，里面是 OpenSBI 加 SPL，负责初始化 DDR 和 SDIO 物理层，包含采样延迟参数，换错板型的 fip 会导致无线大包传输失败甚至启动异常。荔枝派 Nano 的 fip 是 440832 字节（sha1 `5b4d1faf…`），AKA-00 车板是 509440 字节。
 
@@ -321,7 +313,7 @@ cargo starry board \
 
 车板用 `aka-00-sg2002-board.toml`，荔枝派 Nano 把 `--board-config` 换成 `os/StarryOS/configs/board/licheerv-nano-sg2002-board.toml`。板级测试的写法是 `cargo starry test board --board aka-00-sg2002`，荔枝派对应 `--board licheerv-nano-sg2002`，配置分别在 `test-suit/starryos/board-aka-00-sg2002` 和 `test-suit/starryos/board-licheerv-nano-sg2002` 下。两份板卡的 `shell_prefix` 都是 `root@starry:`，和 5.2 里的提示符一致。
 
-和 6.3 里 `cargo xtask starry app board -b AKA-00-SG2002` 那条应用级测试是两回事：这里跑的是内核启动验证，那里跑的是用户程序。
+和 6.3 里 `cargo xtask starry app board -t aka00-tennis-yolo -b AKA-00-SG2002` 那条应用级测试是两回事：这里跑的是内核启动验证，那里跑的是用户程序。
 
 ### 4.4 把卡装进机器人
 
@@ -346,7 +338,17 @@ cargo starry board \
 
 ### 5.2 SG2002 启动
 
-SG2002 的 U-Boot 默认会去加载第一个分区里的旧内核 `boot.sd`（一个跑厂商 Linux 5.10 的镜像），那不是 StarryOS，直接回车走自动启动就会进旧系统。所以上电后要在倒计时结束前按键打断自动启动，进入 U-Boot 命令行手动引导：
+SG2002 的 U-Boot 默认会去加载第一个分区里的旧内核 `boot.sd`（一个跑厂商 Linux 5.10 的镜像），那不是 StarryOS，直接回车走自动启动就会进旧系统。所以上电后要在倒计时结束前按键打断自动启动，进入 U-Boot 命令行手动引导。
+
+按 4.3 的做法，内核和设备树都在第一个 FAT 分区里，从第一分区引导：
+
+```bash
+load mmc 0:1 0x82200000 starryos.uimg
+load mmc 0:1 0x83000000 aka-00-sg2002.dtb
+bootm 0x82200000 - 0x83000000
+```
+
+如果第二个分区的 rootfs 里也留着一份内核，可以改从第二个分区读内核，设备树仍从第一个分区读：
 
 ```bash
 fatload  mmc 0:1 0x81000000 aka-00-sg2002.dtb
@@ -354,20 +356,12 @@ ext4load mmc 0:2 0x82200000 /starryos.uimg
 bootm    0x82200000 - 0x81000000
 ```
 
-这三条命令里的地址不能改。内核镜像必须先加载到 `0x82200000`，再由 `bootm` 解包到 `0x80200000` 运行；如果直接把镜像加载到 `0x80200000`，解包时会覆盖掉自己，这是最常见的引导失败原因。设备树加载到 `0x81000000`。
+这些地址对应板卡配置里的两个键，不能混。`0x82200000` 是 `fit_load_addr`——FIT 镜像 `starryos.uimg` 在内存里的落点；`0x80200000` 是 `kernel_load_addr`——内核自己的运行地址，由 `.its` 里的 `load` 和 `entry` 决定，`bootm` 负责把镜像解包过去。把 FIT 镜像直接加载到 `0x80200000`，这两个地址就重叠了：`bootm` 要在同一个位置把内核解开并跳过去，结果通常是引导失败。快速开始文档里讲本地串口启动的那一节（`docs/docs/quickstart/starryos.md`）用的是同一组键名和取值，可以对照。
 
 如果第一个分区里没有放设备树，可以改用 U-Boot 自带的设备树：
 
 ```bash
 bootm 0x82200000 - $fdtcontroladdr
-```
-
-另一个变通做法是把内核和设备树都放进 FAT 分区，从第一个分区引导，这样地址也不一样：
-
-```bash
-load mmc 0:1 0x82200000 starryos.uimg
-load mmc 0:1 0x83000000 aka-00-sg2002.dtb
-bootm 0x82200000 - 0x83000000
 ```
 
 两条路径里的设备树文件名要和手上这块板对应，车板是 `aka-00-sg2002.dtb`，荔枝派 Nano 是 `licheerv-nano-sg2002.dtb`，都在 `os/StarryOS/configs/board/` 下。
@@ -405,7 +399,7 @@ SG2002 的 IP 地址取决于它连的是哪个热点（比如 iPhone 热点通�
 
 ### 6.1 闭环的几个阶段
 
-RK3588 上的 `tennis` 实现了完整的状态机，依次经过四个阶段，然后回到第一个继续找下一颗球。每个阶段之间靠摄像头看到的画面来切换，`config/lekiwi_pick_config.txt` 里的参数决定多近算"够近"、偏离多少算"对准"。
+RK3588 上的 `tennis` 实现了完整的状态机，依次经过五个阶段，然后回到第一个继续找下一颗球。每个阶段之间靠摄像头看到的画面来切换，`config/lekiwi_pick_config.txt` 里的参数决定多近算"够近"、偏离多少算"对准"。
 
 ```mermaid
 stateDiagram-v2
@@ -606,7 +600,7 @@ SG2002 上则要关注摄像头采集帧率和每帧的分段耗时，`akars` �
 
 | 现象 | 原因 | 处理 |
 | --- | --- | --- |
-| SG2002 引导后立刻崩溃，`EPC=0` | 内核镜像加载地址写成了 `0x80200000` | 必须先加载到 `0x82200000` |
+| SG2002 引导后立刻崩溃，`EPC=0` | 把 FIT 镜像 `starryos.uimg` 加载到了内核地址 `0x80200000`，两个地址重叠 | FIT 镜像要落在 `fit_load_addr`（`0x82200000`），再由 `bootm` 解包到 `kernel_load_addr`（`0x80200000`） |
 | SG2002 重启后回到旧系统 | 自动启动走了第一个分区的旧内核 | 每次手动引导，见 5.2 |
 | 串口输出乱码 | 波特率不对，或 fip 和板型不匹配 | 核对 115200 和 1500000，核对 fip 尺寸 |
 | rootfs 挂载失败或文件丢失 | 写入后没 `sync` 就断电 | 重刷整卡，以后遵守 4.1 的规则 |
