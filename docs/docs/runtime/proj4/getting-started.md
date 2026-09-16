@@ -86,7 +86,7 @@ sudo apt install qemu-system-arm qemu-system-riscv64 qemu-system-x86 \
 rustup show
 ```
 
-其中 `u-boot-tools` 提供 `mkimage` 命令，后面校验 SG2002 内核镜像时必须用到。要在本机编 SG2002 的内核，还需要额外准备 riscv64-linux-musl 交叉编译器（`riscv64-linux-musl-cross`，或玄铁 V3.4.0 工具链），并确保它的 gcc 在 `PATH` 里。这几样凑不齐就直接用容器，不要在本机上硬凑。
+其中 `u-boot-tools` 提供 `mkimage` 命令，后面校验 SG2002 内核镜像时必须用到；`cargo-binutils` 提供 `rust-objcopy` 和 `rust-nm`，内核构建要用这两个工具处理符号表。要在本机编 SG2002 的内核，还需要额外准备 riscv64-linux-musl 交叉编译器（`riscv64-linux-musl-cross`，或玄铁 V3.4.0 工具链），并确保它的 gcc 在 `PATH` 里。这几样凑不齐就直接用容器，不要在本机上硬凑。
 
 ### 2.3 先跑一次 QEMU 确认环境可用
 
@@ -126,7 +126,7 @@ docker run --rm -v "$PWD":/work -w /work \
   'cargo xtask starry build -c os/StarryOS/configs/board/aka-00-sg2002.toml'
 ```
 
-SG2002 的产物在 `target/riscv64gc-unknown-none-elf/release/starryos.uimg`，同时需要一份设备树，在 `os/StarryOS/configs/board/` 下同名，比如 `licheerv-nano-sg2002.dtb` 或 `aka-00-sg2002.dtb`。功能项在板卡配置文件里选：三份 SG2002 配置都带 `ax-driver/serial` 和 `ax-driver/cv181x-sdhci`；`ax-driver/aic8800-wifi` 在 `licheerv-nano-sg2002-wifi.toml` 和 `aka-00-sg2002.toml` 里；决定摄像头能不能用的 `starry-kernel/sg2002-cvi-usb-camera` 和 `ax-driver/sg2002-dwc2` 只有 `aka-00-sg2002.toml` 带。这份指南里的推理和遥控都要用摄像头，所以车板一律编译 `aka-00-sg2002.toml`。
+SG2002 的产物在 `target/riscv64gc-unknown-none-elf/release/starryos.uimg`，另外还需要一份设备树。用哪一份不看编译时选的 config 叫什么名字，而是由运行配置里的 `dtb_file` 指定：车板的 `aka-00-sg2002-board.toml` 和 `aka-00-sg2002-uboot.toml` 都指向 `os/StarryOS/configs/board/aka-00-sg2002.dtb`，荔枝派的两份指向同目录下的 `licheerv-nano-sg2002.dtb`。像 `licheerv-nano-sg2002-wifi.toml` 这样只写 `features` 的配置文件是编译用的，里面没有 `dtb_file`，别按它的名字去找同名的设备树。功能项在板卡配置文件里选：三份 SG2002 配置都带 `ax-driver/serial` 和 `ax-driver/cv181x-sdhci`；`ax-driver/aic8800-wifi` 在 `licheerv-nano-sg2002-wifi.toml` 和 `aka-00-sg2002.toml` 里；决定摄像头能不能用的 `starry-kernel/sg2002-cvi-usb-camera` 和 `ax-driver/sg2002-dwc2` 只有 `aka-00-sg2002.toml` 带。这份指南里的推理和遥控都要用摄像头，所以车板一律编译 `aka-00-sg2002.toml`。
 
 SG2002 的产物编译完必须校验一次加载地址：
 
@@ -202,21 +202,25 @@ akars 在板子上运行还需要运行时库：`libcviruntime.so`、`libcvikern
 
 第四条，手头保留一份能正常启动的底包镜像。卡写坏了直接重刷整卡，不要在已经损坏的卡上继续叠写，那样只会越写越乱。
 
-还有一条容易被忽略的限制：**StarryOS 的 ext4 实现只支持 ext4 特性集里的一个子集**，分区带上了它不认识的特性，挂载时会直接被拒绝。清单在 `fs/rsext4/src/superblock/features.rs` 的 `SUPPORTED_RO_COMPAT_FEATURES` 里。较新的 `mke2fs`（1.47 起）默认会打开 `orphan_file`，这个特性不在清单内，所以自己新建分区时要显式关掉：
+还有一条限制要知道：**StarryOS 的 ext4 实现只支持 ext4 特性集里的一个子集**。挂载时的检查在 `fs/rsext4/src/superblock/features.rs`，它只看两个字段——`s_feature_incompat` 和 `s_feature_ro_compat`，分别对照 `SUPPORTED_INCOMPAT_FEATURES` 和 `SUPPORTED_RO_COMPAT_FEATURES` 两份清单，清单外的特性位会让挂载失败（`s_feature_ro_compat` 只在读写挂载时才校验）。第三个字段 `s_feature_compat` 不参与检查。
+
+这个区别有实际影响：较新的 `mke2fs`（1.47 起）默认开出的 `orphan_file` 正是 `s_feature_compat` 里的位（`EXT4_FEATURE_COMPAT_ORPHAN_FILE`，`0x1000`），**不在检查范围内，不会导致挂载失败**，不需要为它做任何处理。用默认参数 `mkfs.ext4` 建出来的文件系统可以直接挂上。
+
+自己新建分区时块大小要落在 1024 到 4096 之间：
 
 ```bash
-sudo mkfs.ext4 -b 4096 -O ^orphan_file /dev/sdXY
+sudo mkfs.ext4 -b 4096 /dev/sdXY
 ```
 
-这里的 `-b 4096` 指的是**文件系统块大小**，不是分区起始偏移，两件事不要混。块大小在 1024 到 4096 之间都能挂上，写 4096 是为了和仓库里现成的镜像保持一致。
+这里的 `-b 4096` 指的是**文件系统块大小**，不是分区起始偏移，两件事不要混。写 4096 是为了和仓库里现成的镜像保持一致。
 
-拿到一个别人做好的 ext4 分区（比如发行版给的 rootfs），先查它的块大小和特性，再决定要不要重建：
+拿到一个别人做好的 ext4 分区（比如发行版给的 rootfs），如果挂不上，先查它的块大小和特性：
 
 ```bash
 dumpe2fs -h /dev/sdXY | grep -E '^Block size|^Filesystem features'
 ```
 
-块大小落在 1024 到 4096 之间、特性里没有 `orphan_file`，就可以直接用，不必重建。只有查出来不合格，才需要新建一个再把数据拷进去。
+块大小要在 1024 到 4096 之间。特性那一行里如果有不认识的名字，去 `features.rs` 的两份清单里对一下对不对得上，对不上就是它导致的。真遇到挂不上时先跑这条命令，比直接重建分区快，也不会白丢数据。
 
 ### 4.2 RK3588 部署应用
 
@@ -263,7 +267,14 @@ docker run --rm --privileged -v "$PWD/deploy":/deploy -w /deploy \
 
 如果还要跑 6.3 里的固定图片推理校验，把 `apps/starry/aka00-tennis-yolo/install/sg2002_riscv64_musl/akars_tennis/` 整个目录复制到第二个分区根下的 `/akars_tennis`，`lib/`、`model/`、`validation/` 三份都要在，复制完同样要 `sync`。
 
-上面的复制走的是开发机上宿主机的 ext4 驱动。仓库在自编译 rootfs 的实践里记过一条经验：宿主机写进去的文件，StarryOS 侧读回时可能因为元数据校验和对不上而报 I/O 错误，把 `metadata_csum` 关掉能避开，`scripts/prepare-selfhost-rootfs.sh` 建镜像时就是这么做的，细节在 `os/StarryOS/docs/starryos-self-compilation.md`。换内核是整文件覆盖，风险比逐块改写小，但真遇到读回报错，先往这个方向查。
+**上面这些复制走的是开发机上宿主机的 ext4 驱动，它和 StarryOS 侧的 `rsext4` 并不完全兼容。** 仓库在自编译 rootfs 的实践中记过这个问题：宿主机写过的镜像，`rsext4` 读回时会在元数据校验和、块位图解释和 JBD2 日志回放三处对不上，表现为 `Block num already free!` 或 `Input/output error`，而且一旦发生就不可逆。那份记录的结论是 rootfs 的写操作应该交给运行中的 StarryOS 完成，宿主机只负责用 `mkfs.ext4` 建空文件系统，出处是 `os/StarryOS/docs/starryos-self-compilation.md`。
+
+落到这条流程上，两点要守住：
+
+- **只在可丢弃的镜像上做。** 上面这套操作改的是开发机上的一个镜像文件，改坏了重刷整卡就行，所以 4.1 第四条（保留一份能正常启动的底包镜像）在这里是硬要求。每次改动都从底包镜像重新走一遍，不要在已经改过的镜像上再叠一次——问题会一层层累积，出问题时也分不清是哪一步带进来的。
+- **烧进卡之后要在板子上确认。** 宿主机的 `cp` 不报错不代表 `rsext4` 读得回来，`md5sum` 一致只能说明两边内容相同，说明不了文件系统结构是好的。起机后实际读一下换进去的文件、把程序跑一次，这一步才算过。真遇到读回出错，往上面那三个方向查，不用怀疑内核镜像本身。
+
+想彻底避开这个问题，可以把内核和设备树放进第一个 FAT 分区，从第一分区引导，这条路宿主机侧的 `rsext4` 完全不参与，命令见 5.2。`/akars_tennis` 这类必须留在 rootfs 里的内容没法这样处理，按上面的方式做，并接受"这块卡随时可以从底包镜像重来"这个前提。
 
 如果 loop 分区节点没建好，可以改用 offset 直接挂载第二个分区（起于 32769 扇区，即 16777728 字节）：
 
@@ -297,7 +308,20 @@ stat -c %s fip.bin && sha1sum fip.bin
 
 **尺寸相同不等于可以通用**：509440 字节这一档不止一块板在用，最终要靠 sha1 区分。换 fip 之前先比 sha1，并且确认它和提取它的那份镜像对得上。
 
-这块板只能手动插拔 SD 卡刷写，没有网络刷机。仓库里 `cargo starry board` 那套远程开发板服务是给 OrangePi 这类板子用的，荔枝派 Nano 不走这条路。
+刷写这块卡只能手动插拔 SD 卡，没有网络刷机这条捷径——远程板卡服务也不负责写卡，它做的是板卡申请、U-Boot 引导和串口连接这几件事。
+
+但这两块 SG2002 板都在远程服务的覆盖范围内，卡写好插到板子上之后可以走这条路，省掉每次重启手动敲 U-Boot 的麻烦：
+
+```bash
+cargo starry board \
+  --board-config os/StarryOS/configs/board/aka-00-sg2002-board.toml \
+  --server "${OSTOOL_SERVER:?set OSTOOL_SERVER}" \
+  --port "${OSTOOL_PORT:?set OSTOOL_PORT}"
+```
+
+车板用 `aka-00-sg2002-board.toml`，荔枝派 Nano 把 `--board-config` 换成 `os/StarryOS/configs/board/licheerv-nano-sg2002-board.toml`。板级测试的写法是 `cargo starry test board --board aka-00-sg2002`，荔枝派对应 `--board licheerv-nano-sg2002`，配置分别在 `test-suit/starryos/board-aka-00-sg2002` 和 `test-suit/starryos/board-licheerv-nano-sg2002` 下。两份板卡的 `shell_prefix` 都是 `root@starry:`，和 5.2 里的提示符一致。
+
+和 6.3 里 `cargo xtask starry app board -b AKA-00-SG2002` 那条应用级测试是两回事：这里跑的是内核启动验证，那里跑的是用户程序。
 
 ### 4.4 把卡装进机器人
 
@@ -517,16 +541,24 @@ akars 运行时每帧还会打印分段耗时，用来定位慢在哪一步：
 
 改动之前必须先有一个数字，否则无法证明你的改动有效。
 
-RK3588 的程序自带计时，完整闭环跑起来时每帧打印两行：
+RK3588 的程序自带计时，完整闭环跑起来后按统计窗口输出四行——默认窗口是 10 秒，不是每帧打印：
 
 ```
+[PERF] window=..s captured=.. processed=.. camera=..fps effective=..fps busy=..fps
 [PERF] frame_ms avg=.. p50=.. p95=.. max=..
+[PERF] stage_ms wait=.. capture_copy=.. jpeg_header=.. jpeg_decode=.. letterbox_copy=..
 [PERF] stage_ms input=.. run=.. output=.. post=.. release=.. control=.. unaccounted=..
 ```
 
-`frame_ms` 是端到端耗时，看 `p50` 和 `p95` 比看 `avg` 更有意义；`stage_ms` 把这段时间拆到各个阶段上，`input` 是输入准备和缩放，`run` 是 NPU 前向计算，`output` 是取回输出，`unaccounted` 是没归到任何阶段的部分——这个值偏大说明计时点本身有遗漏。追球自动测试另外会打印一行 `[ROBOT_CI] PERF_SUMMARY`，把一个测试窗口内的统计汇总起来，适合前后对比。
+第一行是这一个窗口的吞吐概况：`window` 是窗口长度，`captured` 是采集到的帧数，`processed` 是实际处理完的帧数，后面三个都是帧率——`camera` 是采集侧，`effective` 是端到端的有效值，`busy` 是处理侧。判断丢帧发生在哪一段，看 `captured` 和 `processed` 的差、以及 `camera` 和 `effective` 的差就够了：`camera` 高而 `effective` 低，说明采集跟得上但处理跟不上。
 
-SG2002 上则要关注摄像头采集帧率和每帧的分段耗时，`akars` 的 `[FPS]` 与 `[time]` 两行日志就是这两个数。`aka00-tennis-yolo` 的 `AKARS_TENNIS_BENCH_RESULT` 还会给出 `resize_us_avg`、`forward_us_avg`、`postprocess_us_avg`、`total_us_avg` 等分段均值：给 `akars-tennis-validator` 加上 `--warmup 1 --repeat 5` 就会输出这一行，预热那一轮不计入统计，而且每一轮都会重新和预期结果比对，避免用错误的检测结果换来更好看的耗时。
+第二行的 `frame_ms` 是端到端耗时，看 `p50` 和 `p95` 比看 `avg` 更有意义。后两行都是 `stage_ms`，分工不同：第一行拆的是采集侧（`wait` 是等待取帧，`capture_copy` 是拷贝，`jpeg_header` 和 `jpeg_decode` 是解码，`letterbox_copy` 是缩放填充），第二行拆的是计算侧（`input` 是输入准备和缩放，`run` 是 NPU 前向计算，`output` 是取回输出，`post` 是后处理，`release` 是释放缓冲，`control` 是控制指令下发，`unaccounted` 是没归到任何阶段的部分）——`unaccounted` 偏大说明计时点本身有遗漏。两行名字一样，看数字时先认清楚是哪一行。
+
+追球自动测试另外会打印 `[ROBOT_CI] PERF_BEGIN`、`PERF_WINDOW` 和 `PERF_SUMMARY` 三行，把每个窗口的统计和整段的汇总分开列出，适合前后对比。
+
+SG2002 上则要关注摄像头采集帧率和每帧的分段耗时，`akars` 的 `[FPS]` 与 `[time]` 两行日志就是这两个数。`aka00-tennis-yolo` 的校验程序还会在全部测量轮次都通过结果比对之后，打印一行 `AKARS_TENNIS_BENCH_RESULT`，给的是统计值而不是单次值：`measured_runs` 是测量轮数，`images` 是图片数，`samples` 是两者的乘积；后面 `decode_us`、`resize_us`、`preprocess_us`、`forward_us`、`postprocess_us`、`total_us` 六项各带 `_avg`、`_p50`、`_p95` 三个后缀，单位都是微秒。
+
+这一行默认就会打印，不必特意加参数——默认是 `--warmup 0 --repeat 1`，也就是测一轮。`--warmup` 和 `--repeat` 调的是轮数：`--warmup 2 --repeat 5` 表示先热两轮不计入统计，再正式测五轮。轮数多一些数字才稳，跨机器比较时两边要用同样的参数。每一轮都会重新和预期结果比对，所以不会出现"用错误的检测结果换来更好看的耗时"这种情况。
 
 量测要在同样的条件下重复多次。场地光线、机器人的起始位置、热点距离都会影响结果，只测一次的数字不能用来说明问题。一个已知的参考量级：RK3588 上完整链路的端到端延迟在 Linux 上约 19 ms，在 StarryOS 上约 156 ms，差距集中在图像预处理和 NPU 输出两个环节。
 
@@ -534,7 +566,7 @@ SG2002 上则要关注摄像头采集帧率和每帧的分段耗时，`akars` �
 
 性能问题可能出在内核、驱动、用户态程序或者硬件本身。用排除法确定层次比盲目改代码有效得多。判断方法是从上往下看：用户态程序的耗时占了多少？把用户态排除之后，驱动层的等待时间有多长？硬件本身的物理上限是多少？
 
-把端到端延迟拆成几段来量，是最有效的排除手段，`[PERF] stage_ms` 那一行就是为这件事准备的。一次实测中，RK3588 上完整链路的 156 ms 拆开是 `input` 69.65 ms、`output` 54.99 ms、`run` 28.28 ms，前两项加起来占了总延迟的 80%：`input` 慢是因为当时 RGA 硬件加速还没打通，缩放回退到 CPU 逐行拷贝；`output` 慢是因为每次提交前后都做了全量缓存刷新。
+把端到端延迟拆成几段来量，是最有效的排除手段，`[PERF]` 里带 `input=` 的那一行 `stage_ms` 就是为这件事准备的（两行 `stage_ms` 里认准计算侧那一行，采集侧那行拆的是解码和缩放）。一次实测中，RK3588 上完整链路的 156 ms 拆开是 `input` 69.65 ms、`output` 54.99 ms、`run` 28.28 ms，前两项加起来占了总延迟的 80%：`input` 慢是因为当时 RGA 硬件加速还没打通，缩放回退到 CPU 逐行拷贝；`output` 慢是因为每次提交前后都做了全量缓存刷新。
 
 只看 `run` 会以为"NPU 慢"，拆开才发现真正的开销在数据搬运的路径上，而搬运路径是软件可以改的，换更快的模型反而没有用。这条路径上的硬件加速驱动后来已经合进主线，重新量一次会得到不同的数字——这也说明性能结论有保质期，改完要重新量。
 
@@ -578,7 +610,7 @@ SG2002 上则要关注摄像头采集帧率和每帧的分段耗时，`akars` �
 | SG2002 重启后回到旧系统 | 自动启动走了第一个分区的旧内核 | 每次手动引导，见 5.2 |
 | 串口输出乱码 | 波特率不对，或 fip 和板型不匹配 | 核对 115200 和 1500000，核对 fip 尺寸 |
 | rootfs 挂载失败或文件丢失 | 写入后没 `sync` 就断电 | 重刷整卡，以后遵守 4.1 的规则 |
-| rootfs 挂载被直接拒绝，日志说特性不支持 | 分区的 ext4 带了 StarryOS 不认识的特性，多半是 `orphan_file` | 按 4.1 的办法查特性；确实带上了就重建分区再拷数据 |
+| rootfs 挂载被直接拒绝，日志说特性不支持 | 分区的 ext4 带了 rsext4 不认识的 `s_feature_incompat` 或 `s_feature_ro_compat` 位 | 按 4.1 的办法查特性，对照 `features.rs` 的两份清单；对不上就重建分区再拷数据 |
 | 挂载 rootfs 找不到分区 | `bootargs` 里的 `root=` 没指对 | 检查内核命令行里的 rootfs 分区参数 |
 | 系统完全没有任何输出 | SD 卡或固件问题 | 换一张确认可用的卡重刷 |
 
