@@ -283,8 +283,10 @@ sync                                                          # 写完先把数�
 第四步，进系统之后把用户程序写进 rootfs。这一步的写入由板子上的 `rsext4` 完成，开发机只负责把数据送过去，走的是 5.3 里那条 SSH 管道：
 
 ```bash
-cat akars | ssh root@<板子IP> 'cat > /root/akars && chmod +x /root/akars && sync'
+cat akars | ssh root@<板子IP> 'mkdir -p /usr/local/bin && cat > /usr/local/bin/akars && chmod +x /usr/local/bin/akars && sync'
 ```
+
+装到 `/usr/local/bin` 是因为板子的 `PATH` 里只有它：`os/StarryOS/starryos/src/init.sh` 把 `PATH` 设成 `/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`，里面没有 `/root`。装在别的目录就得每次写全路径，6.3 那张子命令表里的 `akars` 也就不能照着敲了。
 
 `akars` 运行时需要的 `libcviruntime.so`、`libcvikernel.so`、`libstdc++.so.6` 和 `libgcc_s.so.1` 按同一条通道送进 `/lib`，送完 `sync`。要跑 6.3 里的固定图片推理校验，把 `apps/starry/aka00-tennis-yolo/install/sg2002_riscv64_musl/akars_tennis/` 整个目录按同样的方式传到第二个分区根下的 `/akars_tennis`，`lib/`、`model/`、`validation/` 三份都要在。
 
@@ -381,10 +383,10 @@ dropbear -R -p22
 StarryOS 上 SSH 的默认密码是 `starry`。板子上没有装 scp 和 sftp 服务，传文件要用管道的方式：
 
 ```bash
-cat akars | ssh root@<板子IP> 'cat > /root/akars && chmod +x /root/akars && sync'
+cat akars | ssh root@<板子IP> 'mkdir -p /usr/local/bin && cat > /usr/local/bin/akars && chmod +x /usr/local/bin/akars && sync'
 ```
 
-写完记得 sync。板子根目录下有一个 `wifi_switch` 程序用来配网：
+写到 `/usr/local/bin` 是跟着板子的 `PATH` 走的，理由见 4.3。写完记得 sync。板子根目录下有一个 `wifi_switch` 程序用来配网：
 
 ```bash
 wifi_switch sta <SSID> <密码>   # 连到 WPA2 热点
@@ -484,6 +486,8 @@ cd /akars_tennis && ./run.sh
 akars yolov8n_tennis_v2.cvimodel \
   --camera /dev/cvi-usb-camera0 --motor /dev/ttyS3 --arm /dev/ttyS2
 ```
+
+模型这一项给的是路径，例子用的是相对路径，所以执行时当前目录要在模型文件所在的那一级，或者直接写成绝对路径。程序本身在 `PATH` 里，不用带路径。
 
 akars 在开发机上也能编译运行：没有 TPU 时用桩函数替代，Web 部分加 `--mock` 参数，这样图像管线、状态机和网页都能在没有硬件的情况下先调通。这是它相对 C++ 版本的一个明显好处——改逻辑不必每次都上板。
 
