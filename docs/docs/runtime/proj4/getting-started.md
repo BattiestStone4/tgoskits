@@ -149,7 +149,7 @@ cd apps/starry/aka-rk3588
 ./prepare-package.sh
 ```
 
-脚本会下载 `source.env` 里固定提交号的源码归档、校验 SHA256，再用仓库里的预编译程序替换归档中的构建产物，最后在 `target/aka-rk3588/aka-rk3588.tar.gz` 生成部署包。要把源码版本换掉时，`source.env` 里的提交号和二进制 SHA256 必须一起更新，不要用分支名或 `HEAD` 当输入。
+脚本会把 `source.env` 里固定提交号的源码归档下载下来、校验 SHA256，再用仓库里的预编译程序替换归档中的构建产物，最后在 `target/aka-rk3588/aka-rk3588.tar.gz` 生成部署包。源码来自 `source.env` 里的 `AKA_RK3588_REPOSITORY`，也就是 `bullhh/aka-rk3588` 的固定提交 `8408f1b9`；包里的 `config/`、`models/` 和几个 `run_*.sh` 都取自这份归档，本仓库只保存程序本体（预编译的 `prebuilt/aarch64/build/tennis`），其余文件都在那份归档里。后面 6.2、6.5 和 7.1 里引用的脚本名、日志字符串因此在仓库里搜不到，要对照这个上游仓库看。要把源码版本换掉时，`source.env` 里的提交号和二进制 SHA256 必须一起更新，不要用分支名或 `HEAD` 当输入。
 
 SG2002 上先跑仓库自带的最小推理校验，代码就在 `apps/starry/aka00-tennis-yolo/`，不用另外下载。它依赖玄铁 V3.4.0 musl 工具链和 Milk-V 的 SG200x TPU SDK，用脚本一次装好：
 
@@ -259,45 +259,57 @@ SG2002 的卡上分两个区：第一个区是 FAT，放 `fip.bin`、设备树�
 # macOS
 diskutil list                      # 先确认设备号，别烧错盘
 diskutil unmountDisk /dev/diskN
-sudo dd if=deploy/sdcard_akars.img of=/dev/rdiskN bs=4m
+sudo dd if=<底包镜像> of=/dev/rdiskN bs=4m
 diskutil eject /dev/diskN
 
 # Linux
 lsblk                              # 找 SD 卡，如 /dev/sdX
-sudo dd if=deploy/sdcard_akars.img of=/dev/sdX bs=4M conv=fsync
+sudo dd if=<底包镜像> of=/dev/sdX bs=4M conv=fsync
 ```
 
-底包镜像的来源有三条路：用荔枝派官方的镜像，用 `chenlongos/AKA-00` 仓库 releases 里的 `sd_licheervnano_with_AKA00_v0_*.img.xz`（那是一个跑厂商 Linux 的镜像，适合做性能对照），或者用已经配好的 `sdcard_akars.img`。前面两个的 `fip.bin` 需要从荔枝派官方镜像里提取。
+`<底包镜像>` 换成整卡镜像的文件路径，来源有三条路：用荔枝派官方的镜像，用 `chenlongos/AKA-00` 仓库 releases 里的 `sd_licheervnano_with_AKA00_v0_*.img.xz`（那是一个跑厂商 Linux 的镜像，适合做性能对照），或者用已经配好的 `sdcard_akars.img`。前面两个的 `fip.bin` 需要从荔枝派官方镜像里提取。
 
-第二步，把内核和设备树放进第一个分区。整卡写完、重新插卡之后，第一个 FAT 分区就是一个普通移动盘：macOS 上会出现在 `/Volumes/` 下，Linux 上挂载 `/dev/sdX1` 即可。这一步不需要 loop 设备和分区偏移，直接往里拷文件：
+第二步，把内核和设备树放进第一个分区。整卡写完、重新插卡之后，第一个 FAT 分区就是一个普通移动盘：macOS 上会出现在 `/Volumes/` 下，Linux 上挂载 `/dev/sdX1` 即可。这一步不需要 loop 设备和分区偏移，直接往里拷文件。命令在仓库根目录执行，两个源文件都按仓库内的相对路径给：
 
 ```bash
-cp starryos.uimg aka-00-sg2002.dtb /Volumes/<第一个分区>/    # macOS 上的挂载点
-sync                                                          # 写完先把数据落到盘上，再弹出
+cp target/riscv64gc-unknown-none-elf/release/starryos.uimg \
+   os/StarryOS/configs/board/aka-00-sg2002.dtb /Volumes/<第一个分区>/
+sync    # 写完先把数据落到盘上，再弹出
 ```
 
-设备树（`aka-00-sg2002.dtb`）在 `os/StarryOS/configs/board/` 下，`aka-00-sg2002-uboot.toml` 里的 `dtb_file` 指的就是它。换内核之前先把分区里那份旧的改名留一份备份，对应 4.1 第三条；FAT 分区结构简单，这一步在开发机上做没有问题。
+挂载点按平台替换：macOS 上是 `/Volumes/` 下的那个卷，Linux 上是 `mount` 里看到的那个挂载点。内核产物在 `target/riscv64gc-unknown-none-elf/release/` 下，编译出来的名字就是 `starryos.uimg`，和 3.1 里 `mkimage -l` 用的是同一个文件；设备树（`aka-00-sg2002.dtb`）在 `os/StarryOS/configs/board/` 下，`aka-00-sg2002-uboot.toml` 里的 `dtb_file` 指的就是它。换内核之前先把分区里那份旧的改名留一份备份，对应 4.1 第三条；FAT 分区结构简单，这一步在开发机上做没有问题。
 
 第三步，上电并从第一个分区引导，命令见 5.2。
 
 第四步，进系统之后把用户程序写进 rootfs。这一步的写入由板子上的 `rsext4` 完成，开发机只负责把数据送过去，走的是 5.3 里那条 SSH 管道：
 
 ```bash
-cat akars | ssh root@<板子IP> 'mkdir -p /usr/local/bin && cat > /usr/local/bin/akars && chmod +x /usr/local/bin/akars && sync'
+# 在 akars 仓库目录下执行；编译产物在 target/riscv64gc-unknown-linux-musl/release/ 下
+cat target/riscv64gc-unknown-linux-musl/release/akars | \
+  ssh root@<板子IP> 'mkdir -p /usr/local/bin && cat > /usr/local/bin/akars && chmod +x /usr/local/bin/akars && sync'
 ```
 
-装到 `/usr/local/bin` 是因为板子的 `PATH` 里只有它：`os/StarryOS/starryos/src/init.sh` 把 `PATH` 设成 `/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`，里面没有 `/root`。装在别的目录就得每次写全路径，6.3 那张子命令表里的 `akars` 也就不能照着敲了。
+管道左边是本机文件的路径，右边引号里是板子上的目标路径，两者不一样，别照着左边去板子上找。装到 `/usr/local/bin` 是因为板子的 `PATH` 里只有它：`os/StarryOS/starryos/src/init.sh` 把 `PATH` 设成 `/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`，里面没有 `/root`。装在别的目录就得每次写全路径，6.3 那张子命令表里的 `akars` 也就不能照着敲了。
 
-`akars` 运行时需要的 `libcviruntime.so`、`libcvikernel.so`、`libstdc++.so.6` 和 `libgcc_s.so.1` 按同一条通道送进 `/lib`，送完 `sync`。要跑 6.3 里的固定图片推理校验，把 `apps/starry/aka00-tennis-yolo/install/sg2002_riscv64_musl/akars_tennis/` 整个目录按同样的方式传到第二个分区根下的 `/akars_tennis`，`lib/`、`model/`、`validation/` 三份都要在。
+`akars` 运行时需要的 `libcviruntime.so`、`libcvikernel.so`、`libstdc++.so.6` 和 `libgcc_s.so.1` 按同一条通道送进 `/lib`，送完 `sync`。这四个文件在 `apps/starry/aka00-tennis-yolo/install/sg2002_riscv64_musl/akars_tennis/lib/` 下，`build-validator.sh` 把 TPU SDK 里的 `.so` 和工具链里的 `libstdc++.so.6`、`libgcc_s.so.1` 一起收在这个目录。要跑 6.3 里的固定图片推理校验，还要把 `apps/starry/aka00-tennis-yolo/install/sg2002_riscv64_musl/akars_tennis/` 这个目录放到第二个分区根下的 `/akars_tennis`，`lib/`、`model/`、`validation/` 三份都要在。上面那条管道一次只送一个文件，装不下整个目录，先在开发机上打包再在板子上解开：
+
+```bash
+tar -C apps/starry/aka00-tennis-yolo/install/sg2002_riscv64_musl -cf - akars_tennis | \
+  ssh root@<板子IP> 'cd / && tar -xf - && sync'
+```
 
 判断这一步是否成功，看的是**板子读得回来**，不是开发机写得进去：在 StarryOS 里 `ls -l` 一遍传上去的文件、再把程序实际跑一次，才算过。真遇到读回出错，往上面那三个方向查，不用怀疑内核镜像本身。
 
 第一个分区里的 `fip.bin` **不要换**。这个文件和板型是绑死的，里面是 OpenSBI 加 SPL，负责初始化 DDR 和 SDIO 物理层，包含采样延迟参数，换错板型的 fip 会导致无线大包传输失败甚至启动异常。荔枝派 Nano 的 fip 是 440832 字节（sha1 `5b4d1faf…`），AKA-00 车板是 509440 字节。
 
-判断手上这份 `fip.bin` 属于哪块板，查它的大小和 sha1：
+判断手上这份 `fip.bin` 属于哪块板，查它的大小和 sha1。命令在 `fip.bin` 所在的目录执行，文件名按它实际存放的路径替换：
 
 ```bash
+# Linux
 stat -c %s fip.bin && sha1sum fip.bin
+
+# macOS
+stat -f %z fip.bin && shasum fip.bin
 ```
 
 **尺寸相同不等于可以通用**：509440 字节这一档不止一块板在用，最终要靠 sha1 区分。换 fip 之前先比 sha1，并且确认它和提取它的那份镜像对得上。
@@ -353,12 +365,12 @@ bootm 0x82200000 - 0x83000000
 如果第二个分区的 rootfs 里也留着一份内核，可以改从第二个分区读内核，设备树仍从第一个分区读：
 
 ```bash
-fatload  mmc 0:1 0x81000000 aka-00-sg2002.dtb
+fatload  mmc 0:1 0x83000000 aka-00-sg2002.dtb
 ext4load mmc 0:2 0x82200000 /starryos.uimg
-bootm    0x82200000 - 0x81000000
+bootm    0x82200000 - 0x83000000
 ```
 
-这些地址对应板卡配置里的两个键，不能混。`0x82200000` 是 `fit_load_addr`——FIT 镜像 `starryos.uimg` 在内存里的落点；`0x80200000` 是 `kernel_load_addr`——内核自己的运行地址，由 `.its` 里的 `load` 和 `entry` 决定，`bootm` 负责把镜像解包过去。把 FIT 镜像直接加载到 `0x80200000`，这两个地址就重叠了：`bootm` 要在同一个位置把内核解开并跳过去，结果通常是引导失败。快速开始文档里讲本地串口启动的那一节（`docs/docs/quickstart/starryos.md`）用的是同一组键名和取值，可以对照。
+这些地址里 `0x82200000` 和 `0x80200000` 对应板卡配置里的两个键，不能混。`0x82200000` 是 `fit_load_addr`——FIT 镜像 `starryos.uimg` 在内存里的落点；`0x80200000` 是 `kernel_load_addr`——内核自己的运行地址，由 `.its` 里的 `load` 和 `entry` 决定，`bootm` 负责把镜像解包过去。把 FIT 镜像直接加载到 `0x80200000`，这两个地址就重叠了：`bootm` 要在同一个位置把内核解开并跳过去，结果通常是引导失败。设备树那份 `0x83000000` 不是配置里的键，是这一段流程自己选的落点，只要不和内核、FIT 镜像重叠就可以，上面两段示例用的是同一个值。快速开始文档里讲本地串口启动的那一节（`docs/docs/quickstart/starryos.md`）用的是同一组键名和取值，可以对照。
 
 如果第一个分区里没有放设备树，可以改用 U-Boot 自带的设备树：
 
@@ -383,10 +395,10 @@ dropbear -R -p22
 StarryOS 上 SSH 的默认密码是 `starry`。板子上没有装 scp 和 sftp 服务，传文件要用管道的方式：
 
 ```bash
-cat akars | ssh root@<板子IP> 'mkdir -p /usr/local/bin && cat > /usr/local/bin/akars && chmod +x /usr/local/bin/akars && sync'
+cat <本机文件路径> | ssh root@<板子IP> 'cat > <板子上的目标路径>'
 ```
 
-写到 `/usr/local/bin` 是跟着板子的 `PATH` 走的，理由见 4.3。写完记得 sync。板子根目录下有一个 `wifi_switch` 程序用来配网：
+左边是本机文件，右边引号里是板子上的落点，两边路径各写各的。以 `akars` 为例，完整命令和它为什么要装在 `/usr/local/bin` 见 4.3。写完记得 sync。配网用一个叫 `wifi_switch` 的程序，它装在板子的 `/usr/bin` 下，这个目录在 `PATH` 里，直接敲命令名就行。这个程序不参与内核构建，源码是 `apps/starry/picoclaw-cli/wifi_switch.c`，编译出来之后按同目录 `WIFI_SWITCH_DEMO.md` 里的步骤放到板子的 `/usr/bin` 下：
 
 ```bash
 wifi_switch sta <SSID> <密码>   # 连到 WPA2 热点
@@ -423,7 +435,7 @@ SG2002 上的 `akars` 目前实现的是**追球和抓取两个阶段**，还没
 
 ### 6.2 RK3588 上跑完整流程
 
-程序装在 `/home/orangepi/robot/aka-rk3588/` 下，所有命令都在这个目录里执行。参数从 `config/lekiwi_pick_config.txt` 读，画面按 640×480 处理；速度和偏差这些阈值、以及接线变化，都在这个文件里改，不用重新编译。
+这套程序连同 `run_*.sh`、`config/`、`models/` 都来自 3.2 生成的部署包，出处见 3.2；下面这些脚本名和日志里的字符串在本仓库里搜不到，属于正常。程序装在 `/home/orangepi/robot/aka-rk3588/` 下，所有命令都在这个目录里执行。参数从 `config/lekiwi_pick_config.txt` 读，画面按 640×480 处理；速度和偏差这些阈值、以及接线变化，都在这个文件里改，不用重新编译。
 
 先做三项不动作的检查。它们不驱动车轮，机械臂也不动作，是最快的"板子和接线到底通不通"判据：
 
@@ -554,7 +566,7 @@ RK3588 的程序自带计时，完整闭环跑起来后按统计窗口输出四�
 
 追球自动测试另外会打印 `[ROBOT_CI] PERF_BEGIN`、`PERF_WINDOW` 和 `PERF_SUMMARY` 三行，把每个窗口的统计和整段的汇总分开列出，适合前后对比。
 
-SG2002 上则要关注摄像头采集帧率和每帧的分段耗时，`akars` 的 `[FPS]` 与 `[time]` 两行日志就是这两个数。`aka00-tennis-yolo` 的校验程序还会在全部测量轮次都通过结果比对之后，打印一行 `AKARS_TENNIS_BENCH_RESULT`，给的是统计值而不是单次值：`measured_runs` 是测量轮数，`images` 是图片数，`samples` 是两者的乘积；后面 `decode_us`、`resize_us`、`preprocess_us`、`forward_us`、`postprocess_us`、`total_us` 六项各带 `_avg`、`_p50`、`_p95` 三个后缀，单位都是微秒。
+SG2002 上则要关注摄像头采集帧率和每帧的分段耗时，`akars` 的 `[FPS]` 与 `[time]` 两行日志就是这两个数。`aka00-tennis-yolo` 的校验程序还会在全部测量轮次都通过结果比对之后，打印一行 `AKARS_TENNIS_BENCH_RESULT`，给的是统计值而不是单次值：`pipeline` 是这一轮用的解码路径（硬件解码时形如 `jpu-<缩放比例>`，回退到软件解码时是 `software`），`measured_runs` 是测量轮数，`images` 是图片数，`samples` 是两者的乘积；后面 `decode_us`、`resize_us`、`preprocess_us`、`forward_us`、`postprocess_us`、`total_us` 六项各带 `_avg`、`_p50`、`_p95` 三个后缀，单位都是微秒。
 
 这一行默认就会打印，不必特意加参数——默认是 `--warmup 0 --repeat 1`，也就是测一轮。`--warmup` 和 `--repeat` 调的是轮数：`--warmup 2 --repeat 5` 表示先热两轮不计入统计，再正式测五轮。轮数多一些数字才稳，跨机器比较时两边要用同样的参数。每一轮都会重新和预期结果比对，所以不会出现"用错误的检测结果换来更好看的耗时"这种情况。
 
@@ -578,7 +590,7 @@ SG2002 上则要关注摄像头采集帧率和每帧的分段耗时，`akars` �
 
 ### 7.4 提交 PR
 
-改动完成并验证之后，提交到上游仓库的 `dev` 分支。提交信息的格式有固定要求：标题用英文，写成 `type(scope): 内容` 的形式，比如 `fix(axtask): ...`；正文用中文，说明要解决的问题、实际改了什么、为什么这么改。
+改动完成并验证之后，提交到上游仓库的 `dev` 分支。提交信息的格式有固定要求：标题用英文，写成 `type(scope): 内容` 的形式，比如 `fix(ax-task): ...`（`ax-task` 这个软件包的目录名是 `axtask`，但 `Cargo.toml` 里的包名和提交历史里的 scope 都写 `ax-task`）；正文用中文，说明要解决的问题、实际改了什么、为什么这么改。
 
 提交之前尽量在本地把 CI 流程跑一遍，只有实板测试和自托管项可以跳过。另外两条注意事项：提交信息里不要加任何和 AI 助手相关的标记；推送代码和发布对外评论之前先和仓库维护者确认。
 
