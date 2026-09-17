@@ -8,7 +8,7 @@ title: "Proj4 网球机器人上手指南"
 
 这份指南面向拿到小车硬件之后要动手做开发的人。内容按实际动手的顺序排列：先认识硬件，再准备开发环境，然后编译系统、制作 SD 卡、上电启动，最后让小车真正跑完一次"看到球、开过去、抓起来、放进桶里"的完整过程。每一步都给出可以照抄的命令和判断成功的方法。
 
-这套硬件有 RK3588 和 SG2002 两条路线，两条路线各自配套底盘和机械臂，因此编译、写卡、启动方式都不一样。凡是不同的地方都分开写清楚，相同的部分合并说明。
+这套硬件有 RK3588 和 SG2002 两条路线，它们共用同一台车，只有主控板不同，因此编译、写卡、启动方式都不一样。凡是不同的地方都分开写清楚，相同的部分合并说明。
 
 ## 1. 认识这套硬件
 
@@ -16,13 +16,13 @@ title: "Proj4 网球机器人上手指南"
 
 ### 1.1 机器人本体的组成
 
-两条路线各自配套一套底盘和机械臂，不是同一台车换主控板。
+两条路线是同一台车，区别只在主控板：底盘、机械臂、摄像头都用同一套，把 Orange Pi 5 Plus 整板换成 AKA-00 车板（或者反过来）就算换了路线，不需要换车。
 
-RK3588 路线是三轮全向底盘小车。三个轮子和机械臂的六个关节挂在同一条 Feetech 总线上：轮子是 ID 7、8、9，机械臂是 ID 1～6，其中 ID 6 是夹爪。视觉用普通的 USB 摄像头（UVC 协议），另有一个红色的桶用来投放网球。
+车体是一台四轮差速小车，轮半径 0.03 m、轮距 0.18 m。左右两侧各由一个编码电机驱动，底盘控制器是 ESP32-C3，电机驱动是 DRV8833 双路 H 桥，供电是锂电池加降压板；机械臂是三自由度舵机臂，三个舵机都是 ZP10S 总线舵机；视觉用普通的 USB 摄像头（UVC 协议），另有一个红色的桶用来投放网球。
 
-SG2002 路线是四轮差速小车。左右两侧各由一个编码电机驱动，底盘控制器是 ESP32-C3，电机驱动是 DRV8833 双路 H 桥，供电是锂电池加降压板；机械臂是 ZP10D 舵机臂；视觉同样用 USB 摄像头。底盘和机械臂各占一个串口，ESP32-C3 上跑的是自研固件，通过 UART 协议接收主控板发来的速度和方向指令，帧格式是 `[0xAA] [0x55] [CMD] [LEN] [PAYLOAD] [CHK]`，校验字取 `CMD ^ LEN ^ PAYLOAD` 的逐字节异或，协议测试见 `chenlongos/AKA-00` 的 `tests/test_uart.py`。
+底盘和机械臂各占一路串口，都是 115200 8N1。底盘这一路的固件跑在 ESP32-C3 上，主控板通过 UART 下发速度和方向指令，帧格式是 `[0xAA] [0x55] [CMD] [LEN] [PAYLOAD] [CHK]`，整帧长度是 5 加载荷长度，校验字取 `CMD ^ LEN ^ PAYLOAD` 的逐字节异或，接收侧先扫 `0xAA` 再扫 `0x55` 重新同步；速度用命令字 `0x13` 下发，载荷是一对大端有符号百分比，钳位到 ±100；里程计遥测走命令字 `0x20`，下位机以两帧 `0x90` 回报左右轮转速。协议测试见 `chenlongos/AKA-00` 的 `tests/test_uart.py`。机械臂这一路走 ASCII 舵机协议，程序是阻塞式的：移动命令形如 `#000P1611T1000!`（依次是舵机号、脉宽、耗时），位置回读形如 `#002PRAD!`，一条命令发完要等舵机走到位才发下一条；角度按 270° 满量程折算成脉宽并叠加 500 µs 偏置，钳位在 500～2500 µs。
 
-两条路线用同一个 YOLOv8n 网球模型的权重，导出成各自的格式，除此之外没有共用部件。两块主控板都跑 StarryOS，用户态程序根据摄像头画面决定底盘怎么走、机械臂什么时候动。
+两条路线的用户态程序互不相同：模型是同一个 YOLOv8n 网球模型，导出成各自要的格式；程序本体、运行方式和调参方式都不一样，分别在 3.2 里说明。两块主控板都跑 StarryOS，用户态程序根据摄像头画面决定底盘怎么走、机械臂什么时候动。
 
 ### 1.2 两条平台路线
 
@@ -51,14 +51,16 @@ SG2002 路线是四轮差速小车。左右两侧各由一个编码电机驱动�
 
 | 用途 | RK3588 | SG2002 |
 | --- | --- | --- |
-| 调试串口 | `/dev/ttyUSB0`，波特率 1500000 | `/dev/ttyUSB0`，波特率 115200 |
-| 底盘驱动 | Feetech 总线 ID 7、8、9，设备名写 `auto` | `/dev/ttyS3` |
-| 机械臂舵机 | Feetech 总线 ID 1～6，设备名写 `auto` | `/dev/ttyS2` |
-| 摄像头 | UVC 摄像头，USB 接口 | `/dev/cvi-usb-camera0`，USB 接口 |
+| 调试串口 | 板子侧 `ttyS2`，主机侧 `/dev/ttyUSB0`，波特率 1500000 | `/dev/ttyUSB0`，波特率 115200 |
+| 底盘驱动 | ESP32-C3，115200 8N1，`/dev/ttyS6` | ESP32-C3，115200 8N1，akars 默认 `/dev/ttyS3` |
+| 机械臂舵机 | ZP10S 舵机，115200，`/dev/ttyS3` | ZP10S 舵机，115200，akars 默认 `/dev/ttyS2` |
+| 摄像头 | UVC 摄像头，USB3 口，输出 MJPEG | `/dev/cvi-usb-camera0`，USB 接口 |
 
-RK3588 的底盘和机械臂挂在同一条 Feetech 总线上，所以程序里这两个设备名都写 `auto`：Linux 下解析到 `/dev/ttyACM0`，StarryOS 下走 userspace libusb。查总线上的电机用 `./build/tennis test-feetech auto scan`，正常会列出 1 到 9 号。
+两条路线上的底盘和机械臂是同一套硬件，接法也一样：底盘控制器占一路串口，机械臂占另一路。设备节点的名字跟着接法走——接在板载 UART 上是 `ttyS*`，经 USB 转串口接是 `ttyUSB*`——两块板子枚举出来的编号不一定相同，所以拿到一台车先 `ls /dev/ttyS* /dev/ttyUSB*` 看一眼实际有哪些节点，再和上表对照。
 
-`akars` 给这三个设备都设了默认值（`--camera /dev/cvi-usb-camera0`、`--motor /dev/ttyS3`、`--arm /dev/ttyS2`），接线和默认一致时不用写。这块板子的调试控制台占的是 `ttyS0`，接外设时避开它。
+RK3588 的程序把这两个设备名当命令行参数收，底盘在前、机械臂在后：`./build/tennis <模型> <底盘串口> 0 <机械臂串口>`。程序里内置的默认值是底盘 `/dev/ttyS3`、机械臂 `/dev/ttyUSB1`，用法示例给的也是这两个，和实车接线不是同一组节点，所以命令里要把设备名显式写出来，别用默认值。单独试某一路用 `./build/tennis test-motor /dev/ttyS6 speed=30` 和 `./build/tennis test-arm /dev/ttyS3 pos`。
+
+SG2002 侧的 `akars` 给这三个设备都设了默认值（`--camera /dev/cvi-usb-camera0`、`--motor /dev/ttyS3`、`--arm /dev/ttyS2`），接线和默认一致时不用写。这块板子的调试控制台占的是 `ttyS0`，接外设时避开它。
 
 ## 2. 准备开发环境
 
@@ -149,7 +151,7 @@ cd apps/starry/aka-rk3588
 ./prepare-package.sh
 ```
 
-脚本会把 `source.env` 里固定提交号的源码归档下载下来、校验 SHA256，再用仓库里的预编译程序替换归档中的构建产物，最后在 `target/aka-rk3588/aka-rk3588.tar.gz` 生成部署包。源码来自 `source.env` 里的 `AKA_RK3588_REPOSITORY`，也就是 `bullhh/aka-rk3588` 的固定提交 `8408f1b9`；包里的 `config/`、`models/` 和几个 `run_*.sh` 都取自这份归档，本仓库只保存程序本体（预编译的 `prebuilt/aarch64/build/tennis`），其余文件都在那份归档里。后面 6.2、6.5 和 7.1 里引用的脚本名、日志字符串因此在仓库里搜不到，要对照这个上游仓库看。要把源码版本换掉时，`source.env` 里的提交号和二进制 SHA256 必须一起更新，不要用分支名或 `HEAD` 当输入。
+脚本会把 `source.env` 里固定提交号的源码归档下载下来、校验 SHA256，再用仓库里的预编译程序替换归档中的构建产物，最后在 `target/aka-rk3588/aka-rk3588.tar.gz` 生成部署包。源码来自 `source.env` 里的 `AKA_RK3588_REPOSITORY`，也就是 `bullhh/aka-rk3588` 的固定提交 `8408f1b9`；包里的 `config/`、`models/` 和几个 `run_*.sh` 都取自这份归档，本仓库只保存程序本体（预编译的 `prebuilt/aarch64/build/tennis`），其余文件都在那份归档里。后面 6.2、6.5 里引用的 `run_vision_once.sh` 和日志字符串都来自那份归档，要对照这个上游仓库看。要把源码版本换掉时，`source.env` 里的提交号和二进制 SHA256 必须一起更新，不要用分支名或 `HEAD` 当输入。
 
 SG2002 上先跑仓库自带的最小推理校验，代码就在 `apps/starry/aka00-tennis-yolo/`，不用另外下载。它依赖玄铁 V3.4.0 musl 工具链和 Milk-V 的 SG200x TPU SDK，用脚本一次装好：
 
@@ -234,7 +236,7 @@ RK3588 用 eMMC 存储，rootfs 直接用 Orange Pi 官方的 Ubuntu 22.04（Jam
 /home/orangepi/robot/aka-rk3588
 ```
 
-装好之后目录不要再搬动。程序从这个路径启动，也按相对路径找 `config/`、`models/` 和 `lib/`。如果这台机器人已经做过实机校准，先用备份覆盖回来的方式保留它自己的 `config/lekiwi_calibration.json` 和 `config/lekiwi_pick_config.txt`——这两份文件是每台车各自调出来的，不要被部署包里的默认值盖掉。
+装好之后目录不要再搬动。程序从这个路径启动，也按相对路径找 `config/`、`models/` 和 `lib/`。覆盖部署之前，先把这台车原来的 `config/` 备份出来，免得被新包里的默认值盖掉。
 
 板子已经能跑 Linux 时，最省事的做法是先在 Linux 下把程序调到能跑，再切到 StarryOS 上验证内核。改一次内核跑一次的场景不必每次都重新部署应用，直接用串口把内核送进 U-Boot 更快（`quick-start` 是仓库保留的兼容入口，仓库的快速开始文档里标注它后续会废弃）：
 
@@ -431,55 +433,52 @@ SG2002 的 IP 地址取决于它连的是哪个热点（比如 iPhone 热点通�
 
 ### 6.1 闭环的几个阶段
 
-RK3588 上的 `tennis` 实现了完整的状态机，依次经过五个阶段，然后回到第一个继续找下一颗球。每个阶段之间靠摄像头看到的画面来切换，`config/lekiwi_pick_config.txt` 里的参数决定多近算"够近"、偏离多少算"对准"。
+RK3588 上的 `tennis` 实现了完整的状态机：追球对准之后停车抓球，然后转头找桶、靠近桶、把球放进去，再回到追球找下一颗球。阶段之间靠摄像头看到的画面来切换，多近算"够近"、偏离多少算"对准"这些判定阈值是程序里的编译期常量，不在配置文件里，要改得改源码重新编译，见 6.2。
 
 ```mermaid
 stateDiagram-v2
     [*] --> CHASE_BALL: 检测到球
-    CHASE_BALL --> PICK_BALL: 检测框尺寸和球心偏差连续满足要求
-    PICK_BALL --> FIND_BUCKET: 夹住球
-    PICK_BALL --> CHASE_BALL: 几次尝试都失败
+    CHASE_BALL --> GRAB: 球够近、够正，连续几帧确认
+    GRAB --> FIND_BUCKET: 抓球动作走完
     FIND_BUCKET --> APPROACH_BUCKET: 认出红桶
     APPROACH_BUCKET --> FIND_BUCKET: 跟丢，回头再找
     APPROACH_BUCKET --> DEPOSIT: 桶已到跟前
-    DEPOSIT --> CHASE_BALL: 放球后原路撤离
+    DEPOSIT --> CHASE_BALL: 放球后机械臂回到待机姿态
 ```
 
-各阶段的职责是：`CHASE_BALL` 从画面里挑出最合适的检测框，按预测尺寸决定前进速度、按球心偏移决定左右轮差速，距离过近时先后退，长时间没有进展会做一次视觉重新对准；`PICK_BALL` 驱动机械臂走一遍 `HOME → 打开夹爪 → 安全接近 → 夹球姿态 → 闭合并检测接触 → 沿原路径抬升 → 平滑收臂`，失败会带偏移重试，几次都不成则退回 `CHASE_BALL`；`FIND_BUCKET` 原地转动搜索红色的桶；`APPROACH_BUCKET` 按桶在画面里的位置和 `metric=sqrt(w*h)` 算出的尺寸靠近，只在桶心落在容差内时才允许前进；`DEPOSIT` 是放球那一段，分两段 S 曲线越过桶沿、下降释放、再原路撤离，日志里这一整段也写成 `PUT_BALL`。
+各阶段的职责是：`CHASE_BALL` 从画面里挑出最合适的检测框，按预测尺寸决定前进速度、按球心偏移决定左右轮差速，距离过近时先后退，长时间没有进展会做一次视觉重新对准；`GRAB` 是停车那一段，球占画面的比例落在停车窗口内、球心偏差也进入容差、连续确认几帧之后，先点刹一小段时间把车停稳，再让机械臂走一遍抓取序列，这一段是阻塞的，走完才继续往下；`FIND_BUCKET` 原地旋转搜索红色的桶；`APPROACH_BUCKET` 按桶在画面里的面积判断距离，偏置由桶心的列偏移折算并限幅，跟丢超过若干帧就退回去重新找；`DEPOSIT` 打开夹爪放球，停一下之后把机械臂收回待机姿态。
 
-程序按 `AKA_STATE_LOG_INTERVAL_MS` 的间隔打印状态日志，这是判断状态机走到哪一步最直接的依据。抓球是否成功不靠猜：夹爪闭合过程中出现 `overload=0x20` 就算夹住了东西，日志里是 `slow move stopped: gripper overload while closing`。
+程序按 `AKA_STATE_LOG_INTERVAL_MS` 的间隔打印状态日志（默认 1000 ms），这是判断状态机走到哪一步最直接的依据：追球时是 `[STATE] CHASE zone=FAR` 这类带区域和左右轮速的行走日志，停车抓球是 `[STATE] STOPPED area=... -> GRAB`，换阶段时会打印 `[GAME] -> FIND_BUCKET`、`[GAME] -> CHASE_BALL (next round)` 这类箭头日志。
 
 SG2002 上的 `akars` 目前实现的是**追球和抓取两个阶段**，还没有做找桶和投放。它的抓取触发条件是目标面积占比达到 0.40 且已经对准，连续确认 5 帧后执行抓取；面积超过 0.55 时先后退一小段再抓，避免冲过目标。没有检测到球时原地慢速旋转搜索。
 
 ### 6.2 RK3588 上跑完整流程
 
-这套程序连同 `run_*.sh`、`config/`、`models/` 都来自 3.2 生成的部署包，出处见 3.2；下面这些脚本名和日志里的字符串在本仓库里搜不到，属于正常。程序装在 `/home/orangepi/robot/aka-rk3588/` 下，所有命令都在这个目录里执行。参数从 `config/lekiwi_pick_config.txt` 读，画面按 640×480 处理；速度和偏差这些阈值、以及接线变化，都在这个文件里改，不用重新编译。
+这套程序连同 `run_vision_once.sh`、`config/`、`models/` 都来自 3.2 生成的部署包，出处见 3.2；下面引用的脚本名和日志字符串都来自那份归档，在本仓库里搜不到，属于正常。程序装在 `/home/orangepi/robot/aka-rk3588/` 下，所有命令都在这个目录里执行。画面按 640×480 处理，两个串口按 1.3 的办法确认之后传给程序，下面示例用的是 1.3 表里那台车的实际节点。
 
-先做三项不动作的检查。它们不驱动车轮，机械臂也不动作，是最快的"板子和接线到底通不通"判据：
+先单独确认视觉链路。这两条命令只启动摄像头和识别，不初始化底盘和机械臂：
 
 ```bash
 cd /home/orangepi/robot/aka-rk3588
-./build/tennis test-new-arm auto config-check   # 抓放轨迹是否在配置的安全限位内
-./build/tennis test-feetech auto scan           # 总线上有哪些电机，应列出 1 到 9
-./build/tennis test-new-arm auto calib-check    # 校准文件是否可用
-```
-
-再单独确认视觉链路。这两条命令只启动摄像头和识别，同样不初始化底盘和机械臂：
-
-```bash
 ./run_vision_once.sh                            # 采集一帧并推理，输出 capture.jpg 和 result.jpg
 ./build/tennis test-yolo models/tennis.rknn 0   # 中间过程打印检测结果
 ```
 
-两项都通过之后，按危险程度从低到高往上走，每一步单独排一类问题：
+视觉通了之后，底盘和机械臂各单独试一次，这两条会让车真的动起来。`test-motor` 让轮子前进 5 秒，执行前先架空车；`test-arm` 让机械臂动作，执行前确认机械臂活动范围内没有人手和杂物：
 
 ```bash
-./run_lekiwi_test.sh        # 架空轮子，只验证追球和停车，确认后退出，不进抓球
-./run_bucket_place_demo.sh  # 只做一次找桶和放球，不找球不抓球
-./run_lekiwi_full.sh        # 完整闭环，会持续找下一颗球，Ctrl-C 停止
+./build/tennis test-motor /dev/ttyS6 speed=30   # 底盘轮子前进 5 秒后停下
+./build/tennis test-arm /dev/ttyS3 pos          # 机械臂回到待机姿态
+./build/tennis test-arm /dev/ttyS3 demo         # 依次走待机、抓取、展示、释放
 ```
 
-最后一步会真的驱动车轮和机械臂，必须在有人看管、场地空旷的条件下执行，手边随时能按 `Ctrl-C` 停车。
+这三样都通了再跑完整闭环。命令行上除了模型文件和两个串口，只剩一个摄像头编号，其余参数都是程序里的常量：
+
+```bash
+./build/tennis models/tennis.rknn /dev/ttyS6 0 /dev/ttyS3
+```
+
+这条路径没有"只追球不抓球"的模式：车一旦把球对准停稳，机械臂就会开始抓球。所以第一次跑要在有人看管、场地空旷的条件下进行，手边随时能按 `Ctrl-C` 停车，需要急停就直接断电。想改追球的速度和判定阈值，改的是源码里的常量（`tennis.cpp` 顶部的 `AREA_*`、`STOP_*`、`CHASE_SPEED_*` 几组），改完要在板子的 Linux 上重新编译，源码就是 3.2 说的那份固定提交。
 
 仓库里还有一条自动测试通道，用来在不改板子的前提下确认这套程序在 StarryOS 上跑得通：
 
@@ -542,11 +541,11 @@ akars serve --listen 0.0.0.0:8080
 | 平台 | 验证内容 | 看到的输出 |
 | --- | --- | --- |
 | RK3588 | 板级自动测试跑通 | `AKA_RK3588_DEMO_PASSED`；板端还没部署应用时是 `AKA_RK3588_DEMO_FAILED reason=linux_deployment_required` |
-| RK3588 | 电机总线连通 | `./build/tennis test-feetech auto scan` 列出 1 到 9 号 |
+| RK3588 | 底盘串口连通 | `./build/tennis test-motor /dev/ttyS6 speed=30` 打完 `=== test-motor DONE ===`，轮子转起来 |
+| RK3588 | 机械臂串口连通 | `./build/tennis test-arm /dev/ttyS3 demo` 依次走完待机、抓取、展示、释放 |
 | RK3588 | 摄像头和识别 | `./run_vision_once.sh` 产出 `capture.jpg` 和 `result.jpg` |
-| RK3588 | 追球和停车 | `./run_lekiwi_test.sh` 能追到球并停下，打印 `[STATE] LEKIWI_CHASE` 一类的状态行 |
-| RK3588 | 完整闭环跑完一轮 | `./run_lekiwi_full.sh` 的日志里依次出现 `[GAME] -> PICK_BALL`、`[GAME] -> FIND_BUCKET`、`[GAME] PUT_BALL done -> CHASE_BALL` |
-| RK3588 | 追球自动测试 | 在板上执行 `./run_robot_ci_once.sh 15.0`，末尾是 `[ROBOT_CI] RESULT=PASS` |
+| RK3588 | 追球 | 完整闭环跑起来，日志里出现 `[STATE] CHASE zone=FAR` 一类的状态行，车跟着球转向和前进 |
+| RK3588 | 完整闭环跑完一轮 | 日志里依次出现 `[STATE] STOPPED area=... -> GRAB`、`[GAME] -> FIND_BUCKET`、`[GAME] DEPOSIT – releasing ball...`、`[GAME] -> CHASE_BALL (next round)` |
 | SG2002 | 固定图片 TPU 推理 | `AKARS_TENNIS_VALIDATE_PASS images=3` |
 | SG2002 | 板级自动测试 | `STARRY_AKA00_TENNIS_DETECT_OK` |
 | SG2002 | 浏览器遥控 | 网页能打开，底盘和机械臂响应操作 |
@@ -581,8 +580,6 @@ RK3588 的程序自带计时，完整闭环跑起来后按统计窗口输出四�
 第一行是这一个窗口的吞吐概况：`window` 是窗口长度，`captured` 是采集到的帧数，`processed` 是实际处理完的帧数，后面三个都是帧率——`camera` 是采集侧，`effective` 是端到端的有效值，`busy` 是处理侧。判断丢帧发生在哪一段，看 `captured` 和 `processed` 的差、以及 `camera` 和 `effective` 的差就够了：`camera` 高而 `effective` 低，说明采集跟得上但处理跟不上。
 
 第二行的 `frame_ms` 是端到端耗时，看 `p50` 和 `p95` 比看 `avg` 更有意义。后两行都是 `stage_ms`，分工不同：第一行拆的是采集侧（`wait` 是等待取帧，`capture_copy` 是拷贝，`jpeg_header` 和 `jpeg_decode` 是解码，`letterbox_copy` 是缩放填充），第二行拆的是计算侧（`input` 是输入准备和缩放，`run` 是 NPU 前向计算，`output` 是取回输出，`post` 是后处理，`release` 是释放缓冲，`control` 是控制指令下发，`unaccounted` 是没归到任何阶段的部分）——`unaccounted` 偏大说明计时点本身有遗漏。两行名字一样，看数字时先认清楚是哪一行。
-
-追球自动测试另外会打印 `[ROBOT_CI] PERF_BEGIN`、`PERF_WINDOW` 和 `PERF_SUMMARY` 三行，把每个窗口的统计和整段的汇总分开列出，适合前后对比。
 
 SG2002 上则要关注摄像头采集帧率和每帧的分段耗时，`akars` 的 `[FPS]` 与 `[time]` 两行日志就是这两个数。`aka00-tennis-yolo` 的校验程序还会在全部测量轮次都通过结果比对之后，打印一行 `AKARS_TENNIS_BENCH_RESULT`，给的是统计值而不是单次值：`pipeline` 是这一轮用的解码路径（硬件解码时形如 `jpu-<缩放比例>`，回退到软件解码时是 `software`），`measured_runs` 是测量轮数，`images` 是图片数，`samples` 是两者的乘积；后面 `decode_us`、`resize_us`、`preprocess_us`、`forward_us`、`postprocess_us`、`total_us` 六项各带 `_avg`、`_p50`、`_p95` 三个后缀，单位都是微秒。
 
@@ -649,8 +646,8 @@ SG2002 上则要关注摄像头采集帧率和每帧的分段耗时，`akars` �
 | 现象 | 原因 | 处理 |
 | --- | --- | --- |
 | RK3588 报找不到配置文件或模型 | 启动目录不对，`config/` 和 `models/` 是按相对路径找的 | 在应用根目录 `/home/orangepi/robot/aka-rk3588` 下启动 |
-| RK3588 报电机无应答 | 总线设备名不对，或底盘和机械臂没接在同一条总线上 | 用 `./build/tennis test-feetech auto scan` 确认能列出 1 到 9 号 |
-| RK3588 摄像头出不了帧 | 摄像头没被识别，或者没有出帧 | 用 `./run_vision_once.sh` 单独确认采集这一层 |
+| RK3588 底盘或机械臂没反应 | 串口设备名和实际接线不一致 | 按 1.3 用 `ls /dev/ttyS* /dev/ttyUSB*` 核对节点，再用 `test-motor` / `test-arm` 单独试哪一路不通 |
+| RK3588 摄像头出不了帧 | 摄像头没被识别，或者编号不是 `0` | 先用 `./build/tennis test-uvc <编号>` 逐个试，确认枚举出了 UVC 设备，再用 `./run_vision_once.sh` 确认采集这一层 |
 | SG2002 底盘或机械臂没反应 | 串口设备名和实际接线不一致 | 按 1.3 核对，用 `--motor` / `--arm` 覆盖默认值，避开控制台 `ttyS0` |
 | SG2002 报找不到共享库 | 缺 musl 运行库 | 按 4.3 补进 `/lib` |
 | SG2002 推理程序报错 | rootfs 里的模型或库缺失 | 检查 `libcviruntime.so`、`libcvikernel.so`、`libstdc++.so.6` |
