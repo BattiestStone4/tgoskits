@@ -256,6 +256,7 @@ SG2002 的卡上分两个区：第一个区是 FAT，放 `fip.bin`、设备树�
 第一步，把底包镜像整卡写入 SD 卡：
 
 ```bash
+# <底包镜像> 指解压后的 raw 整卡镜像，不是 .img.xz 压缩包，展开写法见本步结尾
 # macOS
 diskutil list                      # 先确认设备号，别烧错盘
 diskutil unmountDisk /dev/diskN
@@ -268,6 +269,23 @@ sudo dd if=<底包镜像> of=/dev/sdX bs=4M conv=fsync
 ```
 
 `<底包镜像>` 换成整卡镜像的文件路径，来源有三条路：用荔枝派官方的镜像，用 `chenlongos/AKA-00` 仓库 releases 里的 `sd_licheervnano_with_AKA00_v0_*.img.xz`（那是一个跑厂商 Linux 的镜像，适合做性能对照），或者用已经配好的 `sdcard_akars.img`。前面两个的 `fip.bin` 需要从荔枝派官方镜像里提取。
+
+**`dd` 的输入必须是解压后的 raw 整卡镜像。** AKA-00 releases 里那份文件名以 `.img.xz` 结尾，同目录还有一份 `.img.md5`，里面记的是解压后 `.img` 的摘要。把压缩包直接交给 `dd`，写进卡里的是压缩数据，卡上不会有分区表，第二步找 FAT 分区、第三步引导都无从谈起，所以下载完先解压。macOS 的 `xz` 不在系统自带命令里，来自 Homebrew（`brew install xz`）：
+
+```bash
+# 解压成 raw 镜像，再拿它替换上面命令里的 <底包镜像>
+xz -dc sd_licheervnano_with_AKA00_v0_5.img.xz > sdcard.img
+md5 -q sdcard.img                  # macOS，和 .img.md5 里那 32 位十六进制对一遍
+md5sum sdcard.img                  # Linux
+
+# 也可以不落盘，直接管道进 dd
+xz -dc sd_licheervnano_with_AKA00_v0_5.img.xz | sudo dd of=/dev/rdiskN bs=4m           # macOS
+xz -dc sd_licheervnano_with_AKA00_v0_5.img.xz | sudo dd of=/dev/sdX bs=4M conv=fsync   # Linux
+```
+
+示例里的版本号按实际下载的那份替换。解压出来的是一个完整的整卡镜像，比压缩包大得多，先确认本地空间够再解压。
+
+本节末尾核对 `fip.bin` 板型时，比对的是从解压后的 raw 镜像里取出来的那份：xz 是单一压缩流，没法按偏移直接从压缩包里取文件。
 
 第二步，把内核和设备树放进第一个分区。整卡写完、重新插卡之后，第一个 FAT 分区就是一个普通移动盘：macOS 上会出现在 `/Volumes/` 下，Linux 上挂载 `/dev/sdX1` 即可。这一步不需要 loop 设备和分区偏移，直接往里拷文件。命令在仓库根目录执行，两个源文件都按仓库内的相对路径给：
 
