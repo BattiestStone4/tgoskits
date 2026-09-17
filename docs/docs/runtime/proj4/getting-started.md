@@ -142,7 +142,7 @@ mkimage -l target/riscv64gc-unknown-none-elf/release/starryos.uimg
 
 两块平台的用户态程序来源完全不同，这一步最容易出错。
 
-RK3588 上的程序是 `apps/starry/aka-rk3588/` 这个应用。仓库不重复保存源码，也不要求你在本地交叉编译：它保留了一份已经在 Orange Pi 的 Jammy 系统上用 GCC 11 原生编译并实机验证过的 AArch64 程序 `prebuilt/aarch64/build/tennis`，其余的运行文件由 `prepare-package.sh` 从固定提交的源码归档里取。这个程序最高依赖 `GLIBC_2.34`，只能跑在 glibc 系统上，这也是 4.2 里 RK3588 直接复用 Jammy 根文件系统的原因。
+RK3588 上的程序是 `apps/starry/aka-rk3588/` 这个应用，程序本体不在本仓库里。它是一个外部 C++ 工程，原始仓库是 `pengzechen/aka-rk3588`，后续开发在它派生出来的 `bullhh/aka-rk3588` 上继续，`source.env` 固定的就是后者的一个提交。本仓库不重复保存源码，也不要求你在本地交叉编译：它保留了一份已经在 Orange Pi 的 Jammy 系统上用 GCC 11 原生编译并实机验证过的 AArch64 程序 `prebuilt/aarch64/build/tennis`，其余的运行文件由 `prepare-package.sh` 从固定提交的源码归档里取。这个程序最高依赖 `GLIBC_2.34`，只能跑在 glibc 系统上，这也是 4.2 里 RK3588 直接复用 Jammy 根文件系统的原因。
 
 要生成部署包，在开发主机上执行：
 
@@ -190,7 +190,7 @@ akars 在板子上运行还需要运行时库：`libcviruntime.so`、`libcvikern
 
 ## 4. 制作启动 SD 卡
 
-这一步是让板子能起系统、能跑程序。两块板要做的事完全不同：RK3588 的 eMMC 里已经烧好了 Orange Pi 官方系统，要做的是把程序部署进这套系统；SG2002 则要从镜像开始自己做启动卡。两者的写盘风险也不一样，先看通用规则，再看各自的操作。
+这一步是让板子能起系统、能跑程序。两块板要做的事完全不同：RK3588 的系统已经在 SD 卡上了（这块板子没有 eMMC，系统和数据都在卡上），要做的是把程序部署进这套系统；SG2002 则要从镜像开始自己做启动卡。两者的写盘风险也不一样，先看通用规则，再看各自的操作。
 
 ### 4.1 写卡前的通用规则
 
@@ -226,7 +226,7 @@ dumpe2fs -h /dev/sdXY | grep -E '^Block size|^Filesystem features'
 
 ### 4.2 RK3588 部署应用
 
-RK3588 用 eMMC 存储，rootfs 直接用 Orange Pi 官方的 Ubuntu 22.04（Jammy）系统，不另外做一个最小系统。板子在 Linux 下本来就能跑，出问题时可以先用 Linux 对照一次；StarryOS 启动后复用同一套已经部署好的根文件系统，应用程序不用维护两套。
+RK3588 用 SD 卡存储（这块板子没有 eMMC），rootfs 直接用 Orange Pi 官方的 Ubuntu 22.04（Jammy）系统，不另外做一个最小系统。板子在 Linux 下本来就能跑，出问题时可以先用 Linux 对照一次；StarryOS 启动后复用同一套已经部署好的根文件系统，应用程序不用维护两套。
 
 这个选择不是可选的。用户态程序最高依赖 `GLIBC_2.34`，只能跑在 Jammy 这类 glibc 系统上，放在只含 musl 的 Alpine 或自建的精简 rootfs 里会因为找不到 glibc 而起不来。
 
@@ -238,7 +238,7 @@ RK3588 用 eMMC 存储，rootfs 直接用 Orange Pi 官方的 Ubuntu 22.04（Jam
 
 装好之后目录不要再搬动。程序从这个路径启动，也按相对路径找 `config/`、`models/` 和 `lib/`。覆盖部署之前，先把这台车原来的 `config/` 备份出来，免得被新包里的默认值盖掉。
 
-板子已经能跑 Linux 时，最省事的做法是先在 Linux 下把程序调到能跑，再切到 StarryOS 上验证内核。改一次内核跑一次的场景不必每次都重新部署应用，直接用串口把内核送进 U-Boot 更快（`quick-start` 是仓库保留的兼容入口，仓库的快速开始文档里标注它后续会废弃）：
+板子已经能跑 Linux 时，最省事的做法是先在 Linux 下把程序调到能跑，再切到 StarryOS 上验证内核。改一次内核跑一次的场景不必每次都重做启动卡，直接用串口把内核送进 U-Boot 就行——这条路走的是 YMODEM 上传，内核有好几 MB，传一次要等一会儿，但省掉了改卡和插拔（`quick-start` 是仓库保留的兼容入口，仓库的快速开始文档里标注它后续会废弃）：
 
 ```bash
 cargo starry quick-start orangepi-5-plus build
@@ -355,18 +355,26 @@ cargo starry board \
 
 ## 5. 上电启动
 
-两块板的启动过程不一样。RK3588 由 U-Boot 自动加载内核，SG2002 每次都要手动敲命令，这一点要有心理准备。
+两块板的启动过程不一样。RK3588 由 U-Boot 从 SD 卡自动加载内核，SG2002 每次都要手动敲命令，这一点要有心理准备。
 
 ### 5.1 RK3588 启动
 
-接好串口线（波特率 1500000），上电后 U-Boot 会自动从网络加载 StarryOS 内核和设备树，然后挂载 eMMC 上的 rootfs 进入系统，不需要人工干预。完整链路是：
+接好串口线（波特率 1500000），上电后 U-Boot 从 SD 卡上读内核和设备树，再把控制权交给内核；rootfs 是同一个卡上 ext4 分区里的 Jammy 根文件系统。整个过程不需要人工干预，也不经过网络。完整链路是：
 
 ```
-上电 → U-Boot → TFTP 加载 StarryOS 内核
-              → 加载设备树 orangepi-5-plus.dtb
-              → 挂载 eMMC rootfs（mmcblk0p2，ext4，即 Jammy 根文件系统）
-              → 进入 shell，由使用者启动 /home/orangepi/robot/aka-rk3588 下的程序
+上电 → U-Boot（卡里那份）
+     → 从第一个 FAT 分区读 StarryOS 内核和设备树 orangepi-5-plus.dtb
+     → 内核按 bootargs 里给的 root= 找到卡上的 ext4 分区（Jammy 根文件系统）
+     → 进入 shell，由使用者启动 /home/orangepi/robot/aka-rk3588 下的程序
 ```
+
+这块板子没有 eMMC，`/dev/mmcblk*` 这些节点指的是 SD 卡本身，不要当成片上的内置存储。U-Boot 里读内核的命令形如 `fatload mmc 1:1 0x00400000 /starry/starryos.bin`，设备树用同一条命令从同一个分区读，分区号、文件名按 `mmc list` 和卡上的实际内容写。`bootargs` 里的 rootfs 用 `PARTUUID` 指定，而不是写 `/dev/mmcblkXpY`：
+
+```text
+root=PARTUUID=<分区UUID> rootwait rootfstype=ext4
+```
+
+用 `PARTUUID` 是因为设备名会变：重烧一次卡，或者 MMC 的枚举顺序变了，分区号就可能跟着变，按设备名写会挂到别的分区上；`PARTUUID` 认的是分区本身，不会认错。
 
 看到 StarryOS 的命令行提示符就说明启动成功。想确认应用那一层也通了，先跑一次只推理不动作的检查，具体命令见 6.2。
 
@@ -585,7 +593,7 @@ SG2002 上则要关注摄像头采集帧率和每帧的分段耗时，`akars` �
 
 这一行默认就会打印，不必特意加参数——默认是 `--warmup 0 --repeat 1`，也就是测一轮。`--warmup` 和 `--repeat` 调的是轮数：`--warmup 2 --repeat 5` 表示先热两轮不计入统计，再正式测五轮。轮数多一些数字才稳，跨机器比较时两边要用同样的参数。每一轮都会重新和预期结果比对，所以不会出现"用错误的检测结果换来更好看的耗时"这种情况。
 
-量测要在同样的条件下重复多次。场地光线、机器人的起始位置、热点距离都会影响结果，只测一次的数字不能用来说明问题。一个已知的参考量级：RK3588 上完整链路的端到端延迟在 Linux 上约 19 ms，在 StarryOS 上约 156 ms，差距集中在图像预处理和 NPU 输出两个环节。
+量测要在同样的条件下重复多次。场地光线、机器人的起始位置、热点距离都会影响结果，只测一次的数字不能用来说明问题。一个已知的参考量级：RK3588 上完整链路的帧到指令延迟在 Linux 上约 19 ms，在 StarryOS 上约 156 ms，差距集中在图像预处理和 NPU 输出两个环节。这组数字来自移植自同一上游程序的另一份实现，口径是帧到指令延迟，和上面 `[PERF]` 的 `frame_ms` 不是同一个量，只能当量级参考。
 
 ### 7.2 找到瓶颈在哪一层
 
