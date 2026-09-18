@@ -51,12 +51,12 @@ title: "Proj4 网球机器人上手指南"
 
 | 用途 | RK3588 | SG2002 |
 | --- | --- | --- |
-| 调试串口 | 板子侧 `ttyS2`，主机侧 `/dev/ttyUSB0`，波特率 1500000 | `/dev/ttyUSB0`，波特率 115200 |
+| 调试串口 | 板子侧 `ttyS2`，波特率 1500000 | 板子侧 `ttyS0`，波特率 115200 |
 | 底盘驱动 | ESP32-C3，115200 8N1，`/dev/ttyS6` | ESP32-C3，115200 8N1，akars 默认 `/dev/ttyS3` |
 | 机械臂舵机 | ZP10S 舵机，115200，`/dev/ttyS3` | ZP10S 舵机，115200，akars 默认 `/dev/ttyS2` |
 | 摄像头 | UVC 摄像头，USB3 口，输出 MJPEG | `/dev/cvi-usb-camera0`，USB 接口 |
 
-两条路线上的底盘和机械臂是同一套硬件，接法也一样：底盘控制器占一路串口，机械臂占另一路。设备节点的名字跟着接法走——接在板载 UART 上是 `ttyS*`，经 USB 转串口接是 `ttyUSB*`——两块板子枚举出来的编号不一定相同，所以拿到一台车先 `ls /dev/ttyS* /dev/ttyUSB*` 看一眼实际有哪些节点，再和上表对照。
+两条路线上的底盘和机械臂是同一套硬件，接法也一样：底盘控制器占一路串口，机械臂占另一路。设备节点的名字跟着接法走——接在板载 UART 上是 `ttyS*`，经 USB 转串口接是 `ttyUSB*`——两块板子枚举出来的编号不一定相同，所以拿到一台车先 `ls /dev/ttyS* /dev/ttyUSB*` 看一眼实际有哪些节点，再和上表对照。表里列的都是板子这一侧的节点名；开发机那一侧的 USB 转串口设备名随操作系统变化，见 9.1。
 
 RK3588 的程序把这两个设备名当命令行参数收，底盘在前、机械臂在后：`./build/tennis <模型> <底盘串口> 0 <机械臂串口>`。程序里内置的默认值是底盘 `/dev/ttyS3`、机械臂 `/dev/ttyUSB1`，用法示例给的也是这两个，和实车接线不是同一组节点，所以命令里要把设备名显式写出来，别用默认值。单独试某一路用 `./build/tennis test-motor /dev/ttyS6 speed=30` 和 `./build/tennis test-arm /dev/ttyS3 pos`。
 
@@ -89,6 +89,8 @@ rustup show
 ```
 
 其中 `u-boot-tools` 提供 `mkimage` 命令，后面校验 SG2002 内核镜像时必须用到；`cargo-binutils` 提供 `rust-objcopy` 和 `rust-nm`，内核构建要用这两个工具处理符号表。构建时还会用到生成符号表的 `gen_ksym`，它不在上面这些系统包里，默认由构建过程自己 `cargo install ksym` 装上（离线环境可以先手动装好）。要在本机编 SG2002 的内核，还需要额外准备 riscv64-linux-musl 交叉编译器（`riscv64-linux-musl-cross`，或玄铁 V3.4.0 工具链），并确保它的 gcc 在 `PATH` 里。这几样凑不齐就直接用容器，不要在本机上硬凑。
+
+上面的包名是 Debian 和 Ubuntu 的写法。macOS 和 Windows 上默认没有 `mkimage` 这类命令，遇到它们的步骤改用容器执行，缺的命令在容器里临时装一次即可，写法见 9.1。
 
 ### 2.3 先跑一次 QEMU 确认环境可用
 
@@ -137,6 +139,10 @@ mkimage -l target/riscv64gc-unknown-none-elf/release/starryos.uimg
 ```
 
 输出里的 `Load Address` 和 `Entry Point` 必须都是 `0x80200000`。如果这里是 0，说明打包模板 `.its` 没有被正确解析，这个镜像烧进去 `bootm` 会跳到地址 0 直接崩溃。
+
+RK3588 的产物和 SG2002 不是一回事：它只有 `target/aarch64-unknown-none-softfloat/release/starryos.bin`，一个裸内核二进制，没有配套的 FIT 镜像。打不打 FIT 取决于板卡配置旁边有没有同名的打包模板：`scripts/axbuild/src/starry/build.rs` 里的 `uimage_generation_plan` 只在 `os/StarryOS/configs/board/` 下存在同名 `.its` 时才会调用 `mkimage` 产出 `starryos.uimg`，而这个目录里的三份 `.its` 都是 SG2002 的，没有 `orangepi-5-plus.its`。
+
+所以 RK3588 拿不到 FIT 产物，`cargo starry uboot` 和 `quick-start` 这两条要上传 FIT 镜像的通道在这块板上没有东西可以送。它走的是另一条路：拿 `starryos.bin` 打一个只装内核的 legacy uImage，和设备树分开加载，打包见 4.2，引导命令见 5.1。
 
 ### 3.2 编译用户态程序
 
@@ -190,7 +196,7 @@ akars 在板子上运行还需要运行时库：`libcviruntime.so`、`libcvikern
 
 ## 4. 制作启动 SD 卡
 
-这一步是让板子能起系统、能跑程序。两块板要做的事完全不同：RK3588 的系统已经在 SD 卡上了（这块板子没有 eMMC，系统和数据都在卡上），要做的是把程序部署进这套系统；SG2002 则要从镜像开始自己做启动卡。两者的写盘风险也不一样，先看通用规则，再看各自的操作。
+这一步是让板子能起系统、能跑程序。两块板要做的事完全不同：RK3588 的卡上跑的是一整套 Ubuntu 22.04（Jammy）系统，系统和数据都在 SD 卡里（这块板子没有 eMMC），卡在车到手时已经写好，要做的是把 StarryOS 内核和用户程序部署进这套系统；SG2002 则要从镜像开始自己做启动卡。两者的写盘风险也不一样，先看通用规则，再看各自的操作。
 
 ### 4.1 写卡前的通用规则
 
@@ -224,11 +230,26 @@ dumpe2fs -h /dev/sdXY | grep -E '^Block size|^Filesystem features'
 
 块大小要在 1024 到 4096 之间。特性那一行里如果有不认识的名字，去 `features.rs` 的两份清单里对一下对不对得上，对不上就是它导致的。真遇到挂不上时先跑这条命令，比直接重建分区快，也不会白丢数据。
 
-### 4.2 RK3588 部署应用
+### 4.2 RK3588 写卡与部署
 
-RK3588 用 SD 卡存储（这块板子没有 eMMC），rootfs 直接用 Orange Pi 官方的 Ubuntu 22.04（Jammy）系统，不另外做一个最小系统。板子在 Linux 下本来就能跑，出问题时可以先用 Linux 对照一次；StarryOS 启动后复用同一套已经部署好的根文件系统，应用程序不用维护两套。
+RK3588 用 SD 卡存储（这块板子没有 eMMC），rootfs 直接用现成的 Ubuntu 22.04（Jammy）系统，不另外做一个最小系统。板子在 Linux 下本来就能跑，出问题时可以先用 Linux 对照一次；**StarryOS 复用这同一份 rootfs**，用户程序在 Linux 侧部署一次，切到 StarryOS 之后在同一份根文件系统里直接运行，两套系统共用一个应用目录，不需要维护两份。这条路径在实机上验证过。
 
-这个选择不是可选的。用户态程序最高依赖 `GLIBC_2.34`，只能跑在 Jammy 这类 glibc 系统上，放在只含 musl 的 Alpine 或自建的精简 rootfs 里会因为找不到 glibc 而起不来。
+用 Jammy 不是随便挑的。用户态程序最高依赖 `GLIBC_2.34`，只能跑在 Jammy 这类 glibc 系统上，放在只含 musl 的 Alpine 或自建的精简 rootfs 里会因为找不到 glibc 而起不来。
+
+#### 底包镜像
+
+车到手时卡里已经写好这套系统，需要自己重做一张时才走这一步。用的镜像是 `ubuntu-22.04-preinstalled-server-arm64-orangepi-5-plus.img.xz`，来自社区移植项目 `Joshua-Riek/ubuntu-rockchip`——**它不是 Orange Pi 官方发布的镜像**，是社区把 Ubuntu 移植到 Rockchip 各板型之后发布的一份，系统是 Ubuntu 22.04 LTS Server，内核是 Rockchip 的 Linux 5.10。
+
+镜像的下载入口有两个，按板型选 `orangepi-5-plus` 那一份：
+
+- 项目仓库的 Releases：`https://github.com/Joshua-Riek/ubuntu-rockchip/releases`
+- 项目的下载页：`https://joshua-riek.github.io/ubuntu-rockchip-download/boards/orangepi-5-plus.html`
+
+下载目录里除了 `.img.xz`，还有一份同名的 `.sha256`，写卡之前先核对一次。这份 `.img.xz` 可以**直接**交给写卡工具：balenaEtcher、USBimager 这类工具在三个平台上都有，选文件、选卡、开始写即可，不需要先解压。只有用 `dd` 写的时候才要先展开成 raw 镜像，解压和 `dd` 的写法见 4.3。写完等工具报完成再拔卡，手工用 `dd` 的那种写法要额外 `sync`，理由见 4.1 第一条。
+
+第一次上电要等一到两分钟才出登录提示。串口按 1.3 接好，波特率 1500000。系统的默认账号是 `ubuntu`，默认密码也是 `ubuntu`，**首次登录会被要求改密码**，改完记下来，后面 SSH 用的是新密码。
+
+#### 部署用户程序
 
 先在 Linux 下把部署包解压到板子的固定目录：
 
@@ -238,12 +259,48 @@ RK3588 用 SD 卡存储（这块板子没有 eMMC），rootfs 直接用 Orange P
 
 装好之后目录不要再搬动。程序从这个路径启动，也按相对路径找 `config/`、`models/` 和 `lib/`。覆盖部署之前，先把这台车原来的 `config/` 备份出来，免得被新包里的默认值盖掉。
 
-板子已经能跑 Linux 时，最省事的做法是先在 Linux 下把程序调到能跑，再切到 StarryOS 上验证内核。改一次内核跑一次的场景不必每次都重做启动卡，直接用串口把内核送进 U-Boot 就行——这条路走的是 YMODEM 上传，内核有好几 MB，传一次要等一会儿，但省掉了改卡和插拔（`quick-start` 是仓库保留的兼容入口，仓库的快速开始文档里标注它后续会废弃）：
+#### 放入 StarryOS 内核与设备树
+
+卡上还差 StarryOS 自己的内核和它的设备树，两者都放在卡上 ext4 分区的 `/boot/starry/` 下。先按 3.1 编出裸内核，再打一个 legacy uImage——这块板的 U-Boot 起不了 FIT，原因和现场表现见 5.1：
 
 ```bash
-cargo starry quick-start orangepi-5-plus build
-cargo starry quick-start orangepi-5-plus run --serial /dev/ttyUSB0
+# 开发机上已经有 mkimage 时（Linux 装了 u-boot-tools，见 2.2）
+mkimage -A arm64 -O linux -T kernel -C none \
+  -a 0x00400000 -e 0x00400000 -n "StarryOS RK3588" \
+  -d target/aarch64-unknown-none-softfloat/release/starryos.bin \
+     target/aarch64-unknown-none-softfloat/release/starryos-legacy.uimg
 ```
+
+开发机上没有 `mkimage` 时，借一个装有 `u-boot-tools` 的容器跑同一组参数，产物落在同一个位置：
+
+```bash
+docker run --rm -v "$PWD":/workspace -w /workspace ubuntu:22.04 bash -c '
+  apt-get update -qq && apt-get install -y -qq u-boot-tools >/dev/null
+  mkimage -A arm64 -O linux -T kernel -C none \
+    -a 0x00400000 -e 0x00400000 -n "StarryOS RK3588" \
+    -d target/aarch64-unknown-none-softfloat/release/starryos.bin \
+       target/aarch64-unknown-none-softfloat/release/starryos-legacy.uimg
+'
+```
+
+`-T kernel -C none` 说明这是一个不压缩的普通内核镜像，不是多组件打包的 FIT；`-a` 和 `-e` 是镜像头的加载地址和入口地址，两个都取 `0x00400000`，`bootm` 会照着它把内核放到这个位置。产物大小在 15 MB 上下，和 SG2002 那边 `0x80200000` 那一组地址没有关系。
+
+打包好的镜像和设备树用 `scp` 送进卡里，板子上的 Linux 有完整的 SSH 服务，这样送文件不需要拆卡：
+
+```bash
+scp target/aarch64-unknown-none-softfloat/release/starryos-legacy.uimg \
+    os/StarryOS/configs/board/orangepi-5-plus.dtb ubuntu@<板子IP>:/tmp/
+
+ssh ubuntu@<板子IP> 'sudo mkdir -p /boot/starry && \
+  sudo mv /tmp/starryos-legacy.uimg /tmp/orangepi-5-plus.dtb /boot/starry/ && \
+  sync && ls -l /boot/starry/'
+```
+
+`sync` 不能省，理由见 4.1 第一条；换内核之前把 `/boot/starry/` 里旧的那份改名留一份，对应 4.1 第三条。设备树用的是仓库里 `os/StarryOS/configs/board/orangepi-5-plus.dtb` 这一份，它同时也是 `orangepi-5-plus-uboot.toml` 里 `dtb_file` 指向的文件，两份不要混。
+
+这里的 ext4 写入是板子上运行着的 Linux 在写自己的 rootfs，和 4.3 里"开发机不碰 ext4 分区"不矛盾：那一条说的是开发机直接往卡上的 ext4 分区里塞文件，两者不是同一回事。
+
+三样东西都在卡上之后，重启进 U-Boot 引导，命令见 5.1。
 
 ### 4.3 SG2002 写卡
 
@@ -272,7 +329,7 @@ sudo dd if=<底包镜像> of=/dev/sdX bs=4M conv=fsync
 
 `<底包镜像>` 换成整卡镜像的文件路径，来源有三条路：用荔枝派官方的镜像，用 `chenlongos/AKA-00` 仓库 releases 里的 `sd_licheervnano_with_AKA00_v0_*.img.xz`（那是一个跑厂商 Linux 的镜像，适合做性能对照），或者用已经配好的 `sdcard_akars.img`。前面两个的 `fip.bin` 需要从荔枝派官方镜像里提取。
 
-**`dd` 的输入必须是解压后的 raw 整卡镜像。** AKA-00 releases 里那份文件名以 `.img.xz` 结尾，同目录还有一份 `.img.md5`，里面记的是解压后 `.img` 的摘要。把压缩包直接交给 `dd`，写进卡里的是压缩数据，卡上不会有分区表，第二步找 FAT 分区、第三步引导都无从谈起，所以下载完先解压。macOS 的 `xz` 不在系统自带命令里，来自 Homebrew（`brew install xz`）：
+**`dd` 的输入必须是解压后的 raw 整卡镜像。** AKA-00 releases 里那份文件名以 `.img.xz` 结尾，同目录还有一份 `.img.md5`，里面记的是解压后 `.img` 的摘要。把压缩包直接交给 `dd`，写进卡里的是压缩数据，卡上不会有分区表，第二步找 FAT 分区、第三步引导都无从谈起，所以下载完先解压。开发机上没有 `xz` 的话，按 9.1 的办法装一个或换工具：
 
 ```bash
 # 解压成 raw 镜像，再拿它替换上面命令里的 <底包镜像>
@@ -355,28 +412,29 @@ cargo starry board \
 
 ## 5. 上电启动
 
-两块板的启动过程不一样。RK3588 由 U-Boot 从 SD 卡自动加载内核，SG2002 每次都要手动敲命令，这一点要有心理准备。
+两块板的启动过程不一样：内核在卡上的位置不同，能用的镜像格式也不一样，但都要在 U-Boot 里手动敲命令，没有哪块板是按一下电源就进 StarryOS 的。
 
 ### 5.1 RK3588 启动
 
-接好串口线（波特率 1500000），上电后 U-Boot 从 SD 卡上读内核和设备树，再把控制权交给内核；rootfs 是同一个卡上 ext4 分区里的 Jammy 根文件系统。整个过程不需要人工干预，也不经过网络。完整链路是：
+接好串口线（波特率 1500000），上电，盯着串口输出。U-Boot 的自动启动会去引导卡上那套 Linux，所以要**在倒计时结束前按任意键打断它**，停在 `=>` 提示符上。这个窗口很短，上电后先守着串口，别同时干别的；真错过了也不要紧，板子照样会进 Linux，`sudo reboot` 重来一遍即可。
 
-```
-上电 → U-Boot（卡里那份）
-     → 从第一个 FAT 分区读 StarryOS 内核和设备树 orangepi-5-plus.dtb
-     → 内核按 bootargs 里给的 root= 找到卡上的 ext4 分区（Jammy 根文件系统）
-     → 进入 shell，由使用者启动 /home/orangepi/robot/aka-rk3588 下的程序
-```
-
-这块板子没有 eMMC，`/dev/mmcblk*` 这些节点指的是 SD 卡本身，不要当成片上的内置存储。U-Boot 里读内核的命令形如 `fatload mmc 1:1 0x00400000 /starry/starryos.bin`，设备树用同一条命令从同一个分区读，分区号、文件名按 `mmc list` 和卡上的实际内容写。`bootargs` 里的 rootfs 用 `PARTUUID` 指定，而不是写 `/dev/mmcblkXpY`：
+在 `=>` 提示符下敲三条命令，内核和设备树就是 4.2 里放进卡的那两个文件：
 
 ```text
-root=PARTUUID=<分区UUID> rootwait rootfstype=ext4
+ext4load mmc 1:2 0x02000000 /boot/starry/starryos-legacy.uimg
+ext4load mmc 1:2 0x0a100000 /boot/starry/orangepi-5-plus.dtb
+bootm 0x02000000 - 0x0a100000
 ```
 
-用 `PARTUUID` 是因为设备名会变：重烧一次卡，或者 MMC 的枚举顺序变了，分区号就可能跟着变，按设备名写会挂到别的分区上；`PARTUUID` 认的是分区本身，不会认错。
+- `mmc 1:2` 是 SD 卡的第二个分区，也就是放 rootfs 的那个 ext4 分区。卡对应的设备号按 `mmc list` 确认，固件不同枚举出来的编号可能不一样。
+- 第一条把镜像读进内存的暂存位置 `0x02000000`，`bootm` 再按 uImage 头里写的加载地址（`0x00400000`）把内核搬过去；第二条把设备树读到 `0x0a100000`，这个地址只要不和内核、暂存位置重叠就行。
+- 第三条里的第二个参数写成 `-`，表示这次引导没有 initrd，第三个参数是设备树所在的地址。设备树不打包进镜像、单独传给 `bootm`，这正是这套引导方式和 FIT 的区别。
 
-看到 StarryOS 的命令行提示符就说明启动成功。想确认应用那一层也通了，先跑一次只推理不动作的检查，具体命令见 6.2。
+**这块板的 U-Boot 起不了 FIT。** 多组件打包的 FIT 镜像在这块板子上三种写法都不通：`bootm <地址>` 打完 `BOOTM: transferring to board FIT` 就报 `bootm can't read dtb, ret=-1`，`bootm <地址>#conf-1` 报同样的错，Rockchip 私有的 `boot_fit <地址>` 则停在 `## Booting FIT Image =>` 不再往下走。把内核和设备树拆成两个文件、用只装内核的 legacy uImage 引导可以绕开 FIT 的多组件解析，也就是上面这三条命令。仓库侧同样没有这块板的 FIT 打包模板，3.1 里已经说明。
+
+rootfs 的分区参数写在内核自带设备树的 `chosen` 节点里，值是 `root=/dev/mmcblk0p2`，指向卡上第二个分区。这块板子没有 eMMC，`/dev/mmcblk*` 这些节点指的就是 SD 卡本身，不要当成片上的内置存储。
+
+启动成功的标志是串口出现 shell 提示符 `root@starry:/root #`（这个提示符的出处见 5.2）。这三条命令不在自动启动脚本里，**板子每次重启都要重新敲一遍**。想确认应用那一层也通了，先跑一次只推理不动作的检查，具体命令见 6.2。
 
 ### 5.2 SG2002 启动
 
@@ -462,7 +520,7 @@ SG2002 上的 `akars` 目前实现的是**追球和抓取两个阶段**，还没
 
 ### 6.2 RK3588 上跑完整流程
 
-这套程序连同 `run_vision_once.sh`、`config/`、`models/` 都来自 3.2 生成的部署包，出处见 3.2；下面引用的脚本名和日志字符串都来自那份归档，在本仓库里搜不到，属于正常。程序装在 `/home/orangepi/robot/aka-rk3588/` 下，所有命令都在这个目录里执行。画面按 640×480 处理，两个串口按 1.3 的办法确认之后传给程序，下面示例用的是 1.3 表里那台车的实际节点。
+这套程序连同 `run_vision_once.sh`、`config/`、`models/` 都来自 3.2 生成的部署包，出处见 3.2；下面引用的脚本名和日志字符串都来自那份归档，在本仓库里搜不到，属于正常。程序装在 `/home/orangepi/robot/aka-rk3588/` 下，所有命令都在这个目录里执行。画面按 640×480 处理，两个串口按 1.3 的办法确认之后传给程序，下面示例用的是 1.3 表里那台车的实际节点。视觉那几条命令在 Linux 和 StarryOS 下都能跑；涉及底盘和机械臂的要在 Linux 侧跑，StarryOS 下那两路串口没有设备节点，原因见 9.2。
 
 先单独确认视觉链路。这两条命令只启动摄像头和识别，不初始化底盘和机械臂：
 
@@ -629,6 +687,7 @@ SG2002 上则要关注摄像头采集帧率和每帧的分段耗时，`akars` �
 | --- | --- | --- |
 | 改了 board toml 但行为没变 | 编译时没带 `-c`，用了旧副本 | 重新执行带 `-c` 的编译命令 |
 | SG2002 只产出 bin 没有 uimg | 打包模板 `.its` 缺失 | 确认模板文件在同一目录，重新编译 |
+| RK3588 编完只有 `starryos.bin`，没有 `starryos.uimg` | 仓库里没有这块板的打包模板 `orangepi-5-plus.its`，本来就不产出 FIT | 正常现象，按 4.2 拿裸内核打 legacy uImage |
 | 应用在板子上报缺少 `GLIBC_2.34` | 用 musl 工具链编了 RK3588 程序 | 换用 glibc 的 aarch64 工具链 |
 | akars 启动报找不到加载器 | 用了 xthead 加载器 | 按 3.2 改成标准加载器重新编译 |
 | 本机编不了 riscv 目标 | 缺 musl 工具链或 C sysroot | 改用官方容器编译 |
@@ -641,6 +700,11 @@ SG2002 上则要关注摄像头采集帧率和每帧的分段耗时，`akars` �
 | --- | --- | --- |
 | SG2002 引导后立刻崩溃，`EPC=0` | 把 FIT 镜像 `starryos.uimg` 加载到了内核地址 `0x80200000`，两个地址重叠 | FIT 镜像要落在 `fit_load_addr`（`0x82200000`），再由 `bootm` 解包到 `kernel_load_addr`（`0x80200000`） |
 | SG2002 重启后回到旧系统 | 自动启动走了第一个分区的旧内核 | 每次手动引导，见 5.2 |
+| RK3588 重启后直接进了 Linux，没停在 U-Boot 命令行 | 没在倒计时结束前按键打断自动启动 | 重新上电，出现 `Hit any key to stop autoboot` 时按任意键 |
+| RK3588 的 `bootm` 报 `bootm can't read dtb, ret=-1` | 拿 FIT 镜像去引导，这块板的 U-Boot 起不了 FIT | 改用 legacy uImage 加单独设备树，见 5.1 |
+| RK3588 执行 `boot_fit` 后停在 `## Booting FIT Image =>` 不再输出 | 同上，这个私有命令在这块板上会卡住 | 同上 |
+| `cargo starry uboot` 或 `quick-start` 报没有镜像可以烧 | 这两条通道要 FIT 产物，而仓库没有这块板的 `.its` | 改用 5.1 的三条命令手动引导 |
+| RK3588 换了内核但引导的还是旧的 | 写进 `/boot/starry/` 之后没 `sync`，或者 `bootm` 读的是旧文件 | 按 4.2 重传并 `sync`，再确认 `ls -l /boot/starry/` 的时间和大小 |
 | 串口输出乱码 | 波特率不对，或 fip 和板型不匹配 | 核对 115200 和 1500000，核对 fip 尺寸 |
 | rootfs 挂载失败或文件丢失 | 写入后没 `sync` 就断电 | 重刷整卡，以后遵守 4.1 的规则 |
 | rootfs 挂载被直接拒绝，日志说特性不支持 | 分区的 ext4 带了 rsext4 不认识的 `s_feature_incompat` 或 `s_feature_ro_compat` 位 | 按 4.1 的办法查特性，对照 `features.rs` 的两份清单；对不上就重建分区再拷数据 |
@@ -664,3 +728,31 @@ SG2002 上则要关注摄像头采集帧率和每帧的分段耗时，`akars` �
 | 网页能开但很卡 | 没点开始就卡说明瓶颈在网络上 | 按 6.4 分辨是画面还是状态请求造成的 |
 
 问题无法定位时，把完整的串口日志和复现步骤一起提供，这是排查所需的最少信息。
+
+## 9. 跨平台与实机踩坑提醒
+
+这一节不进前面的操作流程，单独收集两类容易卡住人的地方：一类是开发机操作系统不同带来的写法差异，一类是在这块板子上踩过的坑。前面某条命令在开发机上跑不起来时，先来这里对一下，不用怀疑板子和内核。
+
+### 9.1 开发机平台差异
+
+| 事项 | 差异 | 处理 |
+| --- | --- | --- |
+| 串口设备名 | Linux 上是 `/dev/ttyUSB*`、`/dev/ttyACM*`，macOS 上是 `/dev/tty.usbserial-*`、`/dev/tty.usbmodem*`，Windows 上是 `COM3` 这样的编号 | 命令里凡是写开发机串口的地方都按本机改；板子一侧的节点名不受影响，见 1.3 |
+| `mkimage` | 只有 Linux 装了 `u-boot-tools` 才有，macOS 和 Windows 默认没有这个命令 | 用 4.2 里那条容器命令打 legacy uImage，SG2002 侧校验镜像同理 |
+| `xz` | macOS 系统里不带这个命令，要 `brew install xz`；Windows 上可以用 7-Zip 之类的工具 | 解压 `.img.xz` 时按平台换工具，见 4.3 |
+| 摘要与文件大小 | Linux 是 `md5sum`、`sha1sum`、`stat -c %s`；macOS 是 `md5`、`shasum`、`stat -f %z` | 核对镜像摘要和 `fip.bin` 尺寸时按平台选命令，见 4.3 |
+| 写卡 | `dd` 在 Linux 和 macOS 上可用，Windows 的命令行里没有 | Windows 用 USBimager 或 balenaEtcher，`.img.xz` 可以直接选 |
+| 容器挂载路径 | 2.1 和 4.2 里的 `-v "$PWD":...` 是 Unix shell 的写法 | Windows 的 cmd 里写 `%cd%`，PowerShell 里写 `${PWD}`，换成仓库的实际路径也一样 |
+| 传文件 | Windows 上不一定装了 OpenSSH 客户端，`rsync` 默认没有 | 用 WinSCP 这类图形工具，或者在 WSL 里执行同样的命令 |
+| 编译 RK3588 内核 | macOS 上的 `ar` 打出的是 Mach-O 归档，链接 aarch64 ELF 时会报找不到符号，`lwprintf` 这个依赖先撞上 | 指定一个交叉工具链的 `ar`，工具链来自 `brew install musl-cross`：`AR_aarch64_unknown_none_softfloat=$(brew --prefix)/bin/aarch64-linux-musl-ar cargo starry build -c os/StarryOS/configs/board/orangepi-5-plus.toml` |
+| 组网 | 开发机和板子要在同一个网段里，接同一台交换机可以，网线直连也可以；直连时两侧都要手动配静态地址，地址要配在接板子那块网卡上 | 例如开发机 `192.168.99.1/24`、板子 `192.168.99.2/24`，板子一侧的地址在串口里用 `ip addr` 查；配错网卡是最常见的"网线是好的但不通" |
+
+还有一条和操作系统无关：开发机上开着 VPN 时，去直连网段的流量会被 VPN 的虚拟网卡抢走，现象是网线明明插着却 `ping` 不通，排查网络之前先把 VPN 关掉。
+
+### 9.2 实机上的坑
+
+**底盘和机械臂那两路串口在 StarryOS 下没有设备节点。** 这块板的内核设备树（`os/StarryOS/configs/board/orangepi-5-plus.dtb`）里九条 uart 只有 `uart9` 是 `okay`，其余全是 `disabled`，连控制台走的那一条也是——控制台是内核按 bootargs 里的 `console=` 单独初始化的，不经过设备树枚举。驱动枚举会跳过 `disabled` 的节点（`drivers/rdrive/tests/fdt_probe.rs` 里有测试钉住这个行为），所以按 1.3 记下的那两路串口在 StarryOS 里打不开。想在 StarryOS 下真正驱动车轮和机械臂，要先把这两个节点在设备树里打开，那涉及 pinctrl 和时钟，属于仓库改动；在那之前，动作部分在 Linux 侧验证，StarryOS 侧先跑推理那一段。
+
+**StarryOS 下板载网卡不稳。** 运行中会打印 `realtek-rtl8125: transmit failed: Again`，SSH 会话会断。跑耗时较长的命令时把结果从串口读，不要指望 SSH 撑到结束。
+
+**换内核这一步没法全在开发机上完成。** 把新内核写进 `/boot/starry/` 可以在开发机上用 `scp` 做完（4.2），但从重启到进入新内核这三条 U-Boot 命令，只能在串口前手工敲（5.1）。`cargo starry uboot` 和 `quick-start` 这两条自动化通道要 FIT 产物，在这块板上没有东西可以送（3.1），排计划时要把"人守在串口前"这一步算进去。
